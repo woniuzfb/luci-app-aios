@@ -1,0 +1,12 @@
+#!/bin/sh
+
+uci -q batch <<-EOF >/dev/null
+	delete ucitrack.@aios[-1]
+	add ucitrack aios
+	set ucitrack.@aios[-1].init=aios
+	commit ucitrack
+EOF
+
+mkdir -p /etc/aios/presets /var/etc/aios
+
+exit 0

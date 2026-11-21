@@ -1,0 +1,12 @@
+{
+	"luci-app-aios-geodata": {
+		"description": "Grant read access to GeoIP and GeoSite assets",
+		"read": {
+			"file": {
+				"/usr/share/xray/*.dat": [ "read" ],
+				"/usr/share/v2ray/*.dat": [ "read" ],
+				"/usr/share/aios/*.dat": [ "read" ]
+			}
+		}
+	}
+}

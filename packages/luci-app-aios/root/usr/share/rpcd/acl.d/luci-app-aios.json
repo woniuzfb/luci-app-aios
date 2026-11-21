@@ -1,0 +1,46 @@
+{
+	"luci-app-aios": {
+		"description": "Grant access to AIOS (Xray / V2Ray) configuration and standalone console",
+		"read": {
+			"ubus": {
+				"luci.aios": [
+					"coreInfo",
+					"serviceStatus",
+					"preflightCheck",
+					"firewallInspect",
+					"validateConfig",
+					"stats",
+					"keyGen",
+					"listPresets",
+					"readPreset",
+					"readLog",
+					"readCompiledConfig"
+				],
+				"service": [ "list" ],
+				"network.interface": [ "dump" ],
+				"uci": [ "get", "changes" ]
+			},
+			"uci": [ "aios", "dhcp", "network" ],
+			"file": {
+				"/etc/aios/*": [ "read", "list" ],
+				"/var/etc/aios/*": [ "read", "list" ],
+				"/usr/share/xray/*": [ "read", "list" ],
+				"/usr/share/v2ray/*": [ "read", "list" ],
+				"/usr/share/aios/*": [ "read", "list" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.aios": [
+					"savePreset",
+					"deletePreset",
+					"writeCompiledConfig",
+					"serviceAction",
+					"firewallAction"
+				],
+				"uci": [ "set", "add", "delete", "reorder", "commit", "revert" ]
+			},
+			"uci": [ "aios" ]
+		}
+	}
+}

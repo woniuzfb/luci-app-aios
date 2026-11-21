@@ -1,0 +1,10 @@
+{
+	"luci-app-aios-status": {
+		"description": "Grant read access to AIOS telemetry and stats",
+		"read": {
+			"ubus": {
+				"luci.aios": [ "stats", "serviceStatus", "coreInfo" ]
+			}
+		}
+	}
+}

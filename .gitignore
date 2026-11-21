@@ -1,7 +1,8 @@
+node_modules/
 .DS_Store
-*.po~
-.idea
-node_modules
-output
-package
+.memory/
+dist-packages/
+web/node_modules/
+packages/luci-app-aios/root/www/aios/assets/
+packages/luci-app-aios/root/www/aios/index.html
 *.log

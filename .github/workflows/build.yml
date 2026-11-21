@@ -1,0 +1,92 @@
+name: Build & Verify luci-app-aios
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  web-and-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install, Test & Build Vite Vue 3 Console
+        working-directory: web
+        run: |
+          pnpm install
+          pnpm test
+          pnpm build
+      - name: Validate OpenWrt Shell Scripts
+        run: |
+          sh -n packages/luci-app-aios/root/etc/init.d/aios
+          sh -n packages/luci-app-aios/root/usr/libexec/rpcd/luci.aios
+          sh -n packages/luci-app-aios/root/usr/share/aios/firewall/fw3_ipt.sh
+          sh -n packages/luci-app-aios/root/etc/hotplug.d/iface/90-aios-gateway
+          sh -n packages/luci-app-aios/root/etc/uci-defaults/90-luci-aios
+      - name: Upload compiled web assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: aios-www
+          path: packages/luci-app-aios/root/www/aios
+
+  openwrt-sdk-package:
+    needs: web-and-tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: openwrt-23.05.5-x86_64
+            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+            ext: txz
+          - name: openwrt-24.10.0-x86_64
+            sdk_url: https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            ext: tzst
+          - name: openwrt-21.02.7-legacy-fw3
+            sdk_url: https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/openwrt-sdk-21.02.7-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+            ext: txz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: aios-www
+          path: packages/luci-app-aios/root/www/aios
+      - name: Install OpenWrt SDK prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev gawk git libssl-dev gettext zlib1g-dev swig unzip time rsync zstd xz-utils
+      - name: Download & Extract OpenWrt SDK
+        run: |
+          mkdir -p /tmp/sdk
+          curl -fsSL "${{ matrix.sdk_url }}" -o /tmp/sdk/sdk.archive
+          if [ "${{ matrix.ext }}" = "tzst" ]; then
+            tar --zstd -xf /tmp/sdk/sdk.archive -C /tmp/sdk --strip-components=1
+          else
+            tar -xJf /tmp/sdk/sdk.archive -C /tmp/sdk --strip-components=1
+          fi
+      - name: Compile luci-app-aios packages
+        working-directory: /tmp/sdk
+        run: |
+          ln -s "${GITHUB_WORKSPACE}/packages" package/luci-app-aios-bundle
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/luci-app-aios-bundle/luci-app-aios/{clean,compile} V=s
+          make package/luci-app-aios-bundle/luci-app-aios-geodata/{clean,compile} V=s
+          make package/luci-app-aios-bundle/luci-app-aios-status/{clean,compile} V=s
+          mkdir -p "${GITHUB_WORKSPACE}/dist-packages/${{ matrix.name }}"
+          find bin/packages -type f \( -name 'luci-app-aios*.ipk' -o -name 'luci-app-aios*.apk' \) -exec cp {} "${GITHUB_WORKSPACE}/dist-packages/${{ matrix.name }}/" \;
+          ls -lh "${GITHUB_WORKSPACE}/dist-packages/${{ matrix.name }}"
+      - name: Upload built OpenWrt packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.name }}
+          path: dist-packages/${{ matrix.name }}

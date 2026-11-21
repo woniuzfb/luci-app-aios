@@ -1,0 +1,2 @@
+# Included by firewall4 ruleset-post; loads isolated `table inet aios` when active
+include "/var/etc/aios/fw4_*.nft"

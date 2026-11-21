@@ -1,93 +1,29 @@
-# luci-app-v2ray
+# luci-app-aios
 
-Luci support for V2Ray
+面向 OpenWrt 的 **Xray-core & V2Ray (v2fly)** 双核统一代理控制台与三包架构实现。
 
-**This branch is new LuCI for OpenWrt 19.07 and later.**
+## 核心特性
 
-**For legacy version: [Branch legacy](https://github.com/kuoruan/luci-app-v2ray/tree/legacy)**
+- **双核一等支持**：同一配置模型通过能力矩阵自动编译为 **Xray-core**（支持 REALITY / XHTTP / FinalMask / VLESS Encryption / WireGuard / TUN / Metrics）或 **V2Ray jsonv4**（支持 Hysteria2 / 严格 `vnext`/`servers` 结构 / 自动字段映射与降级提示）。
+- **兼容新旧 OpenWrt**：
+  - OpenWrt 22.03+：`firewall4 (nftables)` 独立表 `table inet aios` + `ucode` 编译引擎 + Dynamic Direct + FakeDNS Ping + 动态默认网关/IPv6 PD 绕过。
+  - OpenWrt 19.07 / 21.02 / LEDE：`firewall3 (iptables + ipset)` 独立 `AIOS_*` 链与 `aios_*` 集合 + 前端预编译 JSON 兜底（无 `ucode` 也可运行）。
+- **全维度防冲突隔离**：统一使用 `/etc/config/aios`、独立 `procd` PID 与高冲突规避路由表/fwmark（默认 `table 166`、`0x3a01`–`0x3a04`），内置启动前共存插件冲突预检。
+- **全手动自由拼装 + 预设快捷键**：完整手动配置任意 `inbounds` / `outbounds` / `dns` / `fakedns` / `routing` / `balancers` / `observatory` / `policy` / `reverse`，内置推荐预设，并支持**将当前完整设置一键保存为自定义预设**（含应用前 Diff 预览与 JSON 导入/导出）。
+- **Vite + TypeScript + Vue 3 独立后台**：产物部署至 `/www/aios/`（由 `uhttpd` 直接托管，零常驻内存），通过 `/ubus` + `rpcd/luci.aios` 通信，并在 LuCI 菜单提供轻量入口壳。
 
-[![Release Version](https://img.shields.io/github/release/kuoruan/luci-app-v2ray.svg)](https://github.com/kuoruan/luci-app-v2ray/releases/latest) [![Latest Release Download](https://img.shields.io/github/downloads/kuoruan/luci-app-v2ray/latest/total.svg)](https://github.com/kuoruan/luci-app-v2ray/releases/latest) [![Total Download](https://img.shields.io/github/downloads/kuoruan/luci-app-v2ray/total.svg)](https://github.com/kuoruan/luci-app-v2ray/releases)
+## 本地开发与验证
 
-## Install
-
-### Install via OPKG (recommend)
-
-1. Add new opkg key:
-
-```sh
-wget -O kuoruan-public.key http://openwrt.kuoruan.net/packages/public.key
-opkg-key add kuoruan-public.key
+```bash
+cd web
+pnpm install
+pnpm test    # 运行双核编译、预设保存与链接导入单元测试
+pnpm build   # 类型检查并构建静态产物到 packages/luci-app-aios/root/www/aios/
+pnpm dev     # 启动本地预览（可设置 AIOS_ROUTER_URL=http://<router-ip> 代理 /ubus）
 ```
 
-2. Add opkg repository from kuoruan:
+## 包结构
 
-```sh
-echo "src/gz kuoruan_universal http://openwrt.kuoruan.net/packages/releases/all" \
-  >> /etc/opkg/customfeeds.conf
-opkg update
-```
-
-3. Install package:
-
-```sh
-opkg install luci-app-v2ray
-opkg install luci-i18n-v2ray-zh-cn
-```
-
-We also support HTTPS protocol.
-
-4. Upgrade package:
-
-```sh
-opkg update
-opkg upgrade luci-app-v2ray
-opkg upgrade luci-i18n-v2ray-zh-cn
-```
-
-### Manual install
-
-1. Download ipk files from [release](https://github.com/kuoruan/luci-app-v2ray/releases) page
-
-2. Upload files to your router
-
-3. Install package with opkg:
-
-```sh
-opkg install luci-app-v2ray_*.ipk
-```
-
-Dependencies:
-
-- jshn
-- ip (ip-tiny or ip-full)
-- ipset
-- iptables
-- iptables-mod-tproxy
-- resolveip
-- dnsmasq-full (dnsmasq ipset is required)
-
-For translations, please install ```luci-i18n-v2ray-*```.
-
-> You may need to remove ```dnsmasq``` before installing this package.
-
-## Configure
-
-1. Download V2Ray file from V2Ray release [link](https://github.com/v2ray/v2ray-core/releases) or V2Ray ipk release [link](https://github.com/kuoruan/openwrt-v2ray/releases).
-
-2. Upload V2Ray file to your router, or install the ipk file.
-
-3. Config V2Ray file path in LuCI page.
-
-4. Add your inbound and outbound rules.
-
-5. Enable the service via LuCI.
-
-## Build
-
-Package files is in branch [luci2](https://github.com/kuoruan/luci-app-v2ray/tree/luci2)
-
-Download with Git:
-
-```sh
-git clone -b luci2 https://github.com/kuoruan/luci-app-v2ray.git luci-app-v2ray
-```
+- `packages/luci-app-aios`：主包（`PKGARCH:=all`），含 `init.d/aios`、`rpcd/luci.aios`、双防火墙后端、`ucode` 编译器、LuCI 入口壳与 Vite 独立后台产物。
+- `packages/luci-app-aios-geodata`：可选 GeoData 菜单与 ACL 权限包。
+- `packages/luci-app-aios-status`：可选状态监控菜单与 ACL 权限包。

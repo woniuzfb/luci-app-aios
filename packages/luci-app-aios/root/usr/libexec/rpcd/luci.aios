@@ -1,0 +1,452 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+
+NAME=aios
+PRESETS_DIR=/etc/aios/presets
+RUNTIME_DIR=/var/etc/aios
+PERSIST_DIR=/etc/aios
+PID_FILE=/var/run/aios.main.pid
+LOOPBACK_ADDR=127.0.0.1
+
+uci_get() {
+	local ret
+	ret="$(uci -q get "${NAME}.${1}" 2>/dev/null)"
+	echo "${ret:-$2}"
+}
+
+detect_core_type() {
+	local configured="$1"
+	local bin="$2"
+	if [ "$configured" = "xray" ] || [ "$configured" = "v2ray" ]; then
+		echo "$configured"
+		return 0
+	fi
+	local ver
+	ver="$("$bin" version 2>/dev/null | head -n 1)"
+	case "$ver" in
+		*[Xx]ray*) echo "xray" ;;
+		*V2Ray*|*v2ray*) echo "v2ray" ;;
+		*)
+			case "$(basename "$bin")" in
+				*xray*) echo "xray" ;;
+				*) echo "v2ray" ;;
+			esac
+			;;
+	esac
+}
+
+detect_fw_backend() {
+	local configured
+	configured="$(uci_get main_tproxy.firewall_backend auto)"
+	if [ "$configured" = "nftables" ] || [ "$configured" = "iptables" ] || [ "$configured" = "none" ]; then
+		echo "$configured"
+		return 0
+	fi
+	if command -v fw4 >/dev/null 2>&1 && command -v nft >/dev/null 2>&1; then
+		echo "nftables"
+	elif command -v iptables >/dev/null 2>&1 && command -v ipset >/dev/null 2>&1; then
+		echo "iptables"
+	else
+		echo "none"
+	fi
+}
+
+sanitize_id() {
+	echo "$1" | tr -cd 'a-zA-Z0-9_-' | cut -c1-64
+}
+
+rpc_core_info() {
+	local bin configured core_type ver asset has_geoip has_geosite has_ucode fw_backend
+	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	configured="$(uci_get main.core_type auto)"
+	asset="$(uci_get main.asset_location /usr/share/xray)"
+	ver=""
+	if [ -x "$bin" ]; then
+		ver="$("$bin" version 2>/dev/null | head -n 1)"
+		core_type="$(detect_core_type "$configured" "$bin")"
+	else
+		core_type="$configured"
+	fi
+	[ -f "${asset}/geoip.dat" ] && has_geoip=1 || has_geoip=0
+	[ -f "${asset}/geosite.dat" ] && has_geosite=1 || has_geosite=0
+	command -v ucode >/dev/null 2>&1 && has_ucode=1 || has_ucode=0
+	fw_backend="$(detect_fw_backend)"
+
+	json_init
+	json_add_string "core_bin" "$bin"
+	json_add_boolean "binary_exists" "$([ -x "$bin" ] && echo 1 || echo 0)"
+	json_add_string "core_type" "$core_type"
+	json_add_string "version" "$ver"
+	json_add_string "asset_location" "$asset"
+	json_add_boolean "has_geoip" "$has_geoip"
+	json_add_boolean "has_geosite" "$has_geosite"
+	json_add_boolean "has_ucode" "$has_ucode"
+	json_add_string "detected_firewall" "$fw_backend"
+	json_dump
+}
+
+rpc_service_status() {
+	local running=0 pid="" rss_kb=0
+	if [ -s "$PID_FILE" ]; then
+		pid="$(cat "$PID_FILE" 2>/dev/null)"
+		if [ -n "$pid" ] && [ -d "/proc/${pid}" ]; then
+			running=1
+			rss_kb="$(awk '/VmRSS/ {print $2}' "/proc/${pid}/status" 2>/dev/null)"
+		fi
+	fi
+	json_init
+	json_add_boolean "running" "$running"
+	json_add_string "pid" "$pid"
+	json_add_int "rss_kb" "${rss_kb:-0}"
+	json_dump
+}
+
+rpc_preflight_check() {
+	local table mark
+	table="$(uci_get main_tproxy.route_table 166)"
+	mark="$(uci_get main_tproxy.tproxy_mark 0x3a01)"
+
+	json_init
+	json_add_array "warnings"
+
+	local svc
+	for svc in xray_core v2ray passwall passwall2 openclash homeproxy shadowsocksr; do
+		if [ -x "/etc/init.d/${svc}" ] && /etc/init.d/"${svc}" running >/dev/null 2>&1; then
+			json_add_string "" "Coexisting proxy service running: ${svc}"
+		fi
+	done
+
+	if ip rule show 2>/dev/null | grep -q "lookup ${table}\b"; then
+		if [ ! -f "${RUNTIME_DIR}/aios_active" ]; then
+			json_add_string "" "Route table ${table} is already used in ip rule"
+		fi
+	fi
+
+	json_close_array
+	json_add_string "route_table" "$table"
+	json_add_string "tproxy_mark" "$mark"
+	json_dump
+}
+
+rpc_firewall_inspect() {
+	local backend active table_present route_table tproxy_mark
+	local live_rules ip_rules ip_routes rendered_file dd_v4_cnt dd_v6_cnt
+	backend="$(detect_fw_backend)"
+	[ -f "${RUNTIME_DIR}/aios_active" ] && active=1 || active=0
+	route_table="$(uci_get main_tproxy.route_table 166)"
+	tproxy_mark="$(uci_get main_tproxy.tproxy_mark 0x3a01)"
+	table_present=0
+	live_rules=""
+	dd_v4_cnt=0
+	dd_v6_cnt=0
+
+	if [ "$backend" = "nftables" ] && command -v nft >/dev/null 2>&1; then
+		if nft list table inet aios >/dev/null 2>&1; then
+			table_present=1
+			live_rules="$(nft list table inet aios 2>/dev/null)"
+			dd_v4_cnt="$(nft list set inet aios aios_dd_v4 2>/dev/null | grep -c 'timeout' || true)"
+			dd_v6_cnt="$(nft list set inet aios aios_dd_v6 2>/dev/null | grep -c 'timeout' || true)"
+		fi
+	elif [ "$backend" = "iptables" ] && command -v iptables >/dev/null 2>&1; then
+		if iptables -t mangle -L AIOS_PREROUTING -n >/dev/null 2>&1 || iptables -t nat -L AIOS_REDIRECT -n >/dev/null 2>&1; then
+			table_present=1
+			live_rules="$(
+				echo "=== iptables -t mangle (AIOS_*) ==="
+				iptables -t mangle -L AIOS_PREROUTING -v -n 2>/dev/null
+				iptables -t mangle -L AIOS_OUTPUT -v -n 2>/dev/null
+				echo "=== iptables -t nat (AIOS_REDIRECT) ==="
+				iptables -t nat -L AIOS_REDIRECT -v -n 2>/dev/null
+				echo "=== ipset (aios_*) ==="
+				ipset list -t 2>/dev/null | grep -A 5 '^Name: aios_'
+			)"
+		fi
+	fi
+
+	ip_rules="$(ip rule show 2>/dev/null; echo "--- IPv6 ---"; ip -6 rule show 2>/dev/null)"
+	ip_routes="$(ip route show table "$route_table" 2>/dev/null; echo "--- IPv6 ---"; ip -6 route show table "$route_table" 2>/dev/null)"
+	rendered_file=""
+	[ -r "${RUNTIME_DIR}/fw4_01_aios.nft" ] && rendered_file="$(cat "${RUNTIME_DIR}/fw4_01_aios.nft")"
+
+	json_init
+	json_add_string "backend" "$backend"
+	json_add_boolean "active" "$active"
+	json_add_boolean "table_present" "$table_present"
+	json_add_string "route_table" "$route_table"
+	json_add_string "tproxy_mark" "$tproxy_mark"
+	json_add_int "dynamic_direct_v4_count" "${dd_v4_cnt:-0}"
+	json_add_int "dynamic_direct_v6_count" "${dd_v6_cnt:-0}"
+	json_add_string "live_rules" "$live_rules"
+	json_add_string "rendered_file" "$rendered_file"
+	json_add_string "ip_rules" "$ip_rules"
+	json_add_string "ip_routes" "$ip_routes"
+	json_dump
+}
+
+rpc_firewall_action() {
+	local input action backend mark table
+	read -r input
+	json_load "$input"
+	json_get_var action "action"
+	backend="$(detect_fw_backend)"
+	mark="$(uci_get main_tproxy.tproxy_mark 0x3a01)"
+	table="$(uci_get main_tproxy.route_table 166)"
+
+	case "$action" in
+		apply)
+			mkdir -p "$RUNTIME_DIR"
+			if [ "$backend" = "nftables" ] && command -v nft >/dev/null 2>&1; then
+				ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+				ip route del local default dev lo table "$table" 2>/dev/null || true
+				ip rule add fwmark "$mark" lookup "$table"
+				ip route add local default dev lo table "$table"
+				/usr/bin/utpl /usr/share/aios/firewall/fw4_nft.ut > "${RUNTIME_DIR}/fw4_01_aios.nft"
+				nft delete table inet aios 2>/dev/null || true
+				nft -f "${RUNTIME_DIR}/fw4_01_aios.nft"
+				[ -x /usr/share/aios/firewall/gateway.uc ] && /usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1 || true
+			elif [ "$backend" = "iptables" ] && [ -x /usr/share/aios/firewall/fw3_ipt.sh ]; then
+				/usr/share/aios/firewall/fw3_ipt.sh restart
+			fi
+			printf '{"ok":true,"action":"apply","backend":"%s"}\n' "$backend"
+			;;
+		flush)
+			ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+			ip route del local default dev lo table "$table" 2>/dev/null || true
+			ip -6 rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+			ip -6 route del local default dev lo table "$table" 2>/dev/null || true
+			command -v nft >/dev/null 2>&1 && nft delete table inet aios 2>/dev/null || true
+			[ -x /usr/share/aios/firewall/fw3_ipt.sh ] && /usr/share/aios/firewall/fw3_ipt.sh stop >/dev/null 2>&1 || true
+			rm -f "${RUNTIME_DIR}"/fw4_*.nft
+			printf '{"ok":true,"action":"flush","backend":"%s"}\n' "$backend"
+			;;
+		refresh_gateway)
+			if command -v ucode >/dev/null 2>&1 && [ -x /usr/share/aios/firewall/gateway.uc ]; then
+				/usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1
+			fi
+			echo '{"ok":true,"action":"refresh_gateway"}'
+			;;
+		*)
+			echo '{"ok":false,"error":"unsupported firewall action"}'
+			;;
+	esac
+}
+
+rpc_validate_config() {
+	local input config_json bin core_type fmt tmp out code
+	read -r input
+	json_load "$input"
+	json_get_var config_json "config"
+	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$bin")"
+	fmt="$(uci_get main.v2ray_format jsonv4)"
+
+	if [ ! -x "$bin" ]; then
+		json_init
+		json_add_boolean "ok" 0
+		json_add_string "output" "Core binary not executable: ${bin}"
+		json_dump
+		return
+	fi
+
+	tmp="${RUNTIME_DIR}/validate.$$.json"
+	mkdir -p "$RUNTIME_DIR"
+	if [ -n "$config_json" ]; then
+		printf '%s\n' "$config_json" > "$tmp"
+	elif [ -s "${RUNTIME_DIR}/config.json" ]; then
+		cp -f "${RUNTIME_DIR}/config.json" "$tmp"
+	else
+		json_init
+		json_add_boolean "ok" 0
+		json_add_string "output" "No configuration provided or generated"
+		json_dump
+		return
+	fi
+
+	if [ "$core_type" = "xray" ]; then
+		out="$("$bin" run -test -c "$tmp" 2>&1)"
+		code=$?
+	else
+		if [ "$fmt" = "jsonv5" ]; then
+			out="$("$bin" test -c "$tmp" -format jsonv5 2>&1)"
+		else
+			out="$("$bin" test -c "$tmp" 2>&1)"
+		fi
+		code=$?
+	fi
+	rm -f "$tmp"
+
+	json_init
+	json_add_boolean "ok" "$([ "$code" -eq 0 ] && echo 1 || echo 0)"
+	json_add_string "output" "$out"
+	json_dump
+}
+
+rpc_stats() {
+	local bin core_type metrics_port api_port out
+	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$bin")"
+	metrics_port="$(uci_get main.metrics_port 18888)"
+	api_port="$(uci_get main.api_port 18080)"
+
+	if [ "$core_type" = "xray" ] && [ "$(uci_get main.metrics_enabled 1)" = "1" ]; then
+		if command -v wget >/dev/null 2>&1; then
+			local url="http://${LOOPBACK_ADDR}:${metrics_port}/debug/vars"
+			out="$(wget -qO- -T 2 "$url" 2>/dev/null)"
+			if [ -n "$out" ]; then
+				printf '{"source":"metrics","core":"xray","data":%s}\n' "$out"
+				return
+			fi
+		fi
+	fi
+
+	if [ -x "$bin" ]; then
+		out="$("$bin" api statsquery --server="${LOOPBACK_ADDR}:${api_port}" 2>/dev/null)"
+		if [ -n "$out" ]; then
+			printf '{"source":"api","core":"%s","data":%s}\n' "$core_type" "$out"
+			return
+		fi
+	fi
+
+	printf '{"source":"none","core":"%s","data":{}}\n' "$core_type"
+}
+
+rpc_key_gen() {
+	local input kind bin out
+	read -r input
+	json_load "$input"
+	json_get_var kind "kind"
+	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	out=""
+	if [ -x "$bin" ]; then
+		case "$kind" in
+			uuid) out="$("$bin" uuid 2>/dev/null)" ;;
+			x25519) out="$("$bin" x25519 2>/dev/null)" ;;
+			mldsa65) out="$("$bin" mldsa65 2>/dev/null)" ;;
+			vlessenc) out="$("$bin" vlessenc 2>/dev/null)" ;;
+			wg) out="$("$bin" wg 2>/dev/null)" ;;
+		esac
+	fi
+	json_init
+	json_add_string "kind" "$kind"
+	json_add_string "output" "$out"
+	json_dump
+}
+
+rpc_list_presets() {
+	mkdir -p "$PRESETS_DIR"
+	printf '{"presets":['
+	local first=1 f
+	for f in "${PRESETS_DIR}"/*.json; do
+		[ -f "$f" ] || continue
+		[ "$first" = "0" ] && printf ','
+		first=0
+		cat "$f"
+	done
+	printf ']}\n'
+}
+
+rpc_save_preset() {
+	local input id payload safe_id
+	read -r input
+	json_load "$input"
+	json_get_var id "id"
+	json_get_var payload "payload"
+	safe_id="$(sanitize_id "$id")"
+	if [ -z "$safe_id" ] || [ -z "$payload" ]; then
+		echo '{"ok":false,"error":"invalid id or payload"}'
+		return
+	fi
+	mkdir -p "$PRESETS_DIR"
+	printf '%s\n' "$payload" > "${PRESETS_DIR}/${safe_id}.json"
+	printf '{"ok":true,"id":"%s"}\n' "$safe_id"
+}
+
+rpc_delete_preset() {
+	local input id safe_id
+	read -r input
+	json_load "$input"
+	json_get_var id "id"
+	safe_id="$(sanitize_id "$id")"
+	[ -z "$safe_id" ] && { echo '{"ok":false,"error":"invalid id"}'; return; }
+	rm -f "${PRESETS_DIR}/${safe_id}.json"
+	printf '{"ok":true,"id":"%s"}\n' "$safe_id"
+}
+
+rpc_write_compiled_config() {
+	local input content
+	read -r input
+	json_load "$input"
+	json_get_var content "content"
+	[ -z "$content" ] && { echo '{"ok":false,"error":"empty content"}'; return; }
+	mkdir -p "$PERSIST_DIR"
+	printf '%s\n' "$content" > "${PERSIST_DIR}/compiled.json"
+	echo '{"ok":true}'
+}
+
+rpc_read_compiled_config() {
+	local src="${RUNTIME_DIR}/config.json"
+	[ -s "$src" ] || src="${PERSIST_DIR}/compiled.json"
+	json_init
+	if [ -s "$src" ]; then
+		json_add_string "path" "$src"
+		json_add_string "content" "$(cat "$src")"
+	else
+		json_add_string "path" ""
+		json_add_string "content" ""
+	fi
+	json_dump
+}
+
+rpc_read_log() {
+	local log_file out
+	log_file="$(uci_get main.error_log /var/log/aios-error.log)"
+	if [ -r "$log_file" ] && [ "$log_file" != "none" ] && [ "$log_file" != "/dev/null" ]; then
+		out="$(tail -n 200 "$log_file" 2>/dev/null)"
+	else
+		out="$(logread -e aios 2>/dev/null | tail -n 200)"
+	fi
+	json_init
+	json_add_string "content" "$out"
+	json_dump
+}
+
+rpc_service_action() {
+	local input action
+	read -r input
+	json_load "$input"
+	json_get_var action "action"
+	case "$action" in
+		start|stop|restart|reload)
+			/etc/init.d/aios "$action" >/dev/null 2>&1
+			printf '{"ok":true,"action":"%s"}\n' "$action"
+			;;
+		*)
+			echo '{"ok":false,"error":"unsupported action"}'
+			;;
+	esac
+}
+
+case "$1" in
+	list)
+		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"}}'
+		;;
+	call)
+		case "$2" in
+			coreInfo) rpc_core_info ;;
+			serviceStatus) rpc_service_status ;;
+			preflightCheck) rpc_preflight_check ;;
+			firewallInspect) rpc_firewall_inspect ;;
+			firewallAction) rpc_firewall_action ;;
+			validateConfig) rpc_validate_config ;;
+			stats) rpc_stats ;;
+			keyGen) rpc_key_gen ;;
+			listPresets) rpc_list_presets ;;
+			savePreset) rpc_save_preset ;;
+			deletePreset) rpc_delete_preset ;;
+			writeCompiledConfig) rpc_write_compiled_config ;;
+			readCompiledConfig) rpc_read_compiled_config ;;
+			readLog) rpc_read_log ;;
+			serviceAction) rpc_service_action ;;
+		esac
+		;;
+esac
