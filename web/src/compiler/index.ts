@@ -6,8 +6,8 @@ import type {
   OutboundConfig,
   StreamFields
 } from '@/schema/types';
-import { resolveEffectiveCore } from '@/schema/capabilities';
-import { compileV2RayV5 } from './v2ray_v5';
+import { resolveEffectiveCore, validateStreamCombination } from '@/schema/capabilities';
+import { compileV2RayV5, parseDurationToNs } from './v2ray_v5';
 
 export interface CompileDiagnostic {
   level: 'warning' | 'error';
@@ -21,14 +21,38 @@ export interface CompileResult {
   diagnostics: CompileDiagnostic[];
 }
 
-function parseJsonSafe(str?: string): Record<string, unknown> | null {
+function parseJsonObjectChecked(
+  str: string | undefined,
+  diagnostics: CompileDiagnostic[],
+  path: string
+): Record<string, unknown> | null {
   if (!str || !str.trim()) return null;
   try {
     const parsed = JSON.parse(str);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : null;
-  } catch {
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    diagnostics.push({ level: 'error', path, message: 'JSON 必须为对象（Object）格式。' });
+    return null;
+  } catch (e) {
+    diagnostics.push({ level: 'error', path, message: `JSON 解析失败: ${String(e)}` });
+    return null;
+  }
+}
+
+function parseJsonArrayChecked(
+  str: string | undefined,
+  diagnostics: CompileDiagnostic[],
+  path: string
+): unknown[] | null {
+  if (!str || !str.trim()) return null;
+  try {
+    const parsed = JSON.parse(str);
+    if (Array.isArray(parsed)) return parsed;
+    diagnostics.push({ level: 'error', path, message: 'JSON 必须为数组（Array）格式。' });
+    return null;
+  } catch (e) {
+    diagnostics.push({ level: 'error', path, message: `JSON 解析失败: ${String(e)}` });
     return null;
   }
 }
@@ -64,6 +88,28 @@ function parseHexOrInt(value: string | number | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function parseSecondsNumber(value: number | string | undefined): number | null {
+  if (value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
+  const cleaned = value.trim().replace(/s$/i, '');
+  const n = Number(cleaned);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null {
+  const [addr, prefixStr] = cidr.trim().split('/');
+  if (!addr) return null;
+  const parts = addr.split('.');
+  if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
+    const bytes = parts.map((p) => Number(p));
+    const prefix = prefixStr !== undefined ? Number(prefixStr) : 32;
+    if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix)) {
+      return { ip: bytes, prefix };
+    }
+  }
+  return null;
+}
+
 function kvToMap(pairs?: KeyValuePair[]): Record<string, string> | null {
   if (!pairs || pairs.length === 0) return null;
   const out: Record<string, string> = {};
@@ -76,6 +122,7 @@ function kvToMap(pairs?: KeyValuePair[]): Record<string, string> | null {
 function buildStreamSettings(
   item: StreamFields & { tag?: string; password?: string },
   core: CoreType,
+  protocol: string,
   isInbound: boolean,
   defaultMark: number | null,
   diagnostics: CompileDiagnostic[],
@@ -88,6 +135,7 @@ function buildStreamSettings(
     if (net === 'tcp') net = 'raw';
     if (net === 'ws') net = 'websocket';
     if (net === 'hysteria2') net = 'hysteria';
+    if (net === 'splithttp') net = 'xhttp';
     if (net === 'h2' || net === 'http' || net === 'quic') {
       diagnostics.push({
         level: 'warning',
@@ -105,23 +153,35 @@ function buildStreamSettings(
       diagnostics.push({
         level: 'error',
         path: `${pathPrefix}.transport`,
-        message: `V2Ray jsonv4 不支持传输层 "${net}"，已降级为 tcp。`
+        message: `V2Ray jsonv4 不支持传输层 "${net}"（httpupgrade 请切换 jsonv5）。`
       });
       net = 'tcp';
     }
   }
-
-  const ss: Record<string, unknown> = { network: net };
 
   let security = item.security || 'none';
   if (!isXray && security === 'reality') {
     diagnostics.push({
       level: 'error',
       path: `${pathPrefix}.security`,
-      message: 'V2Ray 不支持 REALITY，已自动降级为 tls。'
+      message: 'V2Ray 不支持 REALITY 安全层。'
     });
     security = 'tls';
   }
+  if (!isXray && security === 'utls') {
+    diagnostics.push({
+      level: 'error',
+      path: `${pathPrefix}.security`,
+      message: 'V2Ray jsonv4 不支持独立 uTLS 安全层（请切换 jsonv5 或改用 tls）。'
+    });
+    security = 'tls';
+  }
+
+  for (const issue of validateStreamCombination(core, 'jsonv4', protocol, net, security)) {
+    diagnostics.push({ level: issue.level, path: `${pathPrefix}.streamSettings`, message: issue.message });
+  }
+
+  const ss: Record<string, unknown> = isXray ? { method: net } : { network: net };
   ss.security = security;
 
   if (security === 'tls') {
@@ -140,13 +200,24 @@ function buildStreamSettings(
       if (item.tls_fingerprint) tls.fingerprint = item.tls_fingerprint;
       if (pinned.length > 0) tls.pinnedPeerCertSha256 = pinned.join(',');
       if (item.tls_ech_config) tls.echConfigList = item.tls_ech_config;
+      if (item.tls_ech_server_keys) tls.echServerKeys = item.tls_ech_server_keys;
+      const echSock = parseJsonObjectChecked(item.tls_ech_sockopt_json, diagnostics, `${pathPrefix}.tls_ech_sockopt_json`);
+      if (echSock) tls.echSockopt = echSock;
       if (item.tls_verify_peer_name) tls.verifyPeerCertByName = item.tls_verify_peer_name;
+      if (item.tls_min_version) tls.minVersion = item.tls_min_version;
+      if (item.tls_max_version) tls.maxVersion = item.tls_max_version;
+      if (item.tls_cipher_suites) tls.cipherSuites = item.tls_cipher_suites;
+      if (item.tls_reject_unknown_sni) tls.rejectUnknownSni = true;
+      if (item.tls_use_system_ca) tls.useSystemCA = true;
+      if (item.tls_disable_system_root) tls.disableSystemRoot = true;
+      if (item.tls_enable_session_resumption) tls.enableSessionResumption = true;
       if (item.tls_curve_preferences && item.tls_curve_preferences.length > 0) {
         tls.curvePreferences = item.tls_curve_preferences;
       }
     } else {
       if (pinned.length > 0) tls.pinnedPeerCertificateChainSha256 = pinned;
       if (item.tls_verify_client) tls.verifyClientCertificate = true;
+      if (item.tls_disable_system_root) tls.disableSystemRoot = true;
     }
 
     if (isInbound) {
@@ -170,6 +241,9 @@ function buildStreamSettings(
         shortIds: item.reality_short_ids || []
       };
       if (item.reality_mldsa65_seed) rs.mldsa65Seed = item.reality_mldsa65_seed;
+      if (item.reality_min_client_ver) rs.minClientVer = item.reality_min_client_ver;
+      if (item.reality_max_client_ver) rs.maxClientVer = item.reality_max_client_ver;
+      if (item.reality_max_time_diff) rs.maxTimeDiff = item.reality_max_time_diff;
       ss.realitySettings = rs;
     } else {
       const rs: Record<string, unknown> = {
@@ -226,15 +300,15 @@ function buildStreamSettings(
       if (item.grpc_initial_windows_size) grpc.initial_windows_size = item.grpc_initial_windows_size;
     }
     ss.grpcSettings = grpc;
-  } else if ((net === 'xhttp' || net === 'splithttp') && isXray) {
+  } else if (net === 'xhttp' && isXray) {
     const xhttp: Record<string, unknown> = {
       path: item.xhttp_path || '/',
       mode: item.xhttp_mode || 'auto'
     };
     if (item.xhttp_host) xhttp.host = item.xhttp_host;
-    const extra = parseJsonSafe(item.xhttp_extra);
+    const extra = parseJsonObjectChecked(item.xhttp_extra, diagnostics, `${pathPrefix}.xhttp_extra`);
     if (extra) xhttp.extra = extra;
-    ss[net === 'splithttp' ? 'splithttpSettings' : 'xhttpSettings'] = xhttp;
+    ss.xhttpSettings = xhttp;
   } else if (net === 'httpupgrade' && isXray) {
     const hu: Record<string, unknown> = { path: item.httpupgrade_path || '/' };
     if (item.httpupgrade_host) hu.host = item.httpupgrade_host;
@@ -257,7 +331,10 @@ function buildStreamSettings(
       uplinkCapacity: item.mkcp_uplink_capacity || 5,
       downlinkCapacity: item.mkcp_downlink_capacity || 20
     };
-    if (!isXray) {
+    if (isXray) {
+      if (item.mkcp_cwnd_multiplier) kcp.cwndMultiplier = item.mkcp_cwnd_multiplier;
+      if (item.mkcp_max_sending_window) kcp.maxSendingWindow = item.mkcp_max_sending_window;
+    } else {
       kcp.congestion = !!item.mkcp_congestion;
       if (item.mkcp_seed) kcp.seed = item.mkcp_seed;
       if (item.mkcp_header_type) kcp.header = { type: item.mkcp_header_type };
@@ -280,7 +357,32 @@ function buildStreamSettings(
       version: 2,
       auth: item.hysteria_auth || item.password || ''
     };
-    if (item.hysteria_udp_idle_timeout) hy.udpIdleTimeout = item.hysteria_udp_idle_timeout;
+    const idleSec = parseSecondsNumber(item.hysteria_udp_idle_timeout);
+    if (idleSec !== null) hy.udpIdleTimeout = idleSec;
+    if (item.hysteria_masquerade_type) {
+      const masq: Record<string, unknown> = { type: item.hysteria_masquerade_type };
+      if (item.hysteria_masquerade_type === 'file' && item.hysteria_masquerade_dir) {
+        masq.dir = item.hysteria_masquerade_dir;
+      } else if (item.hysteria_masquerade_type === 'proxy') {
+        if (item.hysteria_masquerade_url) masq.url = item.hysteria_masquerade_url;
+        if (item.hysteria_masquerade_rewrite_host) masq.rewriteHost = true;
+        if (item.hysteria_masquerade_insecure) masq.insecure = true;
+      } else if (item.hysteria_masquerade_type === 'string') {
+        if (item.hysteria_masquerade_content) masq.content = item.hysteria_masquerade_content;
+        const mHeaders = kvToMap(item.hysteria_masquerade_headers);
+        if (mHeaders) masq.headers = mHeaders;
+        if (item.hysteria_masquerade_status_code) masq.statusCode = item.hysteria_masquerade_status_code;
+      }
+      hy.masquerade = masq;
+    } else if (item.hysteria_masquerade && item.hysteria_masquerade.trim()) {
+      const rawMasq = item.hysteria_masquerade.trim();
+      if (rawMasq.startsWith('{')) {
+        const parsedMasq = parseJsonObjectChecked(rawMasq, diagnostics, `${pathPrefix}.hysteria_masquerade`);
+        if (parsedMasq) hy.masquerade = parsedMasq;
+      } else {
+        hy.masquerade = { type: 'proxy', url: rawMasq };
+      }
+    }
     ss.hysteriaSettings = hy;
   } else if (net === 'hysteria2' && !isXray) {
     const hy2: Record<string, unknown> = {
@@ -295,11 +397,25 @@ function buildStreamSettings(
       };
     }
     ss.hysteria2Settings = hy2;
+  } else if (net === 'masque' && isXray) {
+    const mq: Record<string, unknown> = {};
+    const path = item.masque_path || item.masque_uri;
+    if (path) mq.path = path;
+    if (!isInbound) {
+      if (item.masque_host) mq.host = item.masque_host;
+      if (item.masque_user) mq.user = item.masque_user;
+      if (item.masque_pass) mq.pass = item.masque_pass;
+      const headers = kvToMap(item.masque_headers);
+      if (headers) mq.headers = headers;
+      const warp = parseJsonObjectChecked(item.masque_warp_json, diagnostics, `${pathPrefix}.masque_warp_json`);
+      if (warp) mq.warp = warp;
+    }
+    ss.masqueSettings = mq;
   }
 
   // FinalMask (Xray only)
   if (isXray) {
-    let fm = parseJsonSafe(item.finalmask_json);
+    let fm = parseJsonObjectChecked(item.finalmask_json, diagnostics, `${pathPrefix}.finalmask_json`);
     if (
       !fm &&
       net === 'hysteria' &&
@@ -347,7 +463,37 @@ function buildStreamSettings(
   if (item.sockopt_interface) sockopt[isXray ? 'interface' : 'bindToDevice'] = item.sockopt_interface;
   if (item.sockopt_tcp_keepalive_interval) sockopt.tcpKeepAliveInterval = item.sockopt_tcp_keepalive_interval;
   if (isXray) {
+    if (item.sockopt_tcp_max_seg) sockopt.tcpMaxSeg = item.sockopt_tcp_max_seg;
+    if (item.sockopt_tcp_keepalive_idle) sockopt.tcpKeepAliveIdle = item.sockopt_tcp_keepalive_idle;
+    if (item.sockopt_tcp_user_timeout) sockopt.tcpUserTimeout = item.sockopt_tcp_user_timeout;
     if (item.sockopt_tcp_congestion) sockopt.tcpcongestion = item.sockopt_tcp_congestion;
+    if (item.sockopt_v6_only) sockopt.V6Only = true;
+    if (item.sockopt_tcp_window_clamp) sockopt.tcpWindowClamp = item.sockopt_tcp_window_clamp;
+    if (item.sockopt_address_port_strategy) sockopt.addressPortStrategy = item.sockopt_address_port_strategy;
+    if (item.sockopt_trusted_xff && item.sockopt_trusted_xff.length > 0) {
+      sockopt.trustedXForwardedFor = item.sockopt_trusted_xff;
+    }
+    const customSock = parseJsonArrayChecked(item.sockopt_custom_json, diagnostics, `${pathPrefix}.sockopt_custom_json`);
+    if (customSock) sockopt.customSockopt = customSock;
+    if (
+      item.sockopt_happy_eyeballs_try_delay_ms ||
+      item.sockopt_happy_eyeballs_prioritize_ipv6 ||
+      item.sockopt_happy_eyeballs_interleave ||
+      item.sockopt_happy_eyeballs_max_concurrent_try
+    ) {
+      const he: Record<string, unknown> = {};
+      if (item.sockopt_happy_eyeballs_try_delay_ms !== undefined) {
+        he.tryDelayMs = item.sockopt_happy_eyeballs_try_delay_ms;
+      }
+      if (item.sockopt_happy_eyeballs_prioritize_ipv6) he.prioritizeIPv6 = true;
+      if (item.sockopt_happy_eyeballs_interleave !== undefined) {
+        he.interleave = item.sockopt_happy_eyeballs_interleave;
+      }
+      if (item.sockopt_happy_eyeballs_max_concurrent_try !== undefined) {
+        he.maxConcurrentTry = item.sockopt_happy_eyeballs_max_concurrent_try;
+      }
+      sockopt.happyEyeballs = he;
+    }
     if (item.domain_strategy) sockopt.domainStrategy = item.domain_strategy;
     if (item.dialer_proxy) sockopt.dialerProxy = item.dialer_proxy;
   }
@@ -362,11 +508,14 @@ function compileInbound(
   diagnostics: CompileDiagnostic[]
 ): Record<string, unknown> | null {
   const isXray = core === 'xray';
-  if (!isXray && (item.protocol === 'tun' || item.protocol === 'wireguard' || item.protocol === 'masque')) {
+  if (!isXray && item.protocol === 'tun') {
+    return null; // Handled via v4 services.tun
+  }
+  if (!isXray && (item.protocol === 'wireguard' || item.protocol === 'masque')) {
     diagnostics.push({
-      level: 'warning',
+      level: 'error',
       path: `inbounds.${item.tag}`,
-      message: `V2Ray jsonv4 不支持入站协议 "${item.protocol}"，已跳过该入站。`
+      message: `V2Ray jsonv4 不支持入站协议 "${item.protocol}"。`
     });
     return null;
   }
@@ -392,22 +541,31 @@ function compileInbound(
       udp: !!item.socks_udp
     };
     if (item.socks_ip) s.ip = item.socks_ip;
+    if (!isXray && item.packet_encoding) s.packetEncoding = item.packet_encoding;
     if (item.socks_auth === 'password') {
-      if (userList) {
-        s.accounts = userList.map((u) => ({ user: u.username || '', pass: u.password || '' }));
-      } else if (item.username) {
-        s.accounts = [{ user: item.username, pass: item.password || '' }];
+      const creds = userList
+        ? userList.map((u) => ({ user: u.username || '', pass: u.password || '' }))
+        : item.username
+          ? [{ user: item.username, pass: item.password || '' }]
+          : [];
+      if (creds.length > 0) {
+        s[isXray ? 'users' : 'accounts'] = creds;
       }
     }
     obj.settings = s;
   } else if (proto === 'http') {
-    if (userList) {
-      obj.settings = {
-        accounts: userList.map((u) => ({ user: u.username || '', pass: u.password || '' }))
-      };
-    } else if (item.username) {
-      obj.settings = { accounts: [{ user: item.username, pass: item.password || '' }] };
+    const s: Record<string, unknown> = {};
+    const creds = userList
+      ? userList.map((u) => ({ user: u.username || '', pass: u.password || '' }))
+      : item.username
+        ? [{ user: item.username, pass: item.password || '' }]
+        : [];
+    if (creds.length > 0) {
+      s[isXray ? 'users' : 'accounts'] = creds;
     }
+    if (item.http_allow_transparent) s.allowTransparent = true;
+    if (!isXray && item.http_timeout) s.timeout = item.http_timeout;
+    obj.settings = s;
   } else if (proto === 'dokodemo-door') {
     const s: Record<string, unknown> = {
       network: item.dokodemo_network || 'tcp,udp',
@@ -423,9 +581,12 @@ function compileInbound(
     };
     if (item.dokodemo_address) s.rewriteAddress = item.dokodemo_address;
     if (item.dokodemo_port) s.rewritePort = item.dokodemo_port;
+    const portMap = kvToMap(item.tunnel_port_map);
+    if (portMap) s.portMap = portMap;
+    if (item.tunnel_user_level !== undefined) s.userLevel = item.tunnel_user_level;
     obj.settings = s;
   } else if (proto === 'vless') {
-    const clients = userList
+    const entries = userList
       ? userList.map((u) =>
           isXray
             ? { id: u.id || '', flow: u.flow || '', email: u.email || undefined, level: u.level ?? 0 }
@@ -433,13 +594,13 @@ function compileInbound(
         )
       : [isXray ? { id: item.uuid || '', flow: item.flow || '' } : { id: item.uuid || '' }];
     const s: Record<string, unknown> = {
-      clients,
+      [isXray ? 'users' : 'clients']: entries,
       decryption: isXray ? item.decryption || 'none' : 'none'
     };
     if (item.fallbacks && item.fallbacks.length > 0) s.fallbacks = item.fallbacks;
     obj.settings = s;
   } else if (proto === 'vmess') {
-    const clients = userList
+    const entries = userList
       ? userList.map((u) =>
           isXray
             ? { id: u.id || '', email: u.email || undefined, level: u.level ?? 0 }
@@ -450,27 +611,83 @@ function compileInbound(
             ? { id: item.uuid || '' }
             : { id: item.uuid || '', alterId: item.alter_id || 0 }
         ];
-    obj.settings = { clients };
+    obj.settings = { [isXray ? 'users' : 'clients']: entries };
   } else if (proto === 'trojan') {
-    const clients = userList
+    const entries = userList
       ? userList.map((u) => ({ password: u.password || '', email: u.email || undefined, level: u.level ?? 0 }))
       : [{ password: item.password || '' }];
-    const s: Record<string, unknown> = { clients };
+    const s: Record<string, unknown> = { [isXray ? 'users' : 'clients']: entries };
     if (item.fallbacks && item.fallbacks.length > 0) s.fallbacks = item.fallbacks;
+    if (!isXray && item.packet_encoding) s.packetEncoding = item.packet_encoding;
     obj.settings = s;
   } else if (proto === 'shadowsocks') {
-    obj.settings = {
+    const s: Record<string, unknown> = {
       method: item.method || 'aes-256-gcm',
       password: item.password || '',
       network: item.ss_network || 'tcp,udp'
     };
+    if (!isXray && item.packet_encoding) s.packetEncoding = item.packet_encoding;
+    obj.settings = s;
+  } else if (proto === 'hysteria' && isXray) {
+    const users = userList
+      ? userList.map((u) => ({ auth: u.auth || u.password || '', email: u.email || undefined, level: u.level ?? 0 }))
+      : [{ auth: item.hysteria_auth || item.password || '' }];
+    obj.settings = { version: 2, users };
+  } else if (proto === 'hysteria2' && !isXray) {
+    const s: Record<string, unknown> = {};
+    if (item.packet_encoding) s.packetEncoding = item.packet_encoding;
+    obj.settings = s;
+  } else if (proto === 'wireguard' && isXray) {
+    obj.settings = {
+      secretKey: item.wg_secret_key || '',
+      address: item.wg_address || [],
+      peers: item.wg_peers || [],
+      mtu: item.wg_mtu || 1420
+    };
+  } else if (proto === 'masque' && isXray) {
+    const users = userList
+      ? userList.map((u) => ({
+          email: u.email || u.username || '',
+          pass: u.password || u.auth || '',
+          level: u.level ?? 0
+        }))
+      : item.username || item.password
+        ? [{ email: item.username || '', pass: item.password || '', level: 0 }]
+        : [];
+    if (users.length === 0) {
+      diagnostics.push({
+        level: 'warning',
+        path: `inbounds.${item.tag}.users`,
+        message: 'Xray MASQUE 入站未配置 users，所有连接将被拒绝。'
+      });
+    }
+    obj.settings = {
+      users,
+      address: item.masque_address && item.masque_address.length > 0 ? item.masque_address : ['10.0.0.1/24'],
+      mtu: item.masque_mtu || 1280
+    };
   } else if (proto === 'tun' && isXray) {
     delete obj.listen;
     delete obj.port;
-    obj.settings = {
+    const tunSettings: Record<string, unknown> = {
       name: item.tun_name || 'xray0',
-      MTU: item.tun_mtu || 1500
+      mtu: item.tun_mtu || 1500
     };
+    if (item.tun_desc) tunSettings.desc = item.tun_desc;
+    if (item.tun_gateway && item.tun_gateway.length > 0) tunSettings.gateway = item.tun_gateway;
+    if (item.tun_dns && item.tun_dns.length > 0) tunSettings.dns = item.tun_dns;
+    if (item.tun_user_level !== undefined) tunSettings.userLevel = item.tun_user_level;
+    if (item.tun_auto_routing_table && item.tun_auto_routing_table.length > 0) {
+      tunSettings.autoSystemRoutingTable = item.tun_auto_routing_table;
+    }
+    if (item.tun_auto_outbounds_interface) {
+      tunSettings.autoOutboundsInterface = item.tun_auto_outbounds_interface;
+    }
+    if (item.tun_auto_dns_to_gateway) tunSettings.autoSystemDnsToGateway = true;
+    if (item.tun_auto_wfp_block_leak && item.tun_auto_wfp_block_leak.length > 0) {
+      tunSettings.autoSystemWfpBlockLeak = item.tun_auto_wfp_block_leak;
+    }
+    obj.settings = tunSettings;
   }
 
   if (item.sniffing_enabled) {
@@ -499,11 +716,15 @@ function compileInbound(
     };
   }
 
-  if (item.transport || item.security !== 'none' || (item.sockopt_tproxy && item.sockopt_tproxy !== 'off')) {
-    obj.streamSettings = buildStreamSettings(item, core, true, null, diagnostics, `inbounds.${item.tag}`);
+  if (
+    proto !== 'tun' &&
+    proto !== 'wireguard' &&
+    (item.transport || item.security !== 'none' || (item.sockopt_tproxy && item.sockopt_tproxy !== 'off'))
+  ) {
+    obj.streamSettings = buildStreamSettings(item, core, proto, true, null, diagnostics, `inbounds.${item.tag}`);
   }
 
-  const custom = parseJsonSafe(item.custom_config);
+  const custom = parseJsonObjectChecked(item.custom_config, diagnostics, `inbounds.${item.tag}.custom_config`);
   return custom ? deepMerge(obj, custom) : obj;
 }
 
@@ -516,9 +737,17 @@ function compileOutbound(
   const isXray = core === 'xray';
   if (!isXray && (item.protocol === 'wireguard' || item.protocol === 'masque')) {
     diagnostics.push({
-      level: 'warning',
+      level: 'error',
       path: `outbounds.${item.tag}`,
-      message: `V2Ray 不支持出站协议 "${item.protocol}"，已跳过。`
+      message: `V2Ray 不支持出站协议 "${item.protocol}"。`
+    });
+    return null;
+  }
+  if (!isXray && item.protocol === 'shadowsocks2022') {
+    diagnostics.push({
+      level: 'error',
+      path: `outbounds.${item.tag}`,
+      message: 'V2Ray jsonv4 不支持 shadowsocks2022，请将 V2Ray 格式切换为 jsonv5 或改用 Xray-core。'
     });
     return null;
   }
@@ -533,23 +762,54 @@ function compileOutbound(
     settings: {}
   };
   if (item.send_through) obj.sendThrough = item.send_through;
+  if (isXray && item.target_strategy) obj.targetStrategy = item.target_strategy;
 
   if (proto === 'freedom') {
     const s: Record<string, unknown> = {};
     if (!isXray && item.domain_strategy) s.domainStrategy = item.domain_strategy;
     if (item.freedom_redirect) s.redirect = item.freedom_redirect;
+    if (isXray && item.user_level !== undefined) s.userLevel = item.user_level;
+    if (isXray && item.freedom_proxy_protocol) s.proxyProtocol = item.freedom_proxy_protocol;
+    if (isXray && item.freedom_final_rules_json) {
+      const fr = parseJsonArrayChecked(item.freedom_final_rules_json, diagnostics, `outbounds.${item.tag}.freedom_final_rules_json`);
+      if (fr) s.finalRules = fr;
+    }
     obj.settings = s;
   } else if (proto === 'blackhole') {
     obj.settings = { response: { type: item.blackhole_response || 'none' } };
   } else if (proto === 'dns') {
     const s: Record<string, unknown> = {};
-    if (item.dns_network) s.network = item.dns_network;
-    if (item.dns_address) s.address = item.dns_address;
-    if (item.dns_port) s.port = item.dns_port;
-    if (isXray && item.dns_non_ip_query) s.nonIPQuery = item.dns_non_ip_query;
+    if (isXray) {
+      if (item.dns_network) s.rewriteNetwork = item.dns_network;
+      if (item.dns_address) s.rewriteAddress = item.dns_address;
+      if (item.dns_port) s.rewritePort = item.dns_port;
+      if (item.dns_non_ip_query) s.nonIPQuery = item.dns_non_ip_query;
+      const rules = parseJsonArrayChecked(item.dns_rules_json, diagnostics, `outbounds.${item.tag}.dns_rules_json`);
+      if (rules) s.rules = rules;
+    } else {
+      if (item.dns_network) s.network = item.dns_network;
+      if (item.dns_address) s.address = item.dns_address;
+      if (item.dns_port) s.port = item.dns_port;
+    }
     obj.settings = s;
   } else if (proto === 'loopback') {
-    obj.settings = { inboundTag: item.loopback_inbound_tag || '' };
+    const s: Record<string, unknown> = { inboundTag: item.loopback_inbound_tag || '' };
+    if (isXray && item.loopback_sniffing_enabled) {
+      const sn: Record<string, unknown> = {
+        enabled: true,
+        destOverride: item.loopback_sniffing_dest_override || ['http', 'tls'],
+        metadataOnly: !!item.loopback_sniffing_metadata_only,
+        routeOnly: !!item.loopback_sniffing_route_only
+      };
+      if (item.loopback_sniffing_domains_excluded && item.loopback_sniffing_domains_excluded.length > 0) {
+        sn.domainsExcluded = item.loopback_sniffing_domains_excluded;
+      }
+      if (item.loopback_sniffing_ips_excluded && item.loopback_sniffing_ips_excluded.length > 0) {
+        sn.ipsExcluded = item.loopback_sniffing_ips_excluded;
+      }
+      s.sniffing = sn;
+    }
+    obj.settings = s;
   } else if (proto === 'vless') {
     if (!isXray && item.flow) {
       diagnostics.push({
@@ -558,65 +818,140 @@ function compileOutbound(
         message: 'V2Ray 不支持 VLESS flow (xtls-rprx-vision)，已自动忽略。'
       });
     }
-    obj.settings = {
-      vnext: [
-        {
-          address: item.address || '',
-          port: item.port || 443,
-          users: [
-            isXray
-              ? {
-                  id: item.uuid || '',
-                  encryption: item.encryption || 'none',
-                  flow: item.flow || ''
-                }
-              : { id: item.uuid || '', encryption: 'none' }
-          ]
-        }
-      ]
-    };
+    if (isXray) {
+      const s: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 443,
+        id: item.uuid || '',
+        encryption: item.encryption || 'none'
+      };
+      if (item.flow) s.flow = item.flow;
+      if (item.user_level !== undefined) s.level = item.user_level;
+      if (item.vless_reverse_tag) s.reverse = { tag: item.vless_reverse_tag };
+      obj.settings = s;
+    } else {
+      obj.settings = {
+        vnext: [
+          {
+            address: item.address || '',
+            port: item.port || 443,
+            users: [{ id: item.uuid || '', encryption: 'none' }]
+          }
+        ]
+      };
+    }
   } else if (proto === 'vmess') {
-    obj.settings = {
-      vnext: [
-        {
-          address: item.address || '',
-          port: item.port || 443,
-          users: [
-            isXray
-              ? { id: item.uuid || '', security: item.security_cipher || 'auto' }
-              : {
-                  id: item.uuid || '',
-                  alterId: item.alter_id || 0,
-                  security: item.security_cipher || 'auto'
-                }
-          ]
-        }
-      ]
-    };
+    if (isXray) {
+      const s: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 443,
+        id: item.uuid || '',
+        security: item.security_cipher || 'auto'
+      };
+      if (item.user_level !== undefined) s.level = item.user_level;
+      if (item.vmess_experiments) s.experiments = item.vmess_experiments;
+      obj.settings = s;
+    } else {
+      obj.settings = {
+        vnext: [
+          {
+            address: item.address || '',
+            port: item.port || 443,
+            users: [
+              {
+                id: item.uuid || '',
+                alterId: item.alter_id || 0,
+                security: item.security_cipher || 'auto'
+              }
+            ]
+          }
+        ]
+      };
+    }
   } else if (proto === 'trojan') {
-    obj.settings = {
-      servers: [
-        { address: item.address || '', port: item.port || 443, password: item.password || '' }
-      ]
-    };
+    if (isXray) {
+      const s: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 443,
+        password: item.password || ''
+      };
+      if (item.email) s.email = item.email;
+      if (item.user_level !== undefined) s.level = item.user_level;
+      obj.settings = s;
+    } else {
+      obj.settings = {
+        servers: [
+          { address: item.address || '', port: item.port || 443, password: item.password || '' }
+        ]
+      };
+    }
   } else if (proto === 'shadowsocks') {
-    const srv: Record<string, unknown> = {
-      address: item.address || '',
-      port: item.port || 8388,
-      method: item.method || 'aes-256-gcm',
-      password: item.password || ''
-    };
-    if (isXray && item.ss_uot) srv.uot = true;
-    if (!isXray && item.ss_iv_check) srv.ivCheck = true;
-    obj.settings = { servers: [srv] };
+    if (isXray) {
+      const s: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 8388,
+        method: item.method || 'aes-256-gcm',
+        password: item.password || ''
+      };
+      if (item.email) s.email = item.email;
+      if (item.user_level !== undefined) s.level = item.user_level;
+      if (item.ss_uot) s.uot = true;
+      if (item.ss_uot_version) s.UoTVersion = item.ss_uot_version;
+      obj.settings = s;
+    } else {
+      const srv: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 8388,
+        method: item.method || 'aes-256-gcm',
+        password: item.password || ''
+      };
+      if (item.ss_iv_check) srv.ivCheck = true;
+      obj.settings = { servers: [srv] };
+    }
   } else if (proto === 'hysteria') {
     obj.settings = { version: 2, address: item.address || '', port: item.port || 443 };
   } else if (proto === 'hysteria2') {
     obj.settings = { servers: [{ address: item.address || '', port: item.port || 443 }] };
-  } else if (proto === 'socks' || proto === 'http') {
-    const srv: Record<string, unknown> = { address: item.address || '', port: item.port || 1080 };
-    if (item.username) srv.users = [{ user: item.username, pass: item.password || '' }];
-    obj.settings = { servers: [srv] };
+  } else if (proto === 'socks') {
+    if (isXray) {
+      const s: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 1080
+      };
+      if (item.username) {
+        s.user = item.username;
+        s.pass = item.password || '';
+        if (item.email) s.email = item.email;
+        if (item.user_level !== undefined) s.level = item.user_level;
+      }
+      obj.settings = s;
+    } else {
+      const srv: Record<string, unknown> = { address: item.address || '', port: item.port || 1080 };
+      if (item.username) srv.users = [{ user: item.username, pass: item.password || '' }];
+      const s: Record<string, unknown> = { servers: [srv] };
+      if (item.socks_version) s.version = item.socks_version;
+      obj.settings = s;
+    }
+  } else if (proto === 'http') {
+    if (isXray) {
+      const s: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 8080
+      };
+      if (item.username) {
+        s.user = item.username;
+        s.pass = item.password || '';
+        if (item.email) s.email = item.email;
+        if (item.user_level !== undefined) s.level = item.user_level;
+      }
+      const headers = kvToMap(item.http_headers);
+      if (headers) s.headers = headers;
+      obj.settings = s;
+    } else {
+      const srv: Record<string, unknown> = { address: item.address || '', port: item.port || 8080 };
+      if (item.username) srv.users = [{ user: item.username, pass: item.password || '' }];
+      obj.settings = { servers: [srv] };
+    }
   } else if (proto === 'wireguard' && isXray) {
     const peers =
       item.wg_peers && item.wg_peers.length > 0
@@ -627,12 +962,24 @@ function compileOutbound(
       address: item.wg_address || [],
       peers,
       mtu: item.wg_mtu || 1420,
-      noKernelTun: item.wg_no_kernel_tun !== false
+      noKernelTun: item.wg_no_kernel_tun === true
     };
     if (item.wg_reserved && item.wg_reserved.length > 0) {
       wg.reserved = item.wg_reserved.map((n) => Number(n)).filter((n) => Number.isFinite(n));
     }
+    if (item.wg_remote_dns && item.wg_remote_dns.length > 0) {
+      wg.remoteDNS = item.wg_remote_dns;
+    }
     obj.settings = wg;
+  } else if (proto === 'masque' && isXray) {
+    const mq: Record<string, unknown> = {
+      address: item.address || '',
+      port: item.port || 443
+    };
+    if (item.masque_remote_dns && item.masque_remote_dns.length > 0) {
+      mq.remoteDNS = item.masque_remote_dns;
+    }
+    obj.settings = mq;
   }
 
   if (!isXray && item.dialer_proxy) {
@@ -640,12 +987,37 @@ function compileOutbound(
   }
 
   const mark = proto === 'dns' ? null : defaultMark;
-  obj.streamSettings = buildStreamSettings(item, core, false, mark, diagnostics, `outbounds.${item.tag}`);
+  if (proto !== 'wireguard') {
+    obj.streamSettings = buildStreamSettings(item, core, proto, false, mark, diagnostics, `outbounds.${item.tag}`);
+  } else {
+    const wgSock: Record<string, unknown> = {};
+    const m = item.sockopt_mark ?? mark;
+    if (m !== null && m > 0) wgSock.mark = m;
+    if (item.sockopt_interface) wgSock.interface = item.sockopt_interface;
+    if (item.domain_strategy) wgSock.domainStrategy = item.domain_strategy;
+    if (item.dialer_proxy) wgSock.dialerProxy = item.dialer_proxy;
+    if (Object.keys(wgSock).length > 0) obj.streamSettings = { sockopt: wgSock };
+  }
 
   if (item.mux_enabled) {
+    if (isXray && proto === 'masque') {
+      diagnostics.push({
+        level: 'warning',
+        path: `outbounds.${item.tag}.mux`,
+        message: 'Xray MASQUE 出站不支持 Mux。'
+      });
+    }
+    const concurrency = item.mux_concurrency ?? 8;
+    if (isXray && concurrency > 128) {
+      diagnostics.push({
+        level: 'warning',
+        path: `outbounds.${item.tag}.mux.concurrency`,
+        message: `Xray mux.concurrency 最大值为 128（当前 ${concurrency}，超过 128 核心按 128 处理）。`
+      });
+    }
     const mux: Record<string, unknown> = {
       enabled: true,
-      concurrency: item.mux_concurrency ?? 8
+      concurrency: isXray && concurrency > 128 ? 128 : concurrency
     };
     if (isXray) {
       if (item.mux_xudp_concurrency) mux.xudpConcurrency = item.mux_xudp_concurrency;
@@ -654,7 +1026,7 @@ function compileOutbound(
     obj.mux = mux;
   }
 
-  const custom = parseJsonSafe(item.custom_config);
+  const custom = parseJsonObjectChecked(item.custom_config, diagnostics, `outbounds.${item.tag}.custom_config`);
   return custom ? deepMerge(obj, custom) : obj;
 }
 
@@ -684,6 +1056,21 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
     inbounds: [] as Record<string, unknown>[],
     outbounds: [] as Record<string, unknown>[]
   };
+
+  // Xray top-level extensions: env, geodata, version
+  if (isXray) {
+    const envMap = kvToMap(cfg.general.inline_env);
+    if (envMap) doc.env = envMap;
+    if (cfg.general.geodata_reload_interval) {
+      doc.geodata = { reloadInterval: cfg.general.geodata_reload_interval };
+    }
+    if (cfg.general.min_version || cfg.general.max_version) {
+      const ver: Record<string, string> = {};
+      if (cfg.general.min_version) ver.min = cfg.general.min_version;
+      if (cfg.general.max_version) ver.max = cfg.general.max_version;
+      doc.version = ver;
+    }
+  }
 
   if (cfg.general.stats_enabled) doc.stats = {};
 
@@ -734,6 +1121,7 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
       .filter((s) => s.enabled)
       .map((s) => {
         const srv: Record<string, unknown> = { address: s.address };
+        if (isXray && s.server_id) srv.id = s.server_id;
         if (s.port) srv.port = s.port;
         if (s.skip_fallback) srv.skipFallback = true;
         if (s.domains && s.domains.length > 0) srv.domains = s.domains;
@@ -744,6 +1132,15 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
           srv.unexpectedIPs = s.unexpected_ips;
         }
         if (s.client_ip) srv[isXray ? 'clientIP' : 'clientIp'] = s.client_ip;
+        if (isXray) {
+          if (s.query_strategy) srv.queryStrategy = s.query_strategy;
+          if (s.disable_cache) srv.disableCache = true;
+          if (s.serve_stale) srv.serveStale = true;
+          if (s.serve_expired_ttl) srv.serveExpiredTTL = s.serve_expired_ttl;
+          if (s.timeout_ms) srv.timeoutMs = s.timeout_ms;
+          if (s.final_query) srv.finalQuery = true;
+          if (s.tag) srv.tag = s.tag;
+        }
         return srv;
       });
 
@@ -757,8 +1154,11 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
       servers
     };
     if (isXray) {
+      if (cfg.dns.script) dnsObj.script = cfg.dns.script;
       dnsObj.serveStale = cfg.dns.serve_stale;
+      if (cfg.dns.serve_expired_ttl) dnsObj.serveExpiredTTL = cfg.dns.serve_expired_ttl;
       dnsObj.enableParallelQuery = cfg.dns.enable_parallel_query;
+      if (cfg.dns.use_system_hosts) dnsObj.useSystemHosts = true;
     }
     if (cfg.dns.client_ip) dnsObj.clientIp = cfg.dns.client_ip;
 
@@ -790,6 +1190,7 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
       if (rr.ip && rr.ip.length > 0) rule.ip = rr.ip;
       if (rr.port) rule.port = rr.port;
       if (rr.source_port) rule.sourcePort = rr.source_port;
+      if (isXray && rr.local_port) rule.localPort = rr.local_port;
       if (rr.network) rule.network = rr.network;
       if (rr.source && rr.source.length > 0) rule.source = rr.source;
       if (isXray && rr.local_ip && rr.local_ip.length > 0) rule.localIP = rr.local_ip;
@@ -800,9 +1201,18 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
         const protos = isXray ? rr.protocol : rr.protocol.filter((p) => p !== 'quic');
         if (protos.length > 0) rule.protocol = protos;
       }
+      if (isXray && rr.vless_route) rule.vlessRoute = rr.vless_route;
+      if (isXray && rr.rule_tag) rule.ruleTag = rr.rule_tag;
+      if (isXray && rr.webhook_url) {
+        const wh: Record<string, unknown> = { url: rr.webhook_url };
+        if (rr.webhook_deduplication) wh.deduplication = rr.webhook_deduplication;
+        const whHeaders = kvToMap(rr.webhook_headers);
+        if (whHeaders) wh.headers = whHeaders;
+        rule.webhook = wh;
+      }
       if (rr.attrs && rr.attrs.trim()) {
         if (isXray) {
-          const parsedAttrs = parseJsonSafe(rr.attrs);
+          const parsedAttrs = parseJsonObjectChecked(rr.attrs, diagnostics, `routing_rules.${rr.id}.attrs`);
           if (parsedAttrs) rule.attrs = parsedAttrs;
         } else {
           rule.attrs = rr.attrs;
@@ -828,25 +1238,38 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
           diagnostics.push({
             level: 'warning',
             path: `balancers.${b.tag}`,
-            message: 'V2Ray 不支持 leastLoad，已自动降级为 leastPing。'
+            message: 'V2Ray jsonv4 不支持 leastLoad，已自动降级为 leastPing。'
           });
         }
+      }
+      const strategyObj: Record<string, unknown> = { type: strat };
+      if (isXray && strat === 'leastLoad') {
+        const stSettings: Record<string, unknown> = {};
+        if (b.strategy_expected !== undefined) stSettings.expected = b.strategy_expected;
+        if (b.strategy_max_rtt) stSettings.maxRTT = b.strategy_max_rtt;
+        if (b.strategy_tolerance !== undefined) stSettings.tolerance = b.strategy_tolerance;
+        if (b.strategy_baselines && b.strategy_baselines.length > 0) stSettings.baselines = b.strategy_baselines;
+        const costs = parseJsonArrayChecked(b.strategy_costs_json, diagnostics, `balancers.${b.tag}.strategy_costs_json`);
+        if (costs) stSettings.costs = costs;
+        if (Object.keys(stSettings).length > 0) strategyObj.settings = stSettings;
       }
       const out: Record<string, unknown> = {
         tag: b.tag,
         selector: b.selector,
-        strategy: { type: strat }
+        strategy: strategyObj
       };
       if (isXray && b.fallback_tag) out.fallbackTag = b.fallback_tag;
       return out;
     });
 
-    doc.routing = {
+    const routingObj: Record<string, unknown> = {
       domainStrategy: cfg.routing.domain_strategy,
       domainMatcher: !isXray && cfg.routing.domain_matcher === 'hybrid' ? 'linear' : cfg.routing.domain_matcher,
       rules,
       balancers
     };
+    if (isXray && cfg.routing.script) routingObj.script = cfg.routing.script;
+    doc.routing = routingObj;
   }
 
   // Observatory
@@ -864,18 +1287,106 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
     doc.observatory = obs;
   }
 
-  // Policy
-  if (cfg.policy.enabled) {
-    doc.policy = {
-      levels: {
-        '0': {
-          handshake: cfg.policy.handshake,
-          connIdle: cfg.policy.conn_idle,
-          uplinkOnly: cfg.policy.uplink_only,
-          downlinkOnly: cfg.policy.downlink_only,
-          bufferSize: cfg.policy.buffer_size
+  // BurstObservatory (Xray top-level)
+  if (isXray && cfg.burst_observatory?.enabled) {
+    doc.burstObservatory = {
+      subjectSelector: cfg.burst_observatory.subject_selector,
+      pingConfig: {
+        destination: cfg.burst_observatory.destination || 'https://www.google.com/generate_204',
+        connectivity: cfg.burst_observatory.connectivity || undefined,
+        interval: cfg.burst_observatory.interval || '1m',
+        sampling: cfg.burst_observatory.sampling || 3,
+        timeout: cfg.burst_observatory.timeout || '5s'
+      }
+    };
+  }
+
+  // V2Ray jsonv4 services: burstObservatory, tun
+  if (!isXray) {
+    const v4Services: Record<string, unknown> = {};
+    if (cfg.burst_observatory?.enabled) {
+      v4Services.burstObservatory = {
+        subjectSelector: cfg.burst_observatory.subject_selector,
+        pingConfig: {
+          destination: cfg.burst_observatory.destination || 'https://www.google.com/generate_204',
+          connectivity: cfg.burst_observatory.connectivity || undefined,
+          interval: parseDurationToNs(cfg.burst_observatory.interval, 60e9),
+          samplingCount: cfg.burst_observatory.sampling || 3,
+          timeout: parseDurationToNs(cfg.burst_observatory.timeout, 5e9)
         }
-      },
+      };
+    }
+    const tunInbound = cfg.inbounds.find((i) => i.enabled && i.protocol === 'tun');
+    if (tunInbound) {
+      const parsedIps = (tunInbound.tun_ips || [])
+        .map(parseCidrToBytes)
+        .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+      const parsedRoutes = (tunInbound.tun_routes || [])
+        .map(parseCidrToBytes)
+        .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+      const tunSvc: Record<string, unknown> = {
+        name: tunInbound.tun_name || 'aios0',
+        mtu: tunInbound.tun_mtu || 1500,
+        tag: tunInbound.tag || 'tun-in',
+        ips: parsedIps.length > 0 ? parsedIps : [{ ip: [10, 0, 0, 1], prefix: 24 }],
+        routes: parsedRoutes.length > 0 ? parsedRoutes : [{ ip: [0, 0, 0, 0], prefix: 0 }],
+        enablePromiscuousMode: tunInbound.tun_promiscuous !== false,
+        enableSpoofing: tunInbound.tun_spoofing !== false
+      };
+      if (tunInbound.packet_encoding) tunSvc.packetEncoding = tunInbound.packet_encoding;
+      if (tunInbound.sniffing_enabled) {
+        tunSvc.sniffingSettings = {
+          enabled: true,
+          destinationOverride:
+            tunInbound.sniffing_dest_override && tunInbound.sniffing_dest_override.length > 0
+              ? tunInbound.sniffing_dest_override
+              : ['http', 'tls'],
+          metadataOnly: !!tunInbound.sniffing_metadata_only
+        };
+      }
+      v4Services.tun = tunSvc;
+    }
+    if (Object.keys(v4Services).length > 0) doc.services = v4Services;
+  }
+
+  // BrowserForwarder (V2Ray jsonv4 top-level)
+  if (!isXray && cfg.browser_forwarder?.enabled) {
+    doc.browserForwarder = {
+      listenAddr: cfg.browser_forwarder.listen_addr || '127.0.0.1',
+      listenPort: cfg.browser_forwarder.listen_port || 8088
+    };
+  }
+
+  // Policy (multi-level)
+  if (cfg.policy.enabled) {
+    const levelsMap: Record<string, Record<string, unknown>> = {};
+    const levels = cfg.policy.levels && cfg.policy.levels.length > 0
+      ? cfg.policy.levels
+      : [
+          {
+            level: '0',
+            handshake: cfg.policy.handshake,
+            conn_idle: cfg.policy.conn_idle,
+            uplink_only: cfg.policy.uplink_only,
+            downlink_only: cfg.policy.downlink_only,
+            buffer_size: cfg.policy.buffer_size,
+            stats_user_uplink: true,
+            stats_user_downlink: true
+          }
+        ];
+    for (const lv of levels) {
+      levelsMap[lv.level || '0'] = {
+        handshake: lv.handshake,
+        connIdle: lv.conn_idle,
+        uplinkOnly: lv.uplink_only,
+        downlinkOnly: lv.downlink_only,
+        bufferSize: lv.buffer_size,
+        statsUserUplink: lv.stats_user_uplink,
+        statsUserDownlink: lv.stats_user_downlink
+      };
+    }
+    doc.policy = {
+      levels: levelsMap,
       system: {
         statsInboundUplink: cfg.policy.stats_inbound_uplink,
         statsInboundDownlink: cfg.policy.stats_inbound_downlink,
@@ -885,17 +1396,25 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
     };
   }
 
-  // Reverse
+  // Reverse (Xray removed legacy top-level reverse in favor of VLESS Reverse Proxy)
   if (cfg.reverse.enabled) {
-    const mapPair = (arr: string[]) =>
-      arr
-        .map((s) => s.split('|'))
-        .filter((p) => p.length === 2 && p[0].trim() && p[1].trim())
-        .map(([tag, domain]) => ({ tag: tag.trim(), domain: domain.trim() }));
-    doc.reverse = {
-      bridges: mapPair(cfg.reverse.bridges),
-      portals: mapPair(cfg.reverse.portals)
-    };
+    if (isXray) {
+      diagnostics.push({
+        level: 'warning',
+        path: 'reverse',
+        message: 'Xray 26+ 已移除顶层 legacy reverse，请改用 VLESS 入出站 reverse 配置，已跳过生成顶层 reverse。'
+      });
+    } else {
+      const mapPair = (arr: string[]) =>
+        arr
+          .map((s) => s.split('|'))
+          .filter((p) => p.length === 2 && p[0].trim() && p[1].trim())
+          .map(([tag, domain]) => ({ tag: tag.trim(), domain: domain.trim() }));
+      doc.reverse = {
+        bridges: mapPair(cfg.reverse.bridges),
+        portals: mapPair(cfg.reverse.portals)
+      };
+    }
   }
 
   return { core, json: doc, diagnostics };

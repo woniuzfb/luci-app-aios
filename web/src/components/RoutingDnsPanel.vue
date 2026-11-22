@@ -1,16 +1,17 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import type { AiosConfig, CoreType } from '@/schema/types';
-import { CORE_CAPABILITIES } from '@/schema/capabilities';
+import { getCoreCapabilities, type V2RayFormat } from '@/schema/capabilities';
 import ArrayInput from '@/components/ui/ArrayInput.vue';
 import ToggleSwitch from '@/components/ui/ToggleSwitch.vue';
 
 const props = defineProps<{
   config: AiosConfig;
   core: CoreType;
+  v2rayFormat?: V2RayFormat;
 }>();
 
-const cap = computed(() => CORE_CAPABILITIES[props.core]);
+const cap = computed(() => getCoreCapabilities(props.core, props.v2rayFormat || 'jsonv4'));
 const subTab = ref<'dns' | 'routing' | 'balancers' | 'policy'>('dns');
 
 function addDnsServer() {
@@ -45,6 +46,7 @@ function addRoutingRule() {
     inbound_tag: [],
     protocol: [],
     process: [],
+    attrs: '',
     outbound_tag: 'direct'
   });
 }
@@ -65,6 +67,47 @@ function addFakeDns() {
     ip_pool: '198.18.0.0/15',
     pool_size: 65535
   });
+}
+
+function addPolicyLevel() {
+  if (!props.config.policy.levels) props.config.policy.levels = [];
+  const nextLevel = String(props.config.policy.levels.length);
+  props.config.policy.levels.unshift({
+    level: nextLevel,
+    handshake: 4,
+    conn_idle: 300,
+    uplink_only: 2,
+    downlink_only: 5,
+    buffer_size: 4,
+    stats_user_uplink: false,
+    stats_user_downlink: false
+  });
+}
+
+function ensureBurstObservatory() {
+  if (!props.config.burst_observatory) {
+    props.config.burst_observatory = {
+      enabled: false,
+      subject_selector: [],
+      destination: 'https://www.google.com/generate_204',
+      connectivity: '',
+      interval: '1m',
+      sampling: 2,
+      timeout: '5s'
+    };
+  }
+  return props.config.burst_observatory;
+}
+
+function ensureBrowserForwarder() {
+  if (!props.config.browser_forwarder) {
+    props.config.browser_forwarder = {
+      enabled: false,
+      listen_addr: '127.0.0.1',
+      listen_port: 8080
+    };
+  }
+  return props.config.browser_forwarder;
 }
 </script>
 
@@ -105,12 +148,15 @@ function addFakeDns() {
             </select>
           </div>
           <div class="field"><label>全局 ECS (clientIp)</label><input v-model="config.dns.client_ip" type="text" placeholder="可选" /></div>
+          <div v-if="core === 'xray'" class="field"><label>乐观缓存有效期 (serveExpiredTTL, 秒)</label><input v-model.number="config.dns.serve_expired_ttl" type="number" placeholder="0" /></div>
+          <div v-if="core === 'xray'" class="field"><label>Lua 脚本路径 (script, Xray)</label><input v-model="config.dns.script" type="text" placeholder="可选" /></div>
         </div>
 
         <div class="row" style="margin-top: 12px">
           <ToggleSwitch v-model="config.dns.disable_cache" label="disableCache" />
           <ToggleSwitch v-model="config.dns.disable_fallback" label="disableFallback" />
           <ToggleSwitch v-model="config.dns.disable_fallback_if_match" label="disableFallbackIfMatch" />
+          <ToggleSwitch v-if="core === 'xray'" v-model="config.dns.use_system_hosts" label="useSystemHosts (Xray)" />
           <ToggleSwitch v-if="cap.supportsServeStale" v-model="config.dns.serve_stale" label="serveStale (Xray)" />
           <ToggleSwitch v-if="cap.supportsServeStale" v-model="config.dns.enable_parallel_query" label="enableParallelQuery (Xray)" />
         </div>
@@ -131,6 +177,7 @@ function addFakeDns() {
               </div>
               <div class="row-nowrap">
                 <ToggleSwitch v-model="srv.skip_fallback" label="skipFallback" />
+                <ToggleSwitch v-if="core === 'xray'" v-model="srv.final_query" label="finalQuery" />
                 <button class="btn btn-sm btn-danger" @click="config.dns_servers.splice(idx, 1)">删除</button>
               </div>
             </div>
@@ -138,6 +185,22 @@ function addFakeDns() {
               <div class="field"><label>别名</label><input v-model="srv.alias" type="text" /></div>
               <div class="field"><label>地址 (IP / https:// / tls:// / quic+local:// / fakedns)</label><input v-model="srv.address" type="text" /></div>
               <div class="field"><label>端口 (可选)</label><input v-model.number="srv.port" type="number" placeholder="53" /></div>
+              <div v-if="core === 'xray'" class="field"><label>服务器 ID (id, Xray)</label><input v-model="srv.server_id" type="text" placeholder="可选" /></div>
+              <div v-if="core === 'xray'" class="field"><label>查询超时 (timeoutMs, Xray)</label><input v-model.number="srv.timeout_ms" type="number" placeholder="4000" /></div>
+              <div class="field">
+                <label>独立查询策略 (queryStrategy)</label>
+                <select v-model="srv.query_strategy">
+                  <option value="">继承全局</option>
+                  <option value="UseIP">UseIP</option>
+                  <option value="UseIPv4">UseIPv4</option>
+                  <option value="UseIPv6">UseIPv6</option>
+                  <option v-if="core === 'xray'" value="UseSystem">UseSystem</option>
+                </select>
+              </div>
+              <div class="field"><label>独立 Tag (可选)</label><input v-model="srv.tag" type="text" placeholder="如 dns-cn" /></div>
+              <div class="field" style="justify-content: flex-end">
+                <ToggleSwitch v-model="srv.disable_cache" label="disableCache" />
+              </div>
             </div>
             <div class="grid-2">
               <ArrayInput
@@ -209,7 +272,7 @@ function addFakeDns() {
             <button class="btn btn-sm btn-primary" @click="addRoutingRule">+ 新增路由规则</button>
           </div>
         </div>
-        <div class="grid-2">
+        <div class="grid-3">
           <div class="field">
             <label>domainStrategy</label>
             <select v-model="config.routing.domain_strategy">
@@ -225,6 +288,10 @@ function addFakeDns() {
               <option value="linear">linear</option>
               <option value="mph">mph</option>
             </select>
+          </div>
+          <div v-if="core === 'xray'" class="field">
+            <label>路由 Lua 脚本 (script, Xray)</label>
+            <input v-model="config.routing.script" type="text" placeholder="可选" />
           </div>
         </div>
       </div>
@@ -277,9 +344,26 @@ function addFakeDns() {
             <ArrayInput v-model="rr.user" label="用户邮箱 (user[])" placeholder="匹配入站用户 email" />
           </div>
 
-          <div v-if="core === 'xray'" class="grid-2">
+          <div v-if="core === 'xray'" class="grid-2" style="margin-bottom: 10px">
             <ArrayInput v-model="rr.local_ip" label="本地目标 IP (localIP[], Xray)" />
             <ArrayInput v-model="rr.process" label="进程名匹配 (process[], Xray)" />
+          </div>
+
+          <div v-if="core === 'xray'" class="grid-3" style="margin-bottom: 10px">
+            <div class="field"><label>本地入站端口 (localPort, Xray)</label><input v-model="rr.local_port" type="text" placeholder="如 1080-1090" /></div>
+            <div class="field"><label>VLESS 路由值 (vlessRoute, Xray)</label><input v-model="rr.vless_route" type="text" placeholder="可选" /></div>
+            <div class="field"><label>调试标签 (ruleTag, Xray)</label><input v-model="rr.rule_tag" type="text" placeholder="命中时输出日志" /></div>
+            <div class="field"><label>Webhook URL (Xray)</label><input v-model="rr.webhook_url" type="text" placeholder="https://api.example.com/alert" /></div>
+          </div>
+
+          <div class="field">
+            <label v-if="cap.supportsAttrsJson">属性匹配 JSON (attrs — Xray JSON Object，如 {":method":"GET"})</label>
+            <label v-else>属性表达式 (attrs — V2Ray Starlark 表达式，如 attrs[':method'] == 'GET')</label>
+            <input
+              v-model="rr.attrs"
+              type="text"
+              :placeholder="cap.supportsAttrsJson ? '{&quot;:method&quot;:&quot;GET&quot;}' : 'attrs[\':method\'] == \'GET\''"
+            />
           </div>
         </div>
       </div>
@@ -304,7 +388,7 @@ function addFakeDns() {
                 </select>
               </div>
               <div class="row-nowrap">
-                <div v-if="core === 'xray'" class="field" style="flex: 1">
+                <div v-if="core === 'xray' || v2rayFormat === 'jsonv5'" class="field" style="flex: 1">
                   <label>回退节点 (fallbackTag)</label>
                   <input v-model="b.fallback_tag" type="text" placeholder="direct" />
                 </div>
@@ -312,6 +396,11 @@ function addFakeDns() {
               </div>
             </div>
             <ArrayInput v-model="b.selector" label="节点标签前缀列表 (selector[])" placeholder="回车添加出站 tag 前缀" />
+            <div v-if="core === 'xray' && b.strategy === 'leastLoad'" class="grid-3">
+              <div class="field"><label>期望节点数 (expected)</label><input v-model.number="b.strategy_expected" type="number" placeholder="2" /></div>
+              <div class="field"><label>最大 RTT (maxRTT)</label><input v-model="b.strategy_max_rtt" type="text" placeholder="1s" /></div>
+              <div class="field"><label>容忍率 (tolerance)</label><input v-model.number="b.strategy_tolerance" type="number" step="0.01" placeholder="0.01" /></div>
+            </div>
           </div>
         </div>
       </div>
@@ -330,46 +419,99 @@ function addFakeDns() {
           </div>
         </div>
       </div>
+
+      <div class="card" style="margin: 0">
+        <div class="card-header">
+          <h3 class="card-title">突发连接观测 (Burst Observatory — 用于 leastLoad)</h3>
+          <ToggleSwitch v-model="ensureBurstObservatory().enabled" label="启用突发观测" />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 12px">
+          <ArrayInput v-model="ensureBurstObservatory().subject_selector" label="观测节点前缀列表 (subjectSelector[])" />
+          <div class="grid-3">
+            <div class="field"><label>探测目标 (destination)</label><input v-model="ensureBurstObservatory().destination" type="text" placeholder="https://www.google.com/generate_204" /></div>
+            <div class="field"><label>连通性检查 URL (connectivity)</label><input v-model="ensureBurstObservatory().connectivity" type="text" placeholder="可选" /></div>
+            <div class="field"><label>探测周期 (interval)</label><input v-model="ensureBurstObservatory().interval" type="text" placeholder="1m" /></div>
+            <div class="field"><label>采样次数 (sampling)</label><input v-model.number="ensureBurstObservatory().sampling" type="number" placeholder="2" /></div>
+            <div class="field"><label>单次超时 (timeout)</label><input v-model="ensureBurstObservatory().timeout" type="text" placeholder="5s" /></div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Tab 4: Policy & Reverse -->
-    <div v-else-if="subTab === 'policy'" class="grid-2">
+    <div v-else-if="subTab === 'policy'" style="display: flex; flex-direction: column; gap: 16px">
       <div class="card" style="margin: 0">
         <div class="card-header">
-          <h3 class="card-title">本地策略 (Policy)</h3>
-          <ToggleSwitch v-model="config.policy.enabled" label="启用" />
+          <h3 class="card-title">本地策略 (Policy — 系统统计与多用户等级)</h3>
+          <div class="row-nowrap">
+            <ToggleSwitch v-model="config.policy.enabled" label="启用" />
+            <button class="btn btn-sm btn-primary" @click="addPolicyLevel">+ 添加等级</button>
+          </div>
         </div>
-        <div class="grid-2" style="margin-bottom: 12px">
-          <div class="field"><label>handshake (s)</label><input v-model.number="config.policy.handshake" type="number" /></div>
-          <div class="field"><label>connIdle (s)</label><input v-model.number="config.policy.conn_idle" type="number" /></div>
-          <div class="field"><label>uplinkOnly (s)</label><input v-model.number="config.policy.uplink_only" type="number" /></div>
-          <div class="field"><label>downlinkOnly (s)</label><input v-model.number="config.policy.downlink_only" type="number" /></div>
-          <div class="field"><label>bufferSize (KB)</label><input v-model.number="config.policy.buffer_size" type="number" /></div>
-        </div>
-        <div class="row">
+        <div class="row" style="margin-bottom: 12px">
           <ToggleSwitch v-model="config.policy.stats_inbound_uplink" label="statsInboundUplink" />
           <ToggleSwitch v-model="config.policy.stats_inbound_downlink" label="statsInboundDownlink" />
           <ToggleSwitch v-model="config.policy.stats_outbound_uplink" label="statsOutboundUplink" />
           <ToggleSwitch v-model="config.policy.stats_outbound_downlink" label="statsOutboundDownlink" />
         </div>
+        <div v-if="config.policy.levels && config.policy.levels.length > 0" style="display: flex; flex-direction: column; gap: 10px">
+          <div v-for="(lv, idx) in config.policy.levels" :key="idx" class="card-subtle" style="display: flex; flex-direction: column; gap: 10px">
+            <div class="row-nowrap" style="justify-content: space-between">
+              <strong style="font-size: 12.5px">Level {{ lv.level }}</strong>
+              <button class="btn btn-sm btn-danger" @click="config.policy.levels?.splice(idx, 1)">删除等级</button>
+            </div>
+            <div class="grid-3">
+              <div class="field"><label>等级编号 (level)</label><input v-model="lv.level" type="text" placeholder="0" /></div>
+              <div class="field"><label>handshake (s)</label><input v-model.number="lv.handshake" type="number" /></div>
+              <div class="field"><label>connIdle (s)</label><input v-model.number="lv.conn_idle" type="number" /></div>
+              <div class="field"><label>uplinkOnly (s)</label><input v-model.number="lv.uplink_only" type="number" /></div>
+              <div class="field"><label>downlinkOnly (s)</label><input v-model.number="lv.downlink_only" type="number" /></div>
+              <div class="field"><label>bufferSize (KB)</label><input v-model.number="lv.buffer_size" type="number" /></div>
+            </div>
+            <div class="row">
+              <ToggleSwitch v-model="lv.stats_user_uplink" label="statsUserUplink" />
+              <ToggleSwitch v-model="lv.stats_user_downlink" label="statsUserDownlink" />
+            </div>
+          </div>
+        </div>
+        <div v-else class="grid-3">
+          <div class="field"><label>默认 handshake (s)</label><input v-model.number="config.policy.handshake" type="number" /></div>
+          <div class="field"><label>默认 connIdle (s)</label><input v-model.number="config.policy.conn_idle" type="number" /></div>
+          <div class="field"><label>默认 uplinkOnly (s)</label><input v-model.number="config.policy.uplink_only" type="number" /></div>
+          <div class="field"><label>默认 downlinkOnly (s)</label><input v-model.number="config.policy.downlink_only" type="number" /></div>
+          <div class="field"><label>默认 bufferSize (KB)</label><input v-model.number="config.policy.buffer_size" type="number" /></div>
+        </div>
       </div>
 
-      <div class="card" style="margin: 0">
-        <div class="card-header">
-          <h3 class="card-title">反向代理 (Reverse Bridges / Portals)</h3>
-          <ToggleSwitch v-model="config.reverse.enabled" label="启用" />
+      <div class="grid-2">
+        <div class="card" style="margin: 0">
+          <div class="card-header">
+            <h3 class="card-title">反向代理 (Reverse Bridges / Portals)</h3>
+            <ToggleSwitch v-model="config.reverse.enabled" label="启用" />
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 12px">
+            <ArrayInput
+              v-model="config.reverse.bridges"
+              label="Bridges 列表（格式 tag|domain）"
+              placeholder="例如 bridge|private.example.com"
+            />
+            <ArrayInput
+              v-model="config.reverse.portals"
+              label="Portals 列表（格式 tag|domain）"
+              placeholder="例如 portal|private.example.com"
+            />
+          </div>
         </div>
-        <div style="display: flex; flex-direction: column; gap: 12px">
-          <ArrayInput
-            v-model="config.reverse.bridges"
-            label="Bridges 列表（格式 tag|domain）"
-            placeholder="例如 bridge|private.example.com"
-          />
-          <ArrayInput
-            v-model="config.reverse.portals"
-            label="Portals 列表（格式 tag|domain）"
-            placeholder="例如 portal|private.example.com"
-          />
+
+        <div v-if="core === 'v2ray'" class="card" style="margin: 0">
+          <div class="card-header">
+            <h3 class="card-title">浏览器转发 (Browser Forwarder, V2Ray)</h3>
+            <ToggleSwitch v-model="ensureBrowserForwarder().enabled" label="启用" />
+          </div>
+          <div class="grid-2">
+            <div class="field"><label>监听地址 (listenAddr)</label><input v-model="ensureBrowserForwarder().listen_addr" type="text" placeholder="127.0.0.1" /></div>
+            <div class="field"><label>监听端口 (listenPort)</label><input v-model.number="ensureBrowserForwarder().listen_port" type="number" placeholder="8080" /></div>
+          </div>
         </div>
       </div>
     </div>

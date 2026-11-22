@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-- **双核一等支持**：同一配置模型通过能力矩阵自动编译为 **Xray-core**（支持 REALITY / XHTTP / FinalMask / VLESS Encryption / WireGuard / TUN / Metrics）或 **V2Ray jsonv4**（支持 Hysteria2 / 严格 `vnext`/`servers` 结构 / 自动字段映射与降级提示）。
+- **双核一等支持**：同一配置模型通过分离式能力矩阵自动编译为 **Xray-core**（支持 `streamSettings.method` / 扁平出站 / `users` 入站 / REALITY / XHTTP / FinalMask / Hysteria / MASQUE / VLESS Encryption / WireGuard / TUN / Metrics）、**V2Ray `jsonv4`**（支持 Hysteria2 / `vnext`/`servers` / `services.tun` / `services.burstObservatory`）或 **V2Ray `jsonv5`**（支持 `router` / `services.*` / `dns.fakeDns` / Shadowsocks 2022 / Hysteria2 / uTLS / HTTPUpgrade），并在前端与 ucode 双端执行 Fail-Fast 组合校验。
 - **兼容新旧 OpenWrt**：
   - OpenWrt 22.03+：`firewall4 (nftables)` 独立表 `table inet aios` + `ucode` 编译引擎 + Dynamic Direct + FakeDNS Ping + 动态默认网关/IPv6 PD 绕过。
   - OpenWrt 19.07 / 21.02 / LEDE：`firewall3 (iptables + ipset)` 独立 `AIOS_*` 链与 `aios_*` 集合 + 前端预编译 JSON 兜底（无 `ucode` 也可运行）。

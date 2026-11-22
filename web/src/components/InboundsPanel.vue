@@ -1,17 +1,19 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import type { CoreType, InboundConfig } from '@/schema/types';
-import { CORE_CAPABILITIES } from '@/schema/capabilities';
+import { getCoreCapabilities, type V2RayFormat } from '@/schema/capabilities';
 import ArrayInput from '@/components/ui/ArrayInput.vue';
+import KeyValueInput from '@/components/ui/KeyValueInput.vue';
 import ToggleSwitch from '@/components/ui/ToggleSwitch.vue';
 import StreamEditor from '@/components/StreamEditor.vue';
 
 const props = defineProps<{
   inbounds: InboundConfig[];
   core: CoreType;
+  v2rayFormat?: V2RayFormat;
 }>();
 
-const cap = computed(() => CORE_CAPABILITIES[props.core]);
+const cap = computed(() => getCoreCapabilities(props.core, props.v2rayFormat || 'jsonv4'));
 const selectedId = ref<string>(props.inbounds[0]?.id || '');
 const subTab = ref<'basic' | 'users' | 'stream' | 'advanced'>('basic');
 
@@ -61,7 +63,13 @@ function removeInbound(id: string) {
 function addUser() {
   if (!selected.value) return;
   if (!selected.value.users) selected.value.users = [];
-  selected.value.users.unshift({ id: '', username: '', password: '', flow: '', alterId: 0, email: '', level: 0 });
+  selected.value.users.unshift({ id: '', username: '', password: '', auth: '', flow: '', alterId: 0, email: '', level: 0 });
+}
+
+function addWgPeer() {
+  if (!selected.value) return;
+  if (!selected.value.wg_peers) selected.value.wg_peers = [];
+  selected.value.wg_peers.unshift({ publicKey: '', preSharedKey: '', endpoint: '', allowedIPs: ['10.0.0.2/32'], keepAlive: 25 });
 }
 
 function addFallback() {
@@ -144,15 +152,33 @@ function addFallback() {
             </select>
           </div>
           <div class="field"><label>UDP 绑定 IP (ip)</label><input v-model="selected.socks_ip" type="text" placeholder="127.0.0.1" /></div>
+          <div v-if="core === 'v2ray'" class="field">
+            <label>UDP 封包编码 (packetEncoding, V2Ray)</label>
+            <select v-model="selected.packet_encoding">
+              <option value="">默认</option>
+              <option value="None">None</option>
+              <option value="Packet">Packet</option>
+            </select>
+          </div>
           <ToggleSwitch v-model="selected.socks_udp" label="启用 UDP 转发" />
+        </div>
+
+        <div v-if="selected.protocol === 'http'" class="card-subtle grid-2" style="align-items: end">
+          <div class="field">
+            <label>连接超时 (timeout, 秒)</label>
+            <input v-model.number="selected.http_timeout" type="number" placeholder="300" />
+          </div>
+          <ToggleSwitch v-model="selected.http_allow_transparent" label="允许透明代理 (allowTransparent)" />
         </div>
 
         <div v-if="selected.protocol === 'dokodemo-door' || selected.protocol === 'tunnel'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
           <div class="grid-3">
-            <div class="field"><label>网络 (network)</label><input v-model="selected.dokodemo_network" type="text" placeholder="tcp,udp" /></div>
-            <div class="field"><label>转发目标地址 (address)</label><input v-model="selected.dokodemo_address" type="text" placeholder="可选，用于 DNS/端口转发" /></div>
-            <div class="field"><label>转发目标端口 (port)</label><input v-model.number="selected.dokodemo_port" type="number" /></div>
+            <div class="field"><label>网络 (network / allowedNetwork)</label><input v-model="selected.dokodemo_network" type="text" placeholder="tcp,udp" /></div>
+            <div class="field"><label>转发目标地址 (address / rewriteAddress)</label><input v-model="selected.dokodemo_address" type="text" placeholder="可选，用于 DNS/端口转发" /></div>
+            <div class="field"><label>转发目标端口 (port / rewritePort)</label><input v-model.number="selected.dokodemo_port" type="number" /></div>
+            <div v-if="core === 'xray'" class="field"><label>用户等级 (userLevel, Xray)</label><input v-model.number="selected.tunnel_user_level" type="number" placeholder="0" /></div>
           </div>
+          <KeyValueInput v-if="core === 'xray'" v-model="selected.tunnel_port_map" label="多端口映射表 (portMap, Xray)" key-placeholder="5555" value-placeholder="1.1.1.1:7777" />
           <div class="row">
             <ToggleSwitch v-model="selected.dokodemo_follow_redirect" label="followRedirect（透明代理必填）" />
             <ToggleSwitch v-if="core === 'xray'" v-model="selected.use_tunnel" label="使用 Xray 新版 tunnel 协议名" />
@@ -181,11 +207,72 @@ function addFallback() {
             <label>网络 (network)</label>
             <input v-model="selected.ss_network" type="text" placeholder="tcp,udp" />
           </div>
+          <div v-if="core === 'v2ray'" class="field">
+            <label>UDP 封包编码 (packetEncoding, V2Ray)</label>
+            <select v-model="selected.packet_encoding">
+              <option value="">默认</option>
+              <option value="None">None</option>
+              <option value="Packet">Packet</option>
+            </select>
+          </div>
         </div>
 
-        <div v-if="selected.protocol === 'tun'" class="card-subtle grid-2">
-          <div class="field"><label>TUN 网卡名</label><input v-model="selected.tun_name" type="text" placeholder="aios0" /></div>
-          <div class="field"><label>MTU</label><input v-model.number="selected.tun_mtu" type="number" placeholder="1500" /></div>
+        <div v-if="selected.protocol === 'hysteria' || selected.protocol === 'hysteria2'" class="card-subtle grid-3">
+          <div class="field"><label>单用户认证密码 (auth / password)</label><input v-model="selected.password" type="password" placeholder="多用户请切到「多用户与回落」" /></div>
+          <div class="field"><label>上行带宽上限 (Mbps)</label><input v-model.number="selected.hysteria_up_mbps" type="number" placeholder="100" /></div>
+          <div class="field"><label>下行带宽上限 (Mbps)</label><input v-model.number="selected.hysteria_down_mbps" type="number" placeholder="500" /></div>
+        </div>
+
+        <div v-if="selected.protocol === 'wireguard' && core === 'xray'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
+          <div class="grid-2">
+            <div class="field"><label>服务端私钥 (secretKey)</label><input v-model="selected.wg_secret_key" type="password" /></div>
+            <div class="field"><label>MTU</label><input v-model.number="selected.wg_mtu" type="number" placeholder="1420" /></div>
+          </div>
+          <ArrayInput v-model="selected.wg_address" label="服务端隧道地址 (address[])" placeholder="回车添加，如 10.0.0.1/24" />
+          <div class="row-nowrap" style="justify-content: space-between">
+            <strong style="font-size: 12.5px">允许接入的 Peers 列表 (peers[])</strong>
+            <button class="btn btn-sm" @click="addWgPeer">+ 添加 Peer</button>
+          </div>
+          <div v-for="(peer, idx) in selected.wg_peers || []" :key="idx" class="card-subtle" style="display: flex; flex-direction: column; gap: 8px">
+            <div class="grid-3">
+              <div class="field"><label>Peer PublicKey</label><input v-model="peer.publicKey" type="text" /></div>
+              <div class="field"><label>PreSharedKey (可选)</label><input v-model="peer.preSharedKey" type="password" /></div>
+              <div class="row-nowrap" style="align-items: end">
+                <div class="field" style="flex: 1"><label>KeepAlive (s)</label><input v-model.number="peer.keepAlive" type="number" /></div>
+                <button class="btn btn-sm btn-danger" @click="selected.wg_peers?.splice(idx, 1)">删</button>
+              </div>
+            </div>
+            <ArrayInput v-model="peer.allowedIPs" label="allowedIPs[]" :suggestions="['10.0.0.2/32', '0.0.0.0/0', '::/0']" />
+          </div>
+        </div>
+
+        <div v-if="selected.protocol === 'masque' && core === 'xray'" class="card-subtle" style="display: flex; flex-direction: column; gap: 10px">
+          <div class="grid-2">
+            <ArrayInput v-model="selected.masque_address" label="MASQUE 隧道地址池 (address[])" placeholder="回车添加，如 10.0.0.1/24" />
+            <div class="field"><label>隧道 MTU (1280-65535)</label><input v-model.number="selected.masque_mtu" type="number" placeholder="1280" /></div>
+          </div>
+          <div class="field-hint">请在「多用户与回落」标签页配置 MASQUE 用户（email + password），未配置用户时所有连接都会被拒绝。</div>
+        </div>
+
+        <div v-if="selected.protocol === 'tun'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
+          <div class="grid-3">
+            <div class="field"><label>TUN 网卡名</label><input v-model="selected.tun_name" type="text" placeholder="aios0" /></div>
+            <div class="field"><label>MTU</label><input v-model.number="selected.tun_mtu" type="number" placeholder="1500" /></div>
+            <div v-if="core === 'xray'" class="field"><label>自动绑定出口网卡 (autoOutboundsInterface)</label><input v-model="selected.tun_auto_outbounds_interface" type="text" placeholder="auto" /></div>
+          </div>
+          <div v-if="core === 'xray'" class="grid-3">
+            <ArrayInput v-model="selected.tun_gateway" label="TUN 网关地址前缀 (gateway[])" placeholder="如 10.0.0.1/16" />
+            <ArrayInput v-model="selected.tun_dns" label="TUN DNS 列表 (dns[])" placeholder="如 1.1.1.1" />
+            <ArrayInput v-model="selected.tun_auto_routing_table" label="自动系统路由表 (autoSystemRoutingTable[])" :suggestions="['0.0.0.0/0', '::/0']" />
+          </div>
+          <div v-if="core === 'v2ray'" class="grid-2">
+            <ArrayInput v-model="selected.tun_ips" label="TUN IP 地址段 (ips[])" placeholder="如 10.0.0.1/24" />
+            <ArrayInput v-model="selected.tun_routes" label="TUN 路由表 (routes[])" :suggestions="['0.0.0.0/0']" />
+          </div>
+          <div v-if="core === 'v2ray'" class="row">
+            <ToggleSwitch v-model="selected.tun_promiscuous" label="enablePromiscuousMode" />
+            <ToggleSwitch v-model="selected.tun_spoofing" label="enableSpoofing" />
+          </div>
         </div>
       </div>
 
@@ -207,8 +294,11 @@ function addFallback() {
               <div v-if="selected.protocol === 'socks' || selected.protocol === 'http'" class="field">
                 <label>Username</label><input v-model="u.username" type="text" />
               </div>
-              <div v-if="['socks', 'http', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2'].includes(selected.protocol)" class="field">
+              <div v-if="['socks', 'http', 'trojan', 'shadowsocks'].includes(selected.protocol)" class="field">
                 <label>Password</label><input v-model="u.password" type="password" />
+              </div>
+              <div v-if="selected.protocol === 'hysteria' || selected.protocol === 'hysteria2'" class="field">
+                <label>Auth 密钥</label><input v-model="u.auth" type="password" />
               </div>
               <div v-if="selected.protocol === 'vless' && cap.supportsVlessFlow" class="field">
                 <label>Flow</label><input v-model="u.flow" type="text" placeholder="xtls-rprx-vision" />
@@ -244,7 +334,7 @@ function addFallback() {
       </div>
 
       <!-- Tab 3: Stream & Security -->
-      <StreamEditor v-else-if="subTab === 'stream'" :model="selected" :core="core" :is-inbound="true" />
+      <StreamEditor v-else-if="subTab === 'stream'" :model="selected" :core="core" :v2ray-format="v2rayFormat" :is-inbound="true" />
 
       <!-- Tab 4: Sniffing / Allocate / Custom JSON -->
       <div v-else-if="subTab === 'advanced'" style="display: flex; flex-direction: column; gap: 14px">

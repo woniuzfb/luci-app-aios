@@ -1,8 +1,279 @@
 import type { AiosConfig, InboundConfig, OutboundConfig, StreamFields } from '@/schema/types';
+import { validateStreamCombination } from '@/schema/capabilities';
 import type { CompileDiagnostic, CompileResult } from './index';
+
+function toV5LogLevel(level?: string): string {
+  switch ((level || 'warning').toLowerCase()) {
+    case 'debug':
+      return 'Debug';
+    case 'info':
+      return 'Info';
+    case 'error':
+      return 'Error';
+    case 'none':
+      return 'None';
+    default:
+      return 'Warning';
+  }
+}
+
+function toV5QueryStrategy(qs?: string): string {
+  switch (qs) {
+    case 'UseIPv4':
+    case 'USE_IP4':
+      return 'USE_IP4';
+    case 'UseIPv6':
+    case 'USE_IP6':
+      return 'USE_IP6';
+    default:
+      return 'USE_IP';
+  }
+}
+
+function toV5OutboundDomainStrategy(ds?: string): string | undefined {
+  if (!ds) return undefined;
+  switch (ds) {
+    case 'UseIPv4':
+    case 'UseIP4':
+    case 'ForceIPv4':
+      return 'UseIP4';
+    case 'UseIPv6':
+    case 'UseIP6':
+    case 'ForceIPv6':
+      return 'UseIP6';
+    case 'UseIP':
+    case 'UseIPv4v6':
+    case 'UseIPv6v4':
+    case 'ForceIP':
+      return 'UseIP';
+    case 'AsIs':
+      return 'AsIs';
+    default:
+      return ds;
+  }
+}
+
+function toV5RouterDomainStrategy(ds?: string): string {
+  if (ds === 'IPIfNonMatch' || ds === 'IpIfNonMatch') return 'IpIfNonMatch';
+  if (ds === 'IPOnDemand' || ds === 'IpOnDemand') return 'IpOnDemand';
+  if (ds === 'UseIp') return 'UseIp';
+  return 'AsIs';
+}
+
+function toV5QuicSecurity(sec?: string): string {
+  switch ((sec || 'none').toLowerCase()) {
+    case 'aes-128-gcm':
+    case 'aes128_gcm':
+      return 'AES128_GCM';
+    case 'chacha20-poly1305':
+    case 'chacha20_poly1305':
+      return 'CHACHA20_POLY1305';
+    case 'auto':
+      return 'AUTO';
+    case 'zero':
+      return 'ZERO';
+    default:
+      return 'NONE';
+  }
+}
+
+export function parseDurationToNs(val: string | number | undefined, fallbackNs: number): number {
+  if (val === undefined || val === '') return fallbackNs;
+  if (typeof val === 'number') return Number.isFinite(val) && val > 0 ? Math.round(val) : fallbackNs;
+  const s = val.trim().toLowerCase();
+  if (/^\d+$/.test(s)) return Number(s);
+  const m = s.match(/^(\d+(?:\.\d+)?)(ns|us|ms|s|m|h)$/);
+  if (!m) return fallbackNs;
+  const n = Number(m[1]);
+  switch (m[2]) {
+    case 'ns':
+      return Math.round(n);
+    case 'us':
+      return Math.round(n * 1e3);
+    case 'ms':
+      return Math.round(n * 1e6);
+    case 's':
+      return Math.round(n * 1e9);
+    case 'm':
+      return Math.round(n * 60 * 1e9);
+    case 'h':
+      return Math.round(n * 3600 * 1e9);
+    default:
+      return fallbackNs;
+  }
+}
+
+function parseJsonObjectChecked(
+  str: string | undefined,
+  diagnostics: CompileDiagnostic[],
+  path: string
+): Record<string, unknown> | null {
+  if (!str || !str.trim()) return null;
+  try {
+    const parsed = JSON.parse(str);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    diagnostics.push({ level: 'error', path, message: 'JSON 必须为对象（Object）格式。' });
+    return null;
+  } catch (e) {
+    diagnostics.push({ level: 'error', path, message: `JSON 解析失败: ${String(e)}` });
+    return null;
+  }
+}
+
+function deepMerge(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...target };
+  for (const key of Object.keys(source)) {
+    const sv = source[key];
+    const tv = out[key];
+    if (
+      sv &&
+      tv &&
+      typeof sv === 'object' &&
+      typeof tv === 'object' &&
+      !Array.isArray(sv) &&
+      !Array.isArray(tv)
+    ) {
+      out[key] = deepMerge(tv as Record<string, unknown>, sv as Record<string, unknown>);
+    } else {
+      out[key] = sv;
+    }
+  }
+  return out;
+}
+
+function isIpLiteral(val: string): boolean {
+  return /^(\d{1,3}\.){3}\d{1,3}$/.test(val) || val.includes(':');
+}
+
+function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null {
+  const [addr, prefixStr] = cidr.trim().split('/');
+  if (!addr) return null;
+  const parts = addr.split('.');
+  if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
+    const bytes = parts.map((p) => Number(p));
+    const prefix = prefixStr !== undefined ? Number(prefixStr) : 32;
+    if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix)) {
+      return { ip: bytes, prefix };
+    }
+  }
+  return null;
+}
+
+function parseGeoIpEntry(raw: string): Record<string, unknown> {
+  let item = raw.trim();
+  let inverseMatch = false;
+  if (item.startsWith('!')) {
+    inverseMatch = true;
+    item = item.slice(1).trim();
+  }
+  if (item.startsWith('geoip:')) {
+    let code = item.slice('geoip:'.length).trim();
+    if (code.startsWith('!')) {
+      inverseMatch = true;
+      code = code.slice(1).trim();
+    }
+    const obj: Record<string, unknown> = { filePath: 'geoip.dat', code };
+    if (inverseMatch) obj.inverseMatch = true;
+    return obj;
+  }
+  if (item.startsWith('ext:')) {
+    const rest = item.slice(4);
+    const idx = rest.indexOf(':');
+    const filePath = idx >= 0 ? rest.slice(0, idx) : 'geoip.dat';
+    let code = idx >= 0 ? rest.slice(idx + 1) : rest;
+    if (code.startsWith('!')) {
+      inverseMatch = true;
+      code = code.slice(1).trim();
+    }
+    const obj: Record<string, unknown> = { filePath, code };
+    if (inverseMatch) obj.inverseMatch = true;
+    return obj;
+  }
+  const [ipAddr, prefixStr] = item.split('/');
+  const defaultPrefix = ipAddr.includes(':') ? 128 : 32;
+  const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : defaultPrefix;
+  const obj: Record<string, unknown> = {
+    cidr: [{ ipAddr, prefix: Number.isFinite(prefix) ? prefix : defaultPrefix }]
+  };
+  if (inverseMatch) obj.inverseMatch = true;
+  return obj;
+}
+
+function parsePriorityDomain(raw: string): Record<string, unknown> {
+  const s = raw.trim();
+  if (s.startsWith('full:')) return { type: 'Full', domain: s.slice(5) };
+  if (s.startsWith('domain:')) return { type: 'Subdomain', domain: s.slice(7) };
+  if (s.startsWith('regexp:')) return { type: 'Regex', domain: s.slice(7) };
+  if (s.startsWith('keyword:')) return { type: 'Keyword', domain: s.slice(8) };
+  return { type: 'Subdomain', domain: s };
+}
+
+function parseRouterDomains(rawList: string[]): {
+  domains: Record<string, unknown>[];
+  geoDomains: Record<string, unknown>[];
+} {
+  const domains: Record<string, unknown>[] = [];
+  const geoDomains: Record<string, unknown>[] = [];
+  for (const raw of rawList) {
+    const s = raw.trim();
+    if (!s) continue;
+    if (s.startsWith('geosite:')) {
+      geoDomains.push({ filePath: 'geosite.dat', code: s.slice('geosite:'.length) });
+    } else if (s.startsWith('ext:')) {
+      const rest = s.slice(4);
+      const idx = rest.indexOf(':');
+      geoDomains.push({
+        filePath: idx >= 0 ? rest.slice(0, idx) : 'geosite.dat',
+        code: idx >= 0 ? rest.slice(idx + 1) : rest
+      });
+    } else if (s.startsWith('full:')) {
+      domains.push({ type: 'Full', value: s.slice(5) });
+    } else if (s.startsWith('domain:')) {
+      domains.push({ type: 'RootDomain', value: s.slice(7) });
+    } else if (s.startsWith('regexp:')) {
+      domains.push({ type: 'Regex', value: s.slice(7) });
+    } else if (s.startsWith('keyword:')) {
+      domains.push({ type: 'Plain', value: s.slice(8) });
+    } else {
+      domains.push({ type: 'Plain', value: s });
+    }
+  }
+  return { domains, geoDomains };
+}
+
+function buildStaticHostEntry(domainRaw: string, targets: string[]): Record<string, unknown> {
+  const s = domainRaw.trim();
+  let type = 'Full';
+  let domain = s;
+  if (s.startsWith('full:')) {
+    type = 'Full';
+    domain = s.slice(5);
+  } else if (s.startsWith('domain:')) {
+    type = 'Subdomain';
+    domain = s.slice(7);
+  } else if (s.startsWith('regexp:')) {
+    type = 'Regex';
+    domain = s.slice(7);
+  } else if (s.startsWith('keyword:')) {
+    type = 'Keyword';
+    domain = s.slice(8);
+  }
+  const ips = targets.filter((t) => isIpLiteral(t.trim()));
+  const proxied = targets.find((t) => !isIpLiteral(t.trim()));
+  if (proxied) {
+    return { type, domain, proxiedDomain: proxied.trim() };
+  }
+  return { type, domain, ip: ips };
+}
 
 function buildV5Stream(
   item: StreamFields & { password?: string },
+  protocol: string,
   isInbound: boolean,
   defaultMark: number | null,
   diagnostics: CompileDiagnostic[],
@@ -11,22 +282,49 @@ function buildV5Stream(
   let transport = item.transport || 'tcp';
   if (transport === 'raw') transport = 'tcp';
   if (transport === 'websocket') transport = 'ws';
+  if (transport === 'mkcp') transport = 'kcp';
   if (transport === 'h2') transport = 'http';
   if (transport === 'hysteria') transport = 'hysteria2';
   if (transport === 'xhttp' || transport === 'splithttp' || transport === 'masque') {
     diagnostics.push({
       level: 'error',
       path: `${pathPrefix}.transport`,
-      message: `V2Ray jsonv5 不支持传输层 "${transport}"，已降级为 tcp。`
+      message: `V2Ray jsonv5 不支持传输层 "${transport}"。`
     });
     transport = 'tcp';
   }
 
+  let security = item.security || 'none';
+  if (security === 'reality') {
+    diagnostics.push({
+      level: 'error',
+      path: `${pathPrefix}.security`,
+      message: 'V2Ray jsonv5 不支持 REALITY 安全层，请改用 tls 或 utls。'
+    });
+    security = 'utls';
+  }
+
+  for (const issue of validateStreamCombination('v2ray', 'jsonv5', protocol, transport, security)) {
+    diagnostics.push({ level: issue.level, path: `${pathPrefix}.streamSettings`, message: issue.message });
+  }
+
   let transportSettings: Record<string, unknown> = {};
-  if (transport === 'ws') {
+  if (transport === 'tcp') {
+    if (isInbound && item.tcp_accept_proxy_protocol) {
+      transportSettings = { acceptProxyProtocol: true };
+    }
+  } else if (transport === 'ws') {
+    const wsHeaders: Array<{ key: string; value: string }> = (item.ws_headers || [])
+      .filter((h) => h.key.trim())
+      .map((h) => ({ key: h.key.trim(), value: h.value }));
+    if (item.ws_host && !wsHeaders.some((h) => h.key.toLowerCase() === 'host')) {
+      wsHeaders.unshift({ key: 'Host', value: item.ws_host });
+    }
     transportSettings = {
       path: item.ws_path || '/',
-      maxEarlyData: item.ws_max_early_data || 0,
+      header: wsHeaders.length > 0 ? wsHeaders : undefined,
+      acceptProxyProtocol: isInbound && item.tcp_accept_proxy_protocol ? true : undefined,
+      maxEarlyData: item.ws_max_early_data || undefined,
       earlyDataHeaderName: item.ws_early_data_header || undefined
     };
   } else if (transport === 'grpc') {
@@ -38,7 +336,23 @@ function buildV5Stream(
     transportSettings = {
       path: item.httpupgrade_path || '/',
       host: item.httpupgrade_host || '',
-      header: headers.length > 0 ? headers : undefined
+      header: headers.length > 0 ? headers : undefined,
+      maxEarlyData: item.ws_max_early_data || undefined,
+      earlyDataHeaderName: item.ws_early_data_header || undefined
+    };
+  } else if (transport === 'kcp') {
+    transportSettings = {
+      mtu: { value: item.mkcp_mtu || 1350 },
+      tti: { value: item.mkcp_tti || 50 },
+      uplinkCapacity: { value: item.mkcp_uplink_capacity || 5 },
+      downlinkCapacity: { value: item.mkcp_downlink_capacity || 20 },
+      congestion: !!item.mkcp_congestion
+    };
+    if (item.mkcp_seed) transportSettings.seed = { seed: item.mkcp_seed };
+  } else if (transport === 'quic') {
+    transportSettings = {
+      security: { type: toV5QuicSecurity(item.quic_security) },
+      key: item.quic_key || ''
     };
   } else if (transport === 'hysteria2') {
     transportSettings = {
@@ -55,34 +369,33 @@ function buildV5Stream(
     };
   }
 
-  let security = item.security || 'none';
-  if (security === 'reality') {
-    diagnostics.push({
-      level: 'error',
-      path: `${pathPrefix}.security`,
-      message: 'V2Ray jsonv5 不支持 REALITY，已自动降级为 utls。'
-    });
-    security = 'utls';
-  }
-
   let securitySettings: Record<string, unknown> | undefined;
   if (security === 'tls') {
     const tls: Record<string, unknown> = {};
     if (item.tls_server_name) tls.serverName = item.tls_server_name;
-    if (item.tls_allow_insecure) tls.allowInsecure = true;
     if (item.tls_alpn && item.tls_alpn.length > 0) tls.nextProtocol = item.tls_alpn;
+    if (item.tls_disable_system_root) tls.disableSystemRoot = true;
+    const pinned = (item.tls_pinned_sha256 || []).filter(Boolean);
+    if (pinned.length > 0) {
+      tls.pinnedPeerCertificateChainSha256 = pinned;
+      if (item.tls_allow_insecure) tls.allowInsecureIfPinnedPeerCertificate = true;
+    }
     if (item.tls_ech_config) tls.echConfig = item.tls_ech_config;
-    if (isInbound && item.tls_certificates && item.tls_certificates.length > 0) {
-      tls.certificate = item.tls_certificates;
+    if (isInbound) {
+      if (item.tls_certificates && item.tls_certificates.length > 0) {
+        tls.certificate = item.tls_certificates.filter((c) => c.certificateFile && c.keyFile);
+      } else if (item.tls_cert_file && item.tls_key_file) {
+        tls.certificate = [{ certificateFile: item.tls_cert_file, keyFile: item.tls_key_file }];
+      }
     }
     securitySettings = tls;
   } else if (security === 'utls') {
+    const tlsCfg: Record<string, unknown> = {};
+    if (item.tls_server_name) tlsCfg.serverName = item.tls_server_name;
+    if (item.tls_alpn && item.tls_alpn.length > 0) tlsCfg.nextProtocol = item.tls_alpn;
+    if (item.tls_disable_system_root) tlsCfg.disableSystemRoot = true;
     securitySettings = {
-      tlsConfig: {
-        serverName: item.tls_server_name || '',
-        allowInsecure: !!item.tls_allow_insecure,
-        nextProtocol: item.tls_alpn && item.tls_alpn.length > 0 ? item.tls_alpn : undefined
-      },
+      tlsConfig: tlsCfg,
       imitate: item.tls_fingerprint || 'chrome_auto'
     };
   }
@@ -109,49 +422,72 @@ function compileV5Inbound(
   item: InboundConfig,
   diagnostics: CompileDiagnostic[]
 ): Record<string, unknown> | null {
-  if (item.protocol === 'tun' || item.protocol === 'wireguard' || item.protocol === 'masque') {
+  if (item.protocol === 'tun') return null; // Mapped to services.tun
+  if (item.protocol === 'wireguard' || item.protocol === 'masque') {
     diagnostics.push({
-      level: 'warning',
+      level: 'error',
       path: `inbounds.${item.tag}`,
-      message: `V2Ray jsonv5 入站协议不支持 "${item.protocol}"（TUN 请改用 services.tun），已跳过。`
+      message: `V2Ray jsonv5 入站协议不支持 "${item.protocol}"。`
     });
     return null;
   }
   const proto = item.protocol === 'tunnel' ? 'dokodemo-door' : item.protocol === 'hysteria' ? 'hysteria2' : item.protocol;
   const settings: Record<string, unknown> = {};
   if (proto === 'socks') {
-    settings.auth = item.socks_auth || 'noauth';
+    if (item.socks_ip) settings.address = item.socks_ip;
     settings.udpEnabled = !!item.socks_udp;
+    if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
+  } else if (proto === 'http') {
+    // Simplified v5 inbound.http has empty settings object
   } else if (proto === 'dokodemo-door') {
-    settings.networks = (item.dokodemo_network || 'tcp,udp').split(',').map((s) => s.trim().toUpperCase());
+    settings.networks = (item.dokodemo_network || 'tcp,udp').toLowerCase();
     settings.followRedirect = !!item.dokodemo_follow_redirect;
     if (item.dokodemo_address) settings.address = item.dokodemo_address;
     if (item.dokodemo_port) settings.port = item.dokodemo_port;
   } else if (proto === 'vmess' || proto === 'vless') {
-    settings.users = (item.users && item.users.length > 0 ? item.users : [{ id: item.uuid || '' }]).map((u) => ({
-      uuid: u.id || ''
-    }));
+    settings.users =
+      item.users && item.users.length > 0
+        ? item.users.map((u) => u.id || '').filter(Boolean)
+        : item.uuid
+          ? [item.uuid]
+          : [];
   } else if (proto === 'trojan') {
-    settings.users = (item.users && item.users.length > 0 ? item.users : [{ password: item.password || '' }]).map((u) => ({
-      password: u.password || ''
-    }));
+    settings.users =
+      item.users && item.users.length > 0
+        ? item.users.map((u) => u.password || '').filter(Boolean)
+        : item.password
+          ? [item.password]
+          : [];
+    if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
+  } else if (proto === 'shadowsocks') {
+    settings.method = item.method || 'aes-256-gcm';
+    settings.password = item.password || '';
+    settings.networks = (item.ss_network || 'tcp,udp').toLowerCase();
+    if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
+  } else if (proto === 'hysteria2') {
+    if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
   }
 
-  return {
+  const obj: Record<string, unknown> = {
     tag: item.tag || item.id,
     listen: item.listen || '0.0.0.0',
     port: item.port,
     protocol: proto,
     settings,
-    streamSettings: buildV5Stream(item, true, null, diagnostics, `inbounds.${item.tag}`),
-    sniffingSettings: item.sniffing_enabled
-      ? {
-          enabled: true,
-          destinationOverride: item.sniffing_dest_override || ['http', 'tls'],
-          metadataOnly: !!item.sniffing_metadata_only
-        }
-      : undefined
+    streamSettings: buildV5Stream(item, proto, true, null, diagnostics, `inbounds.${item.tag}`)
   };
+  if (item.sniffing_enabled) {
+    obj.sniffing = {
+      enabled: true,
+      destOverride:
+        item.sniffing_dest_override && item.sniffing_dest_override.length > 0
+          ? item.sniffing_dest_override
+          : ['http', 'tls'],
+      metadataOnly: !!item.sniffing_metadata_only
+    };
+  }
+  const custom = parseJsonObjectChecked(item.custom_config, diagnostics, `inbounds.${item.tag}.custom_config`);
+  return custom ? deepMerge(obj, custom) : obj;
 }
 
 function compileV5Outbound(
@@ -161,9 +497,9 @@ function compileV5Outbound(
 ): Record<string, unknown> | null {
   if (item.protocol === 'wireguard' || item.protocol === 'masque') {
     diagnostics.push({
-      level: 'warning',
+      level: 'error',
       path: `outbounds.${item.tag}`,
-      message: `V2Ray jsonv5 不支持出站协议 "${item.protocol}"，已跳过。`
+      message: `V2Ray jsonv5 不支持出站协议 "${item.protocol}"。`
     });
     return null;
   }
@@ -178,6 +514,7 @@ function compileV5Outbound(
       method: item.method || '2022-blake3-aes-128-gcm',
       psk: item.password || ''
     };
+    if (item.ss_ipsk && item.ss_ipsk.length > 0) settings.ipsk = item.ss_ipsk;
   } else if (proto === 'vmess' || proto === 'vless') {
     settings = {
       address: item.address || '',
@@ -201,24 +538,37 @@ function compileV5Outbound(
     settings = {
       server: [{ address: item.address || '', port: item.port || 443 }]
     };
-  } else if (proto === 'freedom') {
-    settings = { domainStrategy: item.domain_strategy || 'AsIs' };
-  } else if (proto === 'blackhole') {
-    settings = { response: { type: item.blackhole_response || 'none' } };
-  } else if (proto === 'dns') {
-    settings = { nonIPQuery: 'skip' };
+  } else if (proto === 'freedom' || proto === 'blackhole' || proto === 'dns') {
+    settings = {};
+  } else if (proto === 'loopback') {
+    settings = { inboundTag: item.loopback_inbound_tag || '' };
+  } else if (proto === 'socks' || proto === 'http') {
+    settings = {
+      address: item.address || '',
+      port: item.port || (proto === 'http' ? 8080 : 1080)
+    };
   }
 
   const obj: Record<string, unknown> = {
     tag: item.tag || item.id,
     protocol: proto,
     settings,
-    streamSettings: buildV5Stream(item, false, proto === 'dns' ? null : defaultMark, diagnostics, `outbounds.${item.tag}`)
+    streamSettings: buildV5Stream(item, proto, false, proto === 'dns' ? null : defaultMark, diagnostics, `outbounds.${item.tag}`)
   };
+  if (item.send_through) obj.sendThrough = item.send_through;
+  const ds = toV5OutboundDomainStrategy(item.domain_strategy);
+  if (ds) obj.domainStrategy = ds;
   if (item.dialer_proxy) {
     obj.proxySettings = { tag: item.dialer_proxy, transportLayer: true };
   }
-  return obj;
+  if (item.mux_enabled) {
+    obj.mux = {
+      enabled: true,
+      concurrency: item.mux_concurrency ?? 8
+    };
+  }
+  const custom = parseJsonObjectChecked(item.custom_config, diagnostics, `outbounds.${item.tag}.custom_config`);
+  return custom ? deepMerge(obj, custom) : obj;
 }
 
 export function compileV2RayV5(cfg: AiosConfig): CompileResult {
@@ -229,36 +579,125 @@ export function compileV2RayV5(cfg: AiosConfig): CompileResult {
 
   const services: Record<string, unknown> = {};
   if (cfg.general.stats_enabled) services.stats = {};
+  if (cfg.general.api_enabled) {
+    diagnostics.push({
+      level: 'warning',
+      path: 'general.api_enabled',
+      message: 'V2Ray jsonv5 未注册 services.api 别名，已跳过生成 services.api。'
+    });
+  }
   if (cfg.observatory.enabled) {
     services.backgroundObservatory = {
       subjectSelector: cfg.observatory.subject_selector,
-      probeURL: cfg.observatory.probe_url,
-      probeInterval: cfg.observatory.probe_interval || '1m'
+      probeUrl: cfg.observatory.probe_url,
+      probeInterval: parseDurationToNs(cfg.observatory.probe_interval, 60e9)
+    };
+  }
+  if (cfg.burst_observatory?.enabled) {
+    services.burstObservatory = {
+      subjectSelector: cfg.burst_observatory.subject_selector,
+      pingConfig: {
+        destination: cfg.burst_observatory.destination || 'https://www.google.com/generate_204',
+        connectivity: cfg.burst_observatory.connectivity || undefined,
+        interval: parseDurationToNs(cfg.burst_observatory.interval, 60e9),
+        samplingCount: cfg.burst_observatory.sampling || 3,
+        timeout: parseDurationToNs(cfg.burst_observatory.timeout, 5e9)
+      }
+    };
+  }
+  if (cfg.browser_forwarder?.enabled) {
+    services.browser = {
+      listenAddr: cfg.browser_forwarder.listen_addr || '127.0.0.1',
+      listenPort: cfg.browser_forwarder.listen_port || 8088
+    };
+  }
+  if (cfg.reverse.enabled) {
+    const mapPair = (arr: string[]) =>
+      arr
+        .map((s) => s.split('|'))
+        .filter((p) => p.length === 2 && p[0].trim() && p[1].trim())
+        .map(([tag, domain]) => ({ tag: tag.trim(), domain: domain.trim() }));
+    services.reverse = {
+      bridgeConfig: mapPair(cfg.reverse.bridges),
+      portalConfig: mapPair(cfg.reverse.portals)
     };
   }
   if (cfg.policy.enabled) {
+    const levelMap: Record<string, Record<string, unknown>> = {};
+    const levels = cfg.policy.levels && cfg.policy.levels.length > 0
+      ? cfg.policy.levels
+      : [
+          {
+            level: '0',
+            handshake: cfg.policy.handshake,
+            conn_idle: cfg.policy.conn_idle,
+            uplink_only: cfg.policy.uplink_only,
+            downlink_only: cfg.policy.downlink_only,
+            buffer_size: cfg.policy.buffer_size,
+            stats_user_uplink: true,
+            stats_user_downlink: true
+          }
+        ];
+    for (const lv of levels) {
+      levelMap[lv.level || '0'] = {
+        timeout: {
+          handshake: { value: lv.handshake },
+          connectionIdle: { value: lv.conn_idle },
+          uplinkOnly: { value: lv.uplink_only },
+          downlinkOnly: { value: lv.downlink_only }
+        },
+        stats: {
+          userUplink: lv.stats_user_uplink,
+          userDownlink: lv.stats_user_downlink
+        },
+        buffer: {
+          connection: lv.buffer_size < 0 ? -1 : lv.buffer_size * 1024
+        }
+      };
+    }
     services.policy = {
-      level: {
-        '0': {
-          handshake: cfg.policy.handshake,
-          connIdle: cfg.policy.conn_idle,
-          uplinkOnly: cfg.policy.uplink_only,
-          downlinkOnly: cfg.policy.downlink_only,
-          bufferSize: cfg.policy.buffer_size
+      level: levelMap,
+      system: {
+        stats: {
+          inboundUplink: cfg.policy.stats_inbound_uplink,
+          inboundDownlink: cfg.policy.stats_inbound_downlink,
+          outboundUplink: cfg.policy.stats_outbound_uplink,
+          outboundDownlink: cfg.policy.stats_outbound_downlink
         }
       }
     };
   }
+
   // Convert any TUN inbound into V2Ray v5 services.tun
   const tunInbound = cfg.inbounds.find((i) => i.enabled && i.protocol === 'tun');
   if (tunInbound) {
-    services.tun = {
+    const parsedIps = (tunInbound.tun_ips || [])
+      .map(parseCidrToBytes)
+      .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+    const parsedRoutes = (tunInbound.tun_routes || [])
+      .map(parseCidrToBytes)
+      .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+    const tunSvc: Record<string, unknown> = {
       name: tunInbound.tun_name || 'aios0',
       mtu: tunInbound.tun_mtu || 1500,
       tag: tunInbound.tag || 'tun-in',
-      ips: [{ ip: [10, 0, 0, 1], prefix: 24 }],
-      routes: [{ ip: [0, 0, 0, 0], prefix: 0 }]
+      ips: parsedIps.length > 0 ? parsedIps : [{ ip: [10, 0, 0, 1], prefix: 24 }],
+      routes: parsedRoutes.length > 0 ? parsedRoutes : [{ ip: [0, 0, 0, 0], prefix: 0 }],
+      enablePromiscuousMode: tunInbound.tun_promiscuous !== false,
+      enableSpoofing: tunInbound.tun_spoofing !== false
     };
+    if (tunInbound.packet_encoding) tunSvc.packetEncoding = tunInbound.packet_encoding;
+    if (tunInbound.sniffing_enabled) {
+      tunSvc.sniffingSettings = {
+        enabled: true,
+        destinationOverride:
+          tunInbound.sniffing_dest_override && tunInbound.sniffing_dest_override.length > 0
+            ? tunInbound.sniffing_dest_override
+            : ['http', 'tls'],
+        metadataOnly: !!tunInbound.sniffing_metadata_only
+      };
+    }
+    services.tun = tunSvc;
   }
 
   const inbounds = cfg.inbounds
@@ -271,38 +710,131 @@ export function compileV2RayV5(cfg: AiosConfig): CompileResult {
     .map((o) => compileV5Outbound(o, outMark, diagnostics))
     .filter((x): x is Record<string, unknown> => x !== null);
 
+  let dnsObj: Record<string, unknown> | undefined;
+  if (cfg.dns.enabled || cfg.fakedns.length > 0) {
+    const staticHosts: Record<string, unknown>[] = [];
+    for (const [domain, addrs] of Object.entries(cfg.dns.hosts || {})) {
+      if (domain.trim() && addrs.length > 0) {
+        staticHosts.push(buildStaticHostEntry(domain, addrs));
+      }
+    }
+    for (const h of cfg.dns.host_entries || []) {
+      if (h.domain.trim() && h.addresses.length > 0) {
+        staticHosts.push(buildStaticHostEntry(h.domain, h.addresses));
+      }
+    }
+    dnsObj = {
+      tag: cfg.dns.tag || 'dns-in',
+      queryStrategy: toV5QueryStrategy(cfg.dns.query_strategy),
+      cacheStrategy: cfg.dns.disable_cache ? 'CacheDisabled' : 'CacheEnabled',
+      fallbackStrategy: cfg.dns.disable_fallback
+        ? 'Disabled'
+        : cfg.dns.disable_fallback_if_match
+          ? 'DisabledIfAnyMatch'
+          : 'Enabled',
+      domainMatcher: cfg.routing.domain_matcher === 'mph' ? 'mph' : 'linear',
+      clientIp: cfg.dns.client_ip || undefined,
+      staticHosts: staticHosts.length > 0 ? staticHosts : undefined,
+      fakeDns:
+        cfg.fakedns.length > 0
+          ? {
+              pools: cfg.fakedns.map((f) => ({ ipPool: f.ip_pool, lruSize: f.pool_size }))
+            }
+          : undefined,
+      nameServer: cfg.dns_servers
+        .filter((s) => s.enabled)
+        .map((s) => {
+          const endpoint: Record<string, unknown> = { address: s.address };
+          if (s.port) endpoint.port = s.port;
+          const ns: Record<string, unknown> = { address: endpoint };
+          if (s.client_ip) ns.clientIp = s.client_ip;
+          if (s.skip_fallback) ns.skipFallback = true;
+          if (s.domains && s.domains.length > 0) {
+            const pDomains: Record<string, unknown>[] = [];
+            const gDomains: Record<string, unknown>[] = [];
+            for (const rawDom of s.domains) {
+              const trimmed = rawDom.trim();
+              if (!trimmed) continue;
+              if (trimmed.startsWith('geosite:')) {
+                gDomains.push({ filePath: 'geosite.dat', code: trimmed.slice(8) });
+              } else if (trimmed.startsWith('ext:')) {
+                const rest = trimmed.slice(4);
+                const colon = rest.indexOf(':');
+                gDomains.push({
+                  filePath: colon >= 0 ? rest.slice(0, colon) : 'geosite.dat',
+                  code: colon >= 0 ? rest.slice(colon + 1) : rest
+                });
+              } else {
+                pDomains.push(parsePriorityDomain(trimmed));
+              }
+            }
+            if (pDomains.length > 0) ns.prioritizedDomain = pDomains;
+            if (gDomains.length > 0) ns.geoDomain = gDomains;
+          }
+          if (s.expect_ips && s.expect_ips.length > 0) {
+            ns.geoip = s.expect_ips.map(parseGeoIpEntry);
+          }
+          if (s.tag) ns.tag = s.tag;
+          if (s.query_strategy) {
+            ns.queryStrategy = toV5QueryStrategy(s.query_strategy);
+          }
+          return ns;
+        })
+    };
+  }
+
+  const hasAccessLog = !!cfg.general.access_log && cfg.general.access_log !== 'none';
   const doc: Record<string, unknown> = {
     log: {
-      access: {
-        type: cfg.general.access_log === 'none' ? 'None' : 'File',
-        path: cfg.general.access_log === 'none' ? undefined : cfg.general.access_log
-      },
+      access: hasAccessLog
+        ? { type: 'File', path: cfg.general.access_log }
+        : { type: 'None' },
       error: {
         type: cfg.general.error_log ? 'File' : 'Console',
         path: cfg.general.error_log || undefined,
-        level: (cfg.general.log_level || 'warning').toUpperCase()
+        level: toV5LogLevel(cfg.general.log_level)
       }
     },
+    dns: dnsObj,
     inbounds,
     outbounds,
     router: cfg.routing.enabled
       ? {
-          domainStrategy: cfg.routing.domain_strategy,
+          domainStrategy: toV5RouterDomainStrategy(cfg.routing.domain_strategy),
           rule: cfg.routing_rules
             .filter((r) => r.enabled)
-            .map((r) => ({
-              domain: r.domain && r.domain.length > 0 ? r.domain : undefined,
-              ip: r.ip && r.ip.length > 0 ? r.ip : undefined,
-              port: r.port || undefined,
-              inboundTag: r.inbound_tag && r.inbound_tag.length > 0 ? r.inbound_tag : undefined,
-              tag: r.outbound_tag || undefined,
-              balancingTag: r.balancer_tag || undefined
-            })),
-          balancingRule: cfg.balancers.map((b) => ({
-            tag: b.tag,
-            outboundSelector: b.selector,
-            strategy: b.strategy === 'leastPing' ? 'leastPing' : 'random'
-          }))
+            .map((r) => {
+              const { domains, geoDomains } = parseRouterDomains(r.domain || []);
+              const ruleObj: Record<string, unknown> = {
+                domain: domains.length > 0 ? domains : undefined,
+                geoDomain: geoDomains.length > 0 ? geoDomains : undefined,
+                geoip: r.ip && r.ip.length > 0 ? r.ip.map(parseGeoIpEntry) : undefined,
+                portList: r.port || undefined,
+                sourcePortList: r.source_port || undefined,
+                networks: r.network || undefined,
+                sourceGeoip: r.source && r.source.length > 0 ? r.source.map(parseGeoIpEntry) : undefined,
+                userEmail: r.user && r.user.length > 0 ? r.user : undefined,
+                inboundTag: r.inbound_tag && r.inbound_tag.length > 0 ? r.inbound_tag : undefined,
+                protocol: r.protocol && r.protocol.length > 0 ? r.protocol.filter((p) => p !== 'quic') : undefined,
+                domainMatcher: cfg.routing.domain_matcher === 'mph' ? 'mph' : 'linear',
+                attributes: r.attrs || undefined,
+                tag: r.outbound_tag || undefined,
+                balancingTag: r.balancer_tag || undefined
+              };
+              return ruleObj;
+            }),
+          balancingRule: cfg.balancers.map((b) => {
+            let strategy = 'random';
+            if (b.strategy === 'leastPing') strategy = 'leastping';
+            else if (b.strategy === 'leastLoad') strategy = 'leastload';
+            const br: Record<string, unknown> = {
+              tag: b.tag,
+              outboundSelector: b.selector,
+              strategy
+            };
+            if (b.fallback_tag) br.fallbackTag = b.fallback_tag;
+            return br;
+          })
         }
       : undefined,
     services: Object.keys(services).length > 0 ? services : undefined

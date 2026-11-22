@@ -13,6 +13,7 @@ import {
 } from '@/api/client';
 
 import ToggleSwitch from '@/components/ui/ToggleSwitch.vue';
+import KeyValueInput from '@/components/ui/KeyValueInput.vue';
 import PresetsPanel from '@/components/PresetsPanel.vue';
 import InboundsPanel from '@/components/InboundsPanel.vue';
 import OutboundsPanel from '@/components/OutboundsPanel.vue';
@@ -83,6 +84,12 @@ async function refreshSystem() {
 }
 
 async function handleSaveAndApply() {
+  const errors = compiled.value.diagnostics.filter((d) => d.level === 'error');
+  if (errors.length > 0) {
+    notify(`存在 ${errors.length} 个配置错误，已阻止保存与重启：${errors[0].path} — ${errors[0].message}`);
+    activeTab.value = 'tools';
+    return;
+  }
   try {
     const compiledText = JSON.stringify(compiled.value.json, null, 2);
     await api.saveConfig(config.value, compiledText);
@@ -318,6 +325,30 @@ onMounted(async () => {
                 <ToggleSwitch v-if="effectiveCore === 'xray'" v-model="config.general.metrics_enabled" label="Xray Metrics (/debug/vars)" />
                 <ToggleSwitch v-if="effectiveCore === 'xray'" v-model="config.general.dns_log" label="DNS 日志 (dnsLog)" />
               </div>
+
+              <div v-if="effectiveCore === 'xray'" class="card-subtle" style="margin-top: 16px; display: flex; flex-direction: column; gap: 12px">
+                <strong style="font-size: 13px">Xray 顶层扩展 (env / geodata / version)</strong>
+                <div class="grid-3">
+                  <div class="field">
+                    <label>GeoData 自动重载间隔 (geodata.reloadInterval)</label>
+                    <input v-model="config.general.geodata_reload_interval" type="text" placeholder="如 1h / 24h" />
+                  </div>
+                  <div class="field">
+                    <label>最低内核版本要求 (version.min)</label>
+                    <input v-model="config.general.min_version" type="text" placeholder="如 25.1.1" />
+                  </div>
+                  <div class="field">
+                    <label>最高内核版本要求 (version.max)</label>
+                    <input v-model="config.general.max_version" type="text" placeholder="可选" />
+                  </div>
+                </div>
+                <KeyValueInput
+                  v-model="config.general.inline_env"
+                  label="内联环境变量 (env)"
+                  key-placeholder="XRAY_CONE_DISABLED"
+                  value-placeholder="true"
+                />
+              </div>
             </div>
           </div>
 
@@ -334,18 +365,21 @@ onMounted(async () => {
             v-else-if="activeTab === 'inbounds'"
             :inbounds="config.inbounds"
             :core="effectiveCore"
+            :v2ray-format="config.general.v2ray_format"
           />
 
           <OutboundsPanel
             v-else-if="activeTab === 'outbounds'"
             :outbounds="config.outbounds"
             :core="effectiveCore"
+            :v2ray-format="config.general.v2ray_format"
           />
 
           <RoutingDnsPanel
             v-else-if="activeTab === 'routing'"
             :config="config"
             :core="effectiveCore"
+            :v2ray-format="config.general.v2ray_format"
           />
 
           <TproxyPanel

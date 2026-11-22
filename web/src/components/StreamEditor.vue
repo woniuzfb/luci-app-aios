@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { CoreType, StreamFields, TlsCertificate } from '@/schema/types';
-import { CORE_CAPABILITIES } from '@/schema/capabilities';
+import { getCoreCapabilities, type V2RayFormat } from '@/schema/capabilities';
 import ArrayInput from '@/components/ui/ArrayInput.vue';
 import KeyValueInput from '@/components/ui/KeyValueInput.vue';
 import ToggleSwitch from '@/components/ui/ToggleSwitch.vue';
@@ -9,10 +9,11 @@ import ToggleSwitch from '@/components/ui/ToggleSwitch.vue';
 const props = defineProps<{
   model: StreamFields;
   core: CoreType;
+  v2rayFormat?: V2RayFormat;
   isInbound?: boolean;
 }>();
 
-const cap = computed(() => CORE_CAPABILITIES[props.core]);
+const cap = computed(() => getCoreCapabilities(props.core, props.v2rayFormat || 'jsonv4'));
 
 function ensureCerts(): TlsCertificate[] {
   if (!props.model.tls_certificates) {
@@ -68,9 +69,9 @@ function removeCert(idx: number) {
     </div>
 
     <!-- TLS Settings -->
-    <div v-if="model.security === 'tls'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
+    <div v-if="model.security === 'tls' || model.security === 'utls'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
       <div class="row-nowrap" style="justify-content: space-between">
-        <strong style="font-size: 13px">TLS 安全配置</strong>
+        <strong style="font-size: 13px">{{ model.security === 'utls' ? 'uTLS 安全配置 (V2Ray v5)' : 'TLS 安全配置' }}</strong>
         <div class="row">
           <ToggleSwitch v-model="model.tls_allow_insecure" label="allowInsecure" />
           <ToggleSwitch v-if="core === 'v2ray'" v-model="model.tls_verify_client" label="verifyClientCertificate (mTLS)" />
@@ -82,7 +83,7 @@ function removeCert(idx: number) {
           <label>SNI (serverName)</label>
           <input v-model="model.tls_server_name" type="text" placeholder="example.com" />
         </div>
-        <div v-if="core === 'xray'" class="field">
+        <div v-if="core === 'xray' || model.security === 'utls'" class="field">
           <label>uTLS Fingerprint</label>
           <input v-model="model.tls_fingerprint" type="text" placeholder="chrome / firefox / safari / randomized" />
         </div>
@@ -94,6 +95,29 @@ function removeCert(idx: number) {
           <label>ECH Config List</label>
           <input v-model="model.tls_ech_config" type="text" placeholder="base64 或 dns+https://..." />
         </div>
+        <div v-if="core === 'xray' && isInbound" class="field">
+          <label>ECH Server Keys (echServerKeys)</label>
+          <input v-model="model.tls_ech_server_keys" type="password" placeholder="可选" />
+        </div>
+        <div v-if="core === 'xray'" class="field">
+          <label>最小 TLS 版本 (minVersion)</label>
+          <input v-model="model.tls_min_version" type="text" placeholder="1.2 / 1.3" />
+        </div>
+        <div v-if="core === 'xray'" class="field">
+          <label>最大 TLS 版本 (maxVersion)</label>
+          <input v-model="model.tls_max_version" type="text" placeholder="1.3" />
+        </div>
+        <div v-if="core === 'xray'" class="field">
+          <label>加密套件 (cipherSuites)</label>
+          <input v-model="model.tls_cipher_suites" type="text" placeholder="冒号分隔" />
+        </div>
+      </div>
+
+      <div v-if="core === 'xray'" class="row">
+        <ToggleSwitch v-if="isInbound" v-model="model.tls_reject_unknown_sni" label="rejectUnknownSni" />
+        <ToggleSwitch v-model="model.tls_use_system_ca" label="useSystemCA" />
+        <ToggleSwitch v-model="model.tls_disable_system_root" label="disableSystemRoot" />
+        <ToggleSwitch v-model="model.tls_enable_session_resumption" label="enableSessionResumption" />
       </div>
 
       <div class="grid-2">
@@ -169,6 +193,18 @@ function removeCert(idx: number) {
           <div class="field">
             <label>后量子签名种子 (mldsa65Seed)</label>
             <input v-model="model.reality_mldsa65_seed" type="password" placeholder="可选" />
+          </div>
+          <div class="field">
+            <label>最低客户端版本 (minClientVer)</label>
+            <input v-model="model.reality_min_client_ver" type="text" placeholder="如 1.8.0" />
+          </div>
+          <div class="field">
+            <label>最高客户端版本 (maxClientVer)</label>
+            <input v-model="model.reality_max_client_ver" type="text" placeholder="可选" />
+          </div>
+          <div class="field">
+            <label>最大时间差 (maxTimeDiff, ms)</label>
+            <input v-model.number="model.reality_max_time_diff" type="number" placeholder="0" />
           </div>
         </div>
         <div class="grid-2">
@@ -297,7 +333,7 @@ function removeCert(idx: number) {
       </div>
     </div>
 
-    <div v-else-if="model.transport === 'httpupgrade' && core === 'xray'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
+    <div v-else-if="model.transport === 'httpupgrade'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
       <div class="grid-2">
         <div class="field"><label>HTTPUpgrade Path</label><input v-model="model.httpupgrade_path" type="text" placeholder="/" /></div>
         <div class="field"><label>HTTPUpgrade Host</label><input v-model="model.httpupgrade_host" type="text" /></div>
@@ -320,6 +356,8 @@ function removeCert(idx: number) {
         <div class="field"><label>TTI (ms)</label><input v-model.number="model.mkcp_tti" type="number" placeholder="50" /></div>
         <div class="field"><label>上行容量 (MB/s)</label><input v-model.number="model.mkcp_uplink_capacity" type="number" placeholder="5" /></div>
         <div class="field"><label>下行容量 (MB/s)</label><input v-model.number="model.mkcp_downlink_capacity" type="number" placeholder="20" /></div>
+        <div v-if="core === 'xray'" class="field"><label>拥塞窗口倍数 (cwndMultiplier)</label><input v-model.number="model.mkcp_cwnd_multiplier" type="number" placeholder="2" /></div>
+        <div v-if="core === 'xray'" class="field"><label>最大发送窗口 (maxSendingWindow)</label><input v-model.number="model.mkcp_max_sending_window" type="number" placeholder="2097152" /></div>
         <div v-if="core === 'v2ray'" class="field"><label>混淆 Seed</label><input v-model="model.mkcp_seed" type="text" /></div>
         <div v-if="core === 'v2ray'" class="field">
           <label>伪装类型 (header.type)</label>
@@ -359,18 +397,73 @@ function removeCert(idx: number) {
       </div>
     </div>
 
+    <div v-else-if="model.transport === 'hysteria' || model.transport === 'hysteria2'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
+      <strong style="font-size: 13px">Hysteria 传输层参数</strong>
+      <div class="grid-3">
+        <div class="field"><label>认证密钥 (auth)</label><input v-model="model.hysteria_auth" type="password" placeholder="留空则沿用密码字段" /></div>
+        <div v-if="core === 'xray'" class="field"><label>UDP 空闲超时 (udpIdleTimeout, 秒)</label><input v-model.number="model.hysteria_udp_idle_timeout" type="number" placeholder="60" /></div>
+        <div v-if="core === 'xray'" class="field">
+          <label>HTTP/3 伪装类型 (masquerade.type)</label>
+          <select v-model="model.hysteria_masquerade_type">
+            <option value="">默认 404</option>
+            <option value="proxy">proxy（反代）</option>
+            <option value="file">file（静态目录）</option>
+            <option value="string">string（自定义内容）</option>
+          </select>
+        </div>
+        <div v-if="core === 'xray' && model.hysteria_masquerade_type === 'proxy'" class="field"><label>伪装反代 URL (masquerade.url)</label><input v-model="model.hysteria_masquerade_url" type="text" placeholder="https://example.com" /></div>
+        <div v-if="core === 'xray' && model.hysteria_masquerade_type === 'file'" class="field"><label>静态文件目录 (masquerade.dir)</label><input v-model="model.hysteria_masquerade_dir" type="text" placeholder="/var/www" /></div>
+        <div v-if="core === 'xray' && model.hysteria_masquerade_type === 'string'" class="field"><label>自定义响应内容 (masquerade.content)</label><input v-model="model.hysteria_masquerade_content" type="text" placeholder="OK" /></div>
+        <div v-if="core === 'xray' && model.hysteria_masquerade_type === 'string'" class="field"><label>响应状态码 (statusCode)</label><input v-model.number="model.hysteria_masquerade_status_code" type="number" placeholder="200" /></div>
+        <div v-if="core === 'xray'" class="field"><label>UDP 端口跳跃 (udpHop.ports)</label><input v-model="model.hysteria_udphop_port" type="text" placeholder="20000-50000" /></div>
+        <div v-if="core === 'xray'" class="field"><label>跳跃间隔 (udpHop.interval, 秒)</label><input v-model.number="model.hysteria_udphop_interval" type="number" placeholder="30" /></div>
+        <div v-if="core === 'xray'" class="field"><label>Salamander 混淆密码</label><input v-model="model.hysteria_obfs_password" type="password" /></div>
+      </div>
+      <div class="row">
+        <ToggleSwitch v-if="core === 'v2ray'" v-model="model.hysteria_udp_extension" label="启用 UDP 扩展 (use_udp_extension)" />
+        <ToggleSwitch v-if="core === 'xray' && model.hysteria_masquerade_type === 'proxy'" v-model="model.hysteria_masquerade_rewrite_host" label="rewriteHost" />
+        <ToggleSwitch v-if="core === 'xray' && model.hysteria_masquerade_type === 'proxy'" v-model="model.hysteria_masquerade_insecure" label="insecure" />
+      </div>
+    </div>
+
+    <div v-else-if="model.transport === 'masque' && core === 'xray'" class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
+      <strong style="font-size: 13px">MASQUE 传输层参数 (Xray)</strong>
+      <div class="grid-3">
+        <div v-if="!isInbound" class="field"><label>Authority Host (host)</label><input v-model="model.masque_host" type="text" placeholder="example.com" /></div>
+        <div class="field"><label>URI 模板路径 (path)</label><input v-model="model.masque_path" type="text" placeholder="/.well-known/masque/ip/{target}/{ipproto}/" /></div>
+        <div v-if="!isInbound" class="field"><label>HTTP Basic 用户名 (user)</label><input v-model="model.masque_user" type="text" placeholder="可选" /></div>
+        <div v-if="!isInbound" class="field"><label>HTTP Basic 密码 (pass)</label><input v-model="model.masque_pass" type="password" placeholder="可选" /></div>
+      </div>
+      <KeyValueInput v-if="!isInbound" v-model="model.masque_headers" label="自定义 MASQUE Headers" />
+      <div v-if="!isInbound" class="field">
+        <label>Cloudflare WARP JSON (warp，可选)</label>
+        <textarea v-model="model.masque_warp_json" rows="2" placeholder='{"address":["172.16.0.2/32"],"privateKey":"..."}' />
+      </div>
+    </div>
+
     <!-- Sockopt & FinalMask -->
     <div class="card-subtle" style="display: flex; flex-direction: column; gap: 12px">
       <strong style="font-size: 13px">底层 Socket 选项 (sockopt)</strong>
       <div class="grid-3">
         <div class="field"><label>出站网卡 ({{ core === 'xray' ? 'interface' : 'bindToDevice' }})</label><input v-model="model.sockopt_interface" type="text" placeholder="如 eth0 / wan" /></div>
         <div class="field"><label>KeepAlive 间隔 (秒)</label><input v-model.number="model.sockopt_tcp_keepalive_interval" type="number" placeholder="0" /></div>
+        <div v-if="core === 'xray'" class="field"><label>KeepAlive 空闲阈值 (tcpKeepAliveIdle, s)</label><input v-model.number="model.sockopt_tcp_keepalive_idle" type="number" placeholder="300" /></div>
         <div v-if="core === 'xray'" class="field"><label>TCP 拥塞控制 (tcpcongestion)</label><input v-model="model.sockopt_tcp_congestion" type="text" placeholder="bbr / cubic" /></div>
+        <div v-if="core === 'xray'" class="field"><label>TCP MaxSeg (tcpMaxSeg)</label><input v-model.number="model.sockopt_tcp_max_seg" type="number" placeholder="0" /></div>
+        <div v-if="core === 'xray'" class="field"><label>TCP UserTimeout (ms)</label><input v-model.number="model.sockopt_tcp_user_timeout" type="number" placeholder="10000" /></div>
+        <div v-if="core === 'xray'" class="field"><label>SRV/TXT 策略 (addressPortStrategy)</label><input v-model="model.sockopt_address_port_strategy" type="text" placeholder="none / SrvPortAndAddress" /></div>
       </div>
       <div class="row">
         <ToggleSwitch v-model="model.sockopt_tcp_fast_open" label="TCP Fast Open" />
         <ToggleSwitch v-model="model.sockopt_mptcp" :label="core === 'xray' ? 'tcpMptcp' : 'mptcp'" />
+        <ToggleSwitch v-if="core === 'xray'" v-model="model.sockopt_v6_only" label="V6Only" />
       </div>
+      <div v-if="core === 'xray' && !isInbound" class="grid-3">
+        <div class="field"><label>HappyEyeballs tryDelayMs</label><input v-model.number="model.sockopt_happy_eyeballs_try_delay_ms" type="number" placeholder="250" /></div>
+        <div class="field"><label>HappyEyeballs interleave</label><input v-model.number="model.sockopt_happy_eyeballs_interleave" type="number" placeholder="1" /></div>
+        <div class="field"><label>HappyEyeballs maxConcurrentTry</label><input v-model.number="model.sockopt_happy_eyeballs_max_concurrent_try" type="number" placeholder="4" /></div>
+      </div>
+      <ToggleSwitch v-if="core === 'xray' && !isInbound" v-model="model.sockopt_happy_eyeballs_prioritize_ipv6" label="HappyEyeballs prioritizeIPv6" />
       <div v-if="core === 'xray'" class="field">
         <label>FinalMask JSON (Xray 专属：fragment / salamander / noise / quicParams)</label>
         <textarea v-model="model.finalmask_json" rows="2" placeholder='{"tcp":[{"type":"fragment","settings":{"packets":"tlshello"}}]}' />

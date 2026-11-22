@@ -9,6 +9,43 @@ export function to_array(v) {
 	return [v];
 }
 
+export function parse_json_safe(str, field_name) {
+	if (!str || str === "") return null;
+	try {
+		return json(str);
+	} catch (e) {
+		die(`AIOS invalid JSON${field_name ? ` in ${field_name}` : ""}: ${e}`);
+	}
+}
+
+export function parse_duration_ns(val, fallback_ns) {
+	if (val == null || val === "") return fallback_ns;
+	if (type(val) === "int" || type(val) === "double") return val > 0 ? int(val + 0.5) : fallback_ns;
+	const s = lc(trim(`${val}`));
+	const m = match(s, /^([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s|m|h)?$/);
+	if (!m) return fallback_ns;
+	const n = double(m[1]);
+	const u = m[2] || "ns";
+	if (u === "ns") return int(n + 0.5);
+	if (u === "us") return int(n * 1000 + 0.5);
+	if (u === "ms") return int(n * 1000000 + 0.5);
+	if (u === "s") return int(n * 1000000000 + 0.5);
+	if (u === "m") return int(n * 60000000000 + 0.5);
+	if (u === "h") return int(n * 3600000000000 + 0.5);
+	return fallback_ns;
+}
+
+export function kv_to_map(pairs) {
+	if (type(pairs) !== "array" || length(pairs) === 0) return null;
+	let out = {};
+	for (let p in pairs) {
+		if (p && p.key && trim(p.key) !== "") {
+			out[trim(p.key)] = p.value || "";
+		}
+	}
+	return length(keys(out)) > 0 ? out : null;
+}
+
 export function detect_core_type(general) {
 	const configured = general.core_type || "auto";
 	if (configured === "xray" || configured === "v2ray") {
@@ -55,6 +92,8 @@ export function load_config() {
 		routing_rules: [],
 		balancers: [],
 		observatory: {},
+		burst_observatory: {},
+		browser_forwarder: {},
 		policy: {},
 		reverse: {},
 		transparent_proxy: {},
@@ -74,6 +113,8 @@ export function load_config() {
 		else if (t === "routing_rule") push(result.routing_rules, sec);
 		else if (t === "routing_balancer") push(result.balancers, sec);
 		else if (t === "observatory") result.observatory = sec;
+		else if (t === "burst_observatory") result.burst_observatory = sec;
+		else if (t === "browser_forwarder") result.browser_forwarder = sec;
 		else if (t === "policy") result.policy = sec;
 		else if (t === "reverse") result.reverse = sec;
 		else if (t === "transparent_proxy") result.transparent_proxy = sec;

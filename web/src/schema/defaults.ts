@@ -162,6 +162,20 @@ export function createDefaultConfig(): AiosConfig {
       probe_interval: '1m',
       enable_concurrency: false
     },
+    burst_observatory: {
+      enabled: false,
+      subject_selector: [],
+      destination: 'https://www.google.com/generate_204',
+      connectivity: '',
+      interval: '1m',
+      sampling: 3,
+      timeout: '5s'
+    },
+    browser_forwarder: {
+      enabled: false,
+      listen_addr: '127.0.0.1',
+      listen_port: 8088
+    },
     policy: {
       enabled: true,
       handshake: 4,
@@ -172,7 +186,19 @@ export function createDefaultConfig(): AiosConfig {
       stats_inbound_uplink: true,
       stats_inbound_downlink: true,
       stats_outbound_uplink: true,
-      stats_outbound_downlink: true
+      stats_outbound_downlink: true,
+      levels: [
+        {
+          level: '0',
+          handshake: 4,
+          conn_idle: 300,
+          uplink_only: 2,
+          downlink_only: 5,
+          buffer_size: 4,
+          stats_user_uplink: true,
+          stats_user_downlink: true
+        }
+      ]
     },
     reverse: {
       enabled: false,
