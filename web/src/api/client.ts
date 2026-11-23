@@ -8,6 +8,7 @@ export interface CoreInfo {
   binary_exists: boolean;
   core_type: CoreType | 'auto';
   version: string;
+  core_version?: string;
   asset_location: string;
   has_geoip: boolean;
   has_geosite: boolean;
@@ -52,6 +53,48 @@ export interface StatsResponse {
   data: Record<string, unknown>;
 }
 
+export interface CoreSlot {
+  id: string;
+  source: 'system' | 'managed';
+  core: CoreType;
+  tag: string;
+  version: string;
+  path: string;
+  active: boolean;
+  removable: boolean;
+}
+
+export interface CoreListResult {
+  bins_dir: string;
+  active_bin: string;
+  active_real: string;
+  arch: string;
+  avail_kb: number;
+  has_unzip: boolean;
+  has_sha256: boolean;
+  has_downloader: boolean;
+  slots: CoreSlot[];
+}
+
+export interface InstallCoreStatus {
+  job_id?: string;
+  state: 'idle' | 'queued' | 'running' | 'done' | 'error';
+  core?: CoreType;
+  tag?: string;
+  progress: number;
+  message: string;
+  updated_at?: number;
+}
+
+export interface SwitchCoreResult {
+  ok: boolean;
+  core?: CoreType;
+  version?: string;
+  core_bin?: string;
+  rolled_back?: boolean;
+  error?: string;
+}
+
 export interface AiosApiClient {
   mode: 'ubus' | 'mock';
   getCoreInfo(): Promise<CoreInfo>;
@@ -69,6 +112,11 @@ export interface AiosApiClient {
   saveUserPreset(preset: AiosPreset): Promise<void>;
   deleteUserPreset(id: string): Promise<void>;
   readLog(): Promise<string>;
+  listCores(): Promise<CoreListResult>;
+  installCore(core: CoreType, tag: string, mirror?: string): Promise<{ ok: boolean; job_id?: string; error?: string }>;
+  installStatus(): Promise<InstallCoreStatus>;
+  switchCore(path: string, compiledJson?: string): Promise<SwitchCoreResult>;
+  removeCore(id: string): Promise<{ ok: boolean; id?: string; error?: string }>;
 }
 
 const STORAGE_CONFIG_KEY = 'aios_mock_config_v3';
@@ -191,6 +239,28 @@ class UbusApiClient implements AiosApiClient {
   async readLog(): Promise<string> {
     const res = await this.call<{ content: string }>('luci.aios', 'readLog');
     return res.content || '';
+  }
+  listCores(): Promise<CoreListResult> {
+    return this.call<CoreListResult>('luci.aios', 'listCores');
+  }
+  installCore(core: CoreType, tag: string, mirror = ''): Promise<{ ok: boolean; job_id?: string; error?: string }> {
+    return this.call<{ ok: boolean; job_id?: string; error?: string }>('luci.aios', 'installCore', {
+      core,
+      tag,
+      mirror
+    });
+  }
+  installStatus(): Promise<InstallCoreStatus> {
+    return this.call<InstallCoreStatus>('luci.aios', 'installStatus');
+  }
+  switchCore(path: string, compiledJson = ''): Promise<SwitchCoreResult> {
+    return this.call<SwitchCoreResult>('luci.aios', 'switchCore', {
+      path,
+      compiled_json: compiledJson
+    });
+  }
+  removeCore(id: string): Promise<{ ok: boolean; id?: string; error?: string }> {
+    return this.call<{ ok: boolean; id?: string; error?: string }>('luci.aios', 'removeCore', { id });
   }
 }
 
@@ -321,8 +391,97 @@ class LocalMockApiClient implements AiosApiClient {
     const list = (await this.listUserPresets()).filter((p) => p.id !== id);
     localStorage.setItem(STORAGE_PRESETS_KEY, JSON.stringify(list));
   }
+  private mockActivePath = '/usr/bin/aios-xray';
+  private mockSlots: CoreSlot[] = [
+    {
+      id: 'system:aios-xray',
+      source: 'system',
+      core: 'xray',
+      tag: 'system',
+      version: '26.11.9',
+      path: '/usr/bin/aios-xray',
+      active: true,
+      removable: false
+    },
+    {
+      id: 'system:aios-v2ray',
+      source: 'system',
+      core: 'v2ray',
+      tag: 'system',
+      version: '5.56.0',
+      path: '/usr/bin/aios-v2ray',
+      active: false,
+      removable: false
+    }
+  ];
+  private mockInstallStatus: InstallCoreStatus = { state: 'idle', progress: 0, message: '' };
+
   async readLog(): Promise<string> {
     return '[info] AIOS local preview mode — connect to OpenWrt /ubus for live logs.';
+  }
+  async listCores(): Promise<CoreListResult> {
+    const cfg = await this.loadConfig();
+    return {
+      bins_dir: cfg.general.bins_dir || '',
+      active_bin: this.mockActivePath,
+      active_real: this.mockActivePath,
+      arch: 'x86_64',
+      avail_kb: 262144,
+      has_unzip: true,
+      has_sha256: true,
+      has_downloader: true,
+      slots: this.mockSlots.map((s) => ({
+        ...s,
+        active: s.path === this.mockActivePath,
+        removable: s.source === 'managed' && s.path !== this.mockActivePath
+      }))
+    };
+  }
+  async installCore(core: CoreType, tag: string): Promise<{ ok: boolean; job_id?: string; error?: string }> {
+    const cfg = await this.loadConfig();
+    if (!cfg.general.bins_dir) {
+      return { ok: false, error: 'bins_dir is not configured (local preview)' };
+    }
+    const id = `${core}-${tag}`;
+    const ver = tag.replace(/^v/, '');
+    const path = `${cfg.general.bins_dir}/${id}/${core}`;
+    if (!this.mockSlots.some((s) => s.id === id)) {
+      this.mockSlots.push({
+        id,
+        source: 'managed',
+        core,
+        tag,
+        version: ver,
+        path,
+        active: false,
+        removable: true
+      });
+    }
+    this.mockInstallStatus = {
+      job_id: `mock-${Date.now()}`,
+      state: 'done',
+      core,
+      tag,
+      progress: 100,
+      message: `已模拟安装 ${core} ${tag} 至 ${path}`
+    };
+    return { ok: true, job_id: this.mockInstallStatus.job_id };
+  }
+  async installStatus(): Promise<InstallCoreStatus> {
+    return this.mockInstallStatus;
+  }
+  async switchCore(path: string): Promise<SwitchCoreResult> {
+    const slot = this.mockSlots.find((s) => s.path === path);
+    if (!slot) return { ok: false, error: 'Slot not found (local preview)' };
+    this.mockActivePath = slot.path;
+    return { ok: true, core: slot.core, version: slot.version, core_bin: slot.path };
+  }
+  async removeCore(id: string): Promise<{ ok: boolean; id?: string; error?: string }> {
+    const slot = this.mockSlots.find((s) => s.id === id);
+    if (!slot) return { ok: false, error: 'Slot not found' };
+    if (slot.path === this.mockActivePath) return { ok: false, error: 'Cannot remove active slot' };
+    this.mockSlots = this.mockSlots.filter((s) => s.id !== id);
+    return { ok: true, id };
   }
 }
 

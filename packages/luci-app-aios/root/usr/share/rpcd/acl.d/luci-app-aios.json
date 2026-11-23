@@ -14,7 +14,9 @@
 					"listPresets",
 					"readPreset",
 					"readLog",
-					"readCompiledConfig"
+					"readCompiledConfig",
+					"listCores",
+					"installStatus"
 				],
 				"service": [ "list" ],
 				"network.interface": [ "dump" ],
@@ -36,7 +38,10 @@
 					"deletePreset",
 					"writeCompiledConfig",
 					"serviceAction",
-					"firewallAction"
+					"firewallAction",
+					"installCore",
+					"switchCore",
+					"removeCore"
 				],
 				"uci": [ "set", "add", "delete", "reorder", "commit", "revert" ]
 			},

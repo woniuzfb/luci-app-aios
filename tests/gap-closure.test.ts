@@ -3,6 +3,8 @@ import { createDefaultConfig } from '../web/src/schema/defaults';
 import { compileConfig } from '../web/src/compiler';
 import { getCoreCapabilities, validateStreamCombination } from '../web/src/schema/capabilities';
 import { parseUciDump, serializeConfigToUci, type UciRawDump } from '../web/src/schema/uci';
+import { BUILTIN_PRESETS } from '../web/src/presets/builtin';
+import { applyPresetToConfig } from '../web/src/presets/manager';
 
 describe('Gap-Closure Regression Tests', () => {
   it('round-trips extended StreamFields and top-level sections through UCI', () => {
@@ -541,5 +543,123 @@ describe('Gap-Closure Regression Tests', () => {
       security: { type: 'AES128_GCM' },
       key: 'secret'
     });
+  });
+
+  it('switches Xray syntax across legacy (25.9.0), transitional (26.6.27), and modern (26.11.9) via core_features.json', () => {
+    const makeBaseXray = () => {
+      const cfg = createDefaultConfig();
+      cfg.general.core_type = 'xray';
+      cfg.reverse = { enabled: true, bridges: ['b1|int.example.com'], portals: ['p1|ext.example.com'] };
+      cfg.inbounds[0].socks_auth = 'password';
+      cfg.inbounds[0].username = 'alice';
+      cfg.inbounds[0].password = 'pw';
+      cfg.inbounds.unshift({
+        id: 'vl_in',
+        enabled: true,
+        alias: 'VLESS In',
+        tag: 'vless-in',
+        listen: '0.0.0.0',
+        port: 443,
+        protocol: 'vless',
+        uuid: '11111111-1111-1111-1111-111111111111',
+        transport: 'raw',
+        security: 'none'
+      });
+      cfg.outbounds.unshift({
+        id: 'vl_out',
+        enabled: true,
+        alias: 'VLESS Out',
+        tag: 'proxy-vless',
+        protocol: 'vless',
+        address: 'example.com',
+        port: 443,
+        uuid: '11111111-1111-1111-1111-111111111111',
+        transport: 'raw',
+        security: 'none'
+      });
+      return cfg;
+    };
+
+    // 1. Legacy Xray 25.9.0: network + clients/accounts + vnext + legacy reverse
+    const legacyRes = compileConfig(makeBaseXray(), { core: 'xray', version: '25.9.0' });
+    const legIn = legacyRes.json.inbounds as Array<Record<string, unknown>>;
+    const legOut = legacyRes.json.outbounds as Array<Record<string, unknown>>;
+    expect(((legOut[0].streamSettings as Record<string, unknown>).network)).toBe('raw');
+    expect(((legOut[0].streamSettings as Record<string, unknown>).method)).toBeUndefined();
+    expect((legOut[0].settings as Record<string, unknown>).vnext).toBeDefined();
+    expect((legIn[0].settings as Record<string, unknown>).clients).toBeDefined();
+    expect((legIn.find((i) => i.tag === 'socks-in')!.settings as Record<string, unknown>).accounts).toBeDefined();
+    expect(legacyRes.json.reverse).toBeDefined();
+
+    // 2. Transitional Xray 26.6.27: network + users + flat outbounds + no legacy reverse
+    const midRes = compileConfig(makeBaseXray(), { core: 'xray', version: '26.6.27' });
+    const midIn = midRes.json.inbounds as Array<Record<string, unknown>>;
+    const midOut = midRes.json.outbounds as Array<Record<string, unknown>>;
+    expect(((midOut[0].streamSettings as Record<string, unknown>).network)).toBe('raw');
+    expect(((midOut[0].streamSettings as Record<string, unknown>).method)).toBeUndefined();
+    expect((midOut[0].settings as Record<string, unknown>).address).toBe('example.com');
+    expect((midIn[0].settings as Record<string, unknown>).users).toBeDefined();
+    expect(midRes.json.reverse).toBeUndefined();
+
+    // 3. Modern Xray 26.11.9: method + users + flat outbounds + no legacy reverse
+    const modRes = compileConfig(makeBaseXray(), { core: 'xray', version: '26.11.9' });
+    const modOut = modRes.json.outbounds as Array<Record<string, unknown>>;
+    expect(((modOut[0].streamSettings as Record<string, unknown>).method)).toBe('raw');
+    expect(((modOut[0].streamSettings as Record<string, unknown>).network)).toBeUndefined();
+    expect((modOut[0].settings as Record<string, unknown>).address).toBe('example.com');
+
+    // 4. V2Ray version gating (v5.16.0 rejects v4 services & hysteria2; v5.11.0 rejects shadowsocks2022)
+    const v4Old = createDefaultConfig();
+    v4Old.general.core_type = 'v2ray';
+    v4Old.general.v2ray_format = 'jsonv4';
+    v4Old.burst_observatory = { enabled: true, subject_selector: ['proxy'], destination: 'https://example.com/204', connectivity: '', interval: '1m', sampling: 3, timeout: '5s' };
+    v4Old.outbounds.unshift({ id: 'hy2_old', enabled: true, alias: 'hy2', tag: 'hy2-old', protocol: 'hysteria2', address: 'example.com', port: 443, password: 'pw', transport: 'hysteria2', security: 'tls' });
+    const v4OldRes = compileConfig(v4Old, { core: 'v2ray', version: '5.16.0' });
+    expect(v4OldRes.diagnostics.some((d) => d.level === 'error' && d.path === 'burst_observatory')).toBe(true);
+    expect(v4OldRes.diagnostics.some((d) => d.level === 'error' && d.path === 'outbounds.hy2-old')).toBe(true);
+
+    const v5Old = createDefaultConfig();
+    v5Old.general.core_type = 'v2ray';
+    v5Old.general.v2ray_format = 'jsonv5';
+    v5Old.outbounds.unshift({ id: 'ss22_old', enabled: true, alias: 'ss22', tag: 'ss22-old', protocol: 'shadowsocks2022', address: 'example.com', port: 8388, method: '2022-blake3-aes-128-gcm', password: 'demo', transport: 'tcp', security: 'none' });
+    const v5OldRes = compileConfig(v5Old, { core: 'v2ray', version: '5.11.0' });
+    expect(v5OldRes.diagnostics.some((d) => d.level === 'error' && d.path === 'outbounds.ss22-old')).toBe(true);
+  });
+
+  it('omits ObservatoryService when observatory is disabled in V2Ray v4 and preserves host env on preset apply', () => {
+    const v4NoObs = createDefaultConfig();
+    v4NoObs.general.core_type = 'v2ray';
+    v4NoObs.general.v2ray_format = 'jsonv4';
+    v4NoObs.general.api_enabled = true;
+    v4NoObs.general.stats_enabled = true;
+    v4NoObs.observatory.enabled = false;
+    const res1 = compileConfig(v4NoObs, { core: 'v2ray', version: '5.56.0' });
+    expect((res1.json.api as { services: string[] }).services).toEqual(['HandlerService', 'LoggerService', 'StatsService']);
+
+    v4NoObs.observatory.enabled = true;
+    const res2 = compileConfig(v4NoObs, { core: 'v2ray', version: '5.56.0' });
+    expect((res2.json.api as { services: string[] }).services).toContain('ObservatoryService');
+
+    const cur = createDefaultConfig();
+    cur.general.core_type = 'v2ray';
+    cur.general.core_bin = '/mnt/sda1/aios/bins/current';
+    cur.general.bins_dir = '/mnt/sda1/aios/bins';
+    cur.general.asset_location = '/usr/share/aios/geodata';
+    cur.general.target_version = '5.56.0';
+    cur.general.v2ray_format = 'jsonv5';
+
+    const classic = BUILTIN_PRESETS.find((p) => p.id === 'builtin-classic-cn-split')!;
+    const appliedClassic = applyPresetToConfig(cur, classic, { preserveOutbounds: true });
+    expect(appliedClassic.general.core_bin).toBe('/mnt/sda1/aios/bins/current');
+    expect(appliedClassic.general.bins_dir).toBe('/mnt/sda1/aios/bins');
+    expect(appliedClassic.general.asset_location).toBe('/usr/share/aios/geodata');
+    expect(appliedClassic.general.target_version).toBe('5.56.0');
+    expect(appliedClassic.general.v2ray_format).toBe('jsonv5');
+    expect(appliedClassic.general.core_type).toBe('v2ray');
+
+    const xrayTproxy = BUILTIN_PRESETS.find((p) => p.id === 'builtin-xray-tproxy-fakedns')!;
+    const appliedXray = applyPresetToConfig(cur, xrayTproxy, { preserveOutbounds: true });
+    expect(appliedXray.general.core_bin).toBe('/mnt/sda1/aios/bins/current');
+    expect(appliedXray.general.bins_dir).toBe('/mnt/sda1/aios/bins');
   });
 });

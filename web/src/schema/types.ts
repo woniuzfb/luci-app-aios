@@ -12,6 +12,8 @@ export interface GeneralConfig {
   enabled: boolean;
   core_type: CoreSelection;
   core_bin: string;
+  bins_dir?: string;
+  target_version?: string;
   v2ray_format: 'jsonv4' | 'jsonv5';
   asset_location: string;
   geoloader: 'memconservative' | 'standard';

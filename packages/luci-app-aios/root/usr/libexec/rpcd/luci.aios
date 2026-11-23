@@ -57,13 +57,33 @@ sanitize_id() {
 }
 
 rpc_core_info() {
-	local bin configured core_type ver asset has_geoip has_geosite has_ucode fw_backend
-	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	local bin configured core_type ver core_version asset has_geoip has_geosite has_ucode fw_backend
+	bin="$(uci_get main.core_bin '')"
+	if [ -z "$bin" ]; then
+		for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
+			if [ -x "$cand" ]; then
+				bin="$cand"
+				break
+			fi
+		done
+		bin="${bin:-/usr/bin/xray}"
+	fi
 	configured="$(uci_get main.core_type auto)"
-	asset="$(uci_get main.asset_location /usr/share/xray)"
+	asset="$(uci_get main.asset_location '')"
+	if [ -z "$asset" ]; then
+		for cand in /usr/share/aios/geodata /usr/share/xray /usr/share/v2ray; do
+			if [ -d "$cand" ]; then
+				asset="$cand"
+				break
+			fi
+		done
+		asset="${asset:-/usr/share/xray}"
+	fi
 	ver=""
+	core_version=""
 	if [ -x "$bin" ]; then
 		ver="$("$bin" version 2>/dev/null | head -n 1)"
+		core_version="$(printf '%s\n' "$ver" | sed -nE 's/.*[[:space:]]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
 		core_type="$(detect_core_type "$configured" "$bin")"
 	else
 		core_type="$configured"
@@ -78,6 +98,7 @@ rpc_core_info() {
 	json_add_boolean "binary_exists" "$([ -x "$bin" ] && echo 1 || echo 0)"
 	json_add_string "core_type" "$core_type"
 	json_add_string "version" "$ver"
+	json_add_string "core_version" "$core_version"
 	json_add_string "asset_location" "$asset"
 	json_add_boolean "has_geoip" "$has_geoip"
 	json_add_boolean "has_geosite" "$has_geosite"
@@ -426,9 +447,251 @@ rpc_service_action() {
 	esac
 }
 
+rpc_list_cores() {
+	local bins_dir active_bin active_real avail_kb has_unzip has_sha256 has_dl
+	bins_dir="$(uci_get main.bins_dir '')"
+	active_bin="$(uci_get main.core_bin '')"
+	if [ -z "$active_bin" ]; then
+		for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
+			if [ -x "$cand" ]; then
+				active_bin="$cand"
+				break
+			fi
+		done
+	fi
+	active_real="$active_bin"
+	[ -L "$active_bin" ] && active_real="$(readlink -f "$active_bin" 2>/dev/null || echo "$active_bin")"
+
+	avail_kb=0
+	if [ -n "$bins_dir" ]; then
+		local probe_dir="$bins_dir"
+		[ -d "$probe_dir" ] || probe_dir="$(dirname "$probe_dir")"
+		avail_kb="$(df -Pk "$probe_dir" 2>/dev/null | awk 'NR>1 {val=$(NF-2)} END {print val+0}')"
+		avail_kb="${avail_kb:-0}"
+	fi
+	has_unzip=0; command -v unzip >/dev/null 2>&1 && has_unzip=1
+	has_sha256=0; command -v sha256sum >/dev/null 2>&1 && has_sha256=1
+	has_dl=0; (command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1) && has_dl=1
+
+	json_init
+	json_add_string "bins_dir" "$bins_dir"
+	json_add_string "active_bin" "$active_bin"
+	json_add_string "active_real" "$active_real"
+	json_add_string "arch" "$(uname -m 2>/dev/null || echo unknown)"
+	json_add_int "avail_kb" "${avail_kb:-0}"
+	json_add_boolean "has_unzip" "$has_unzip"
+	json_add_boolean "has_sha256" "$has_sha256"
+	json_add_boolean "has_downloader" "$has_dl"
+
+	json_add_array "slots"
+	local cand ver cver ctype is_active
+	for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
+		if [ -x "$cand" ]; then
+			ver="$("$cand" version 2>/dev/null | head -n 1)"
+			cver="$(printf '%s\n' "$ver" | sed -nE 's/.*[[:space:]]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+			ctype="$(detect_core_type auto "$cand")"
+			is_active=0
+			[ "$cand" = "$active_bin" ] || [ "$cand" = "$active_real" ] && is_active=1
+			json_add_object ""
+			json_add_string "id" "system:$(basename "$cand")"
+			json_add_string "source" "system"
+			json_add_string "core" "$ctype"
+			json_add_string "tag" "system"
+			json_add_string "version" "${cver:-unknown}"
+			json_add_string "path" "$cand"
+			json_add_boolean "active" "$is_active"
+			json_add_boolean "removable" 0
+			json_close_object
+		fi
+	done
+
+	if [ -n "$bins_dir" ] && [ -d "$bins_dir" ]; then
+		local entry slot_name bin_path
+		for entry in "$bins_dir"/*; do
+			[ -d "$entry" ] || continue
+			slot_name="$(basename "$entry")"
+			case "$slot_name" in
+				.*|current) continue ;;
+			esac
+			bin_path=""
+			if [ -x "${entry}/xray" ]; then
+				bin_path="${entry}/xray"
+			elif [ -x "${entry}/v2ray" ]; then
+				bin_path="${entry}/v2ray"
+			else
+				continue
+			fi
+			ver="$("$bin_path" version 2>/dev/null | head -n 1)"
+			cver="$(printf '%s\n' "$ver" | sed -nE 's/.*[[:space:]]([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n 1)"
+			ctype="$(detect_core_type auto "$bin_path")"
+			is_active=0
+			[ "$bin_path" = "$active_bin" ] || [ "$bin_path" = "$active_real" ] && is_active=1
+			json_add_object ""
+			json_add_string "id" "$slot_name"
+			json_add_string "source" "managed"
+			json_add_string "core" "$ctype"
+			json_add_string "tag" "${slot_name#*-}"
+			json_add_string "version" "${cver:-unknown}"
+			json_add_string "path" "$bin_path"
+			json_add_boolean "active" "$is_active"
+			json_add_boolean "removable" "$([ "$is_active" = "1" ] && echo 0 || echo 1)"
+			json_close_object
+		done
+	fi
+	json_close_array
+	json_dump
+}
+
+is_allowed_core_bin() {
+	local cand="$1" bins_dir="$2"
+	[ -n "$cand" ] && [ -x "$cand" ] || return 1
+	case "$cand" in
+		/usr/bin/aios-xray|/usr/bin/aios-v2ray|/usr/bin/xray|/usr/bin/v2ray)
+			return 0
+			;;
+	esac
+	local real_cand real_bins rel slot leaf
+	real_cand="$(readlink -f "$cand" 2>/dev/null || echo "")"
+	[ -n "$real_cand" ] && [ -x "$real_cand" ] || return 1
+	case "$real_cand" in
+		/usr/bin/aios-xray|/usr/bin/aios-v2ray|/usr/bin/xray|/usr/bin/v2ray)
+			return 0
+			;;
+	esac
+	[ -n "$bins_dir" ] && [ -d "$bins_dir" ] || return 1
+	real_bins="$(readlink -f "$bins_dir" 2>/dev/null || echo "$bins_dir")"
+	case "$real_cand" in
+		"${real_bins}/"*)
+			rel="${real_cand#"${real_bins}/"}"
+			slot="${rel%%/*}"
+			leaf="${rel#*/}"
+			if [ "$leaf" != "xray" ] && [ "$leaf" != "v2ray" ]; then
+				return 1
+			fi
+			if [ -z "$slot" ] || [ "$slot" = "." ] || [ "$slot" = ".." ] || [ "$slot" = "current" ]; then
+				return 1
+			fi
+			printf '%s\n' "$slot" | grep -qE '^[a-zA-Z0-9._-]+$' || return 1
+			[ "$real_cand" = "${real_bins}/${slot}/${leaf}" ] && return 0
+			;;
+	esac
+	return 1
+}
+
+rpc_install_core() {
+	local input core tag mirror bins_dir job_id
+	read -r input
+	json_load "$input"
+	json_get_var core "core"
+	json_get_var tag "tag"
+	json_get_var mirror "mirror"
+	bins_dir="$(uci_get main.bins_dir '')"
+	if [ -z "$bins_dir" ]; then
+		echo '{"ok":false,"error":"bins_dir is not configured in UCI (main.bins_dir)"}'
+		return 0
+	fi
+	if [ "$core" != "xray" ] && [ "$core" != "v2ray" ]; then
+		echo '{"ok":false,"error":"core must be xray or v2ray"}'
+		return 0
+	fi
+	if [ -z "$tag" ] || [ "$tag" = "." ] || [ "$tag" = ".." ] || ! printf '%s\n' "$tag" | grep -qE '^[a-zA-Z0-9._-]+$'; then
+		echo '{"ok":false,"error":"invalid version tag"}'
+		return 0
+	fi
+	if [ -n "$mirror" ]; then
+		if ! printf '%s\n' "$mirror" | grep -qE '^https?://[^[:space:]]+$'; then
+			echo '{"ok":false,"error":"invalid mirror URL (must start with http:// or https://)"}'
+			return 0
+		fi
+		case "$mirror" in
+			*/) ;;
+			*) mirror="${mirror}/" ;;
+		esac
+	fi
+	if [ -d /var/lock/aios-install.lock ]; then
+		if [ -s /var/lock/aios-install.lock/pid ]; then
+			local lock_pid
+			lock_pid="$(cat /var/lock/aios-install.lock/pid 2>/dev/null || true)"
+			if [ -n "$lock_pid" ] && [ ! -d "/proc/${lock_pid}" ]; then
+				rm -rf /var/lock/aios-install.lock 2>/dev/null || true
+			fi
+		fi
+		if [ -d /var/lock/aios-install.lock ]; then
+			echo '{"ok":false,"error":"another install job is already running"}'
+			return 0
+		fi
+	fi
+	job_id="$(date +%s)-$$"
+	mkdir -p "$RUNTIME_DIR"
+	printf '{"job_id":"%s","state":"queued","core":"%s","tag":"%s","progress":5,"message":"Queued install","updated_at":%s}\n' \
+		"$job_id" "$core" "$tag" "$(date +%s)" > "${RUNTIME_DIR}/install.status"
+	/usr/share/aios/core_manager.sh install "$core" "$tag" "$bins_dir" "${mirror:-}" "$job_id" </dev/null >/dev/null 2>&1 &
+	printf '{"ok":true,"job_id":"%s"}\n' "$job_id"
+}
+
+rpc_install_status() {
+	if [ -s "${RUNTIME_DIR}/install.status" ]; then
+		cat "${RUNTIME_DIR}/install.status"
+	else
+		echo '{"state":"idle","progress":0,"message":""}'
+	fi
+}
+
+rpc_switch_core() {
+	local input target_bin compiled_json bins_dir tmp_json=""
+	read -r input
+	json_load "$input"
+	json_get_var target_bin "path"
+	json_get_var compiled_json "compiled_json"
+	bins_dir="$(uci_get main.bins_dir '')"
+	if ! is_allowed_core_bin "$target_bin" "$bins_dir"; then
+		echo '{"ok":false,"error":"Target binary path is not in allowed whitelist or not executable"}'
+		return 0
+	fi
+	mkdir -p "$RUNTIME_DIR"
+	if [ -n "$compiled_json" ]; then
+		tmp_json="${RUNTIME_DIR}/switch_precompiled.json"
+		printf '%s' "$compiled_json" > "$tmp_json"
+	fi
+	/usr/share/aios/core_manager.sh switch "$target_bin" "$tmp_json"
+	[ -n "$tmp_json" ] && rm -f "$tmp_json"
+}
+
+rpc_remove_core() {
+	local input slot_id bins_dir target_dir active_bin active_real
+	read -r input
+	json_load "$input"
+	json_get_var slot_id "id"
+	bins_dir="$(uci_get main.bins_dir '')"
+	if [ -z "$bins_dir" ] || [ -z "$slot_id" ]; then
+		echo '{"ok":false,"error":"bins_dir or slot id missing"}'
+		return 0
+	fi
+	if ! printf '%s\n' "$slot_id" | grep -qE '^[a-zA-Z0-9._-]+$' || [ "$slot_id" = "." ] || [ "$slot_id" = ".." ] || [ "$slot_id" = "current" ]; then
+		echo '{"ok":false,"error":"invalid slot id"}'
+		return 0
+	fi
+	target_dir="${bins_dir}/${slot_id}"
+	if [ ! -d "$target_dir" ]; then
+		echo '{"ok":false,"error":"slot not found"}'
+		return 0
+	fi
+	active_bin="$(uci_get main.core_bin '')"
+	active_real="$active_bin"
+	[ -L "$active_bin" ] && active_real="$(readlink -f "$active_bin" 2>/dev/null || echo "$active_bin")"
+	case "$active_real" in
+		"${target_dir}"/*)
+			echo '{"ok":false,"error":"cannot remove currently active core slot"}'
+			return 0
+			;;
+	esac
+	rm -rf "$target_dir"
+	printf '{"ok":true,"id":"%s"}\n' "$slot_id"
+}
+
 case "$1" in
 	list)
-		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"}}'
+		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"},"listCores":{},"installCore":{"core":"String","tag":"String","mirror":"String"},"installStatus":{},"switchCore":{"path":"String","compiled_json":"String"},"removeCore":{"id":"String"}}'
 		;;
 	call)
 		case "$2" in
@@ -447,6 +710,11 @@ case "$1" in
 			readCompiledConfig) rpc_read_compiled_config ;;
 			readLog) rpc_read_log ;;
 			serviceAction) rpc_service_action ;;
+			listCores) rpc_list_cores ;;
+			installCore) rpc_install_core ;;
+			installStatus) rpc_install_status ;;
+			switchCore) rpc_switch_core ;;
+			removeCore) rpc_remove_core ;;
 		esac
 		;;
 esac

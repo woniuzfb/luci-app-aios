@@ -2,6 +2,7 @@
 
 import { deep_merge, parse_duration_ns, parse_json_safe, to_array } from "../common/config.mjs";
 import { validate_stream_combination } from "../common/capabilities.mjs";
+import { resolve_core_features } from "../common/features.mjs";
 
 function to_v5_log_level(lv) {
 	const v = lc(lv || "warning");
@@ -247,10 +248,16 @@ function build_v5_stream(item, is_inbound, default_mark, protocol) {
 	return ss;
 }
 
-export function compile_v2ray_v5(cfg) {
+export function compile_v2ray_v5(cfg, opts) {
 	const g = cfg.general || {};
 	const tp = cfg.transparent_proxy || {};
 	const out_mark = tp.enabled === "1" ? int(tp.outbound_mark || "0x3a03") : null;
+	const target_ver = (opts && opts.version) || (g.target_version && g.target_version !== "auto" ? g.target_version : null);
+	const features = resolve_core_features("v2ray", "jsonv5", target_ver);
+	const th = features.thresholds || {};
+	if (!features.hasJsonV5) {
+		die(`V2Ray ${features.version} 不支持 jsonv5 格式（需 >= ${th.jsonv5?.since || "5.1.0"}）。`);
+	}
 
 	let inbounds = [];
 	let services = {};
@@ -259,6 +266,12 @@ export function compile_v2ray_v5(cfg) {
 	for (let ib in cfg.inbounds) {
 		if (ib.enabled === "0") continue;
 		if (ib.protocol === "tun") {
+			if (!features.hasV5ServicesTun) {
+				die(`V2Ray ${features.version} 不支持 services.tun（需 >= ${th.v5ServicesTun?.since || "5.9.0"}）。`);
+			}
+			if (ib.packet_encoding === "Stream" && !features.hasPacketEncodingStream) {
+				die(`V2Ray ${features.version} 不支持 packetEncoding="Stream"（需 >= ${th.packetEncodingStream?.since || "5.53.0"}）。`);
+			}
 			let ips = [];
 			for (let c in to_array(ib.tun_ips)) {
 				const parsed = parse_cidr_bytes(c);
@@ -294,6 +307,12 @@ export function compile_v2ray_v5(cfg) {
 			die(`V2Ray jsonv5 不支持入站协议 "${ib.protocol}" (${ib.tag || ib[".name"]})。`);
 		}
 		const proto = ib.protocol === "tunnel" ? "dokodemo-door" : (ib.protocol === "hysteria" ? "hysteria2" : (ib.protocol || "socks"));
+		if (proto === "hysteria2" && !features.hasHysteria2) {
+			die(`V2Ray ${features.version} 不支持 hysteria2 入站协议（需 >= ${th.hysteria2?.since || "5.18.0"}）。`);
+		}
+		if (ib.packet_encoding === "Stream" && !features.hasPacketEncodingStream) {
+			die(`V2Ray ${features.version} 不支持 packetEncoding="Stream"（需 >= ${th.packetEncodingStream?.since || "5.53.0"}）。`);
+		}
 		const users = parse_json_safe(ib.users_json, "users_json");
 		const has_users = type(users) === "array" && length(users) > 0;
 		let settings = {};
@@ -345,6 +364,12 @@ export function compile_v2ray_v5(cfg) {
 			die(`V2Ray jsonv5 不支持出站协议 "${ob.protocol}" (${ob.tag || ob[".name"]})。`);
 		}
 		const proto = ob.protocol === "hysteria" ? "hysteria2" : (ob.protocol || "freedom");
+		if (proto === "shadowsocks2022" && !features.hasShadowsocks2022) {
+			die(`V2Ray ${features.version} 不支持 shadowsocks2022 出站协议（需 >= ${th.shadowsocks2022?.since || "5.12.0"}）。`);
+		}
+		if (proto === "hysteria2" && !features.hasHysteria2) {
+			die(`V2Ray ${features.version} 不支持 hysteria2 出站协议（需 >= ${th.hysteria2?.since || "5.18.0"}）。`);
+		}
 		let settings = {};
 		if (proto === "shadowsocks2022") {
 			settings = { address: ob.address || "", port: int(ob.port || 8388), method: ob.method || "2022-blake3-aes-128-gcm", psk: ob.password || "" };

@@ -1,6 +1,7 @@
 "use strict";
 
 import { deep_merge, parse_duration_ns, parse_json_safe, to_array } from "../common/config.mjs";
+import { resolve_core_features } from "../common/features.mjs";
 import { build_stream_settings } from "../common/stream.mjs";
 
 function build_inbound(item) {
@@ -152,10 +153,13 @@ function build_outbound(item, default_mark) {
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
-export function compile_v2ray(cfg) {
+export function compile_v2ray(cfg, opts) {
 	const g = cfg.general || {};
 	const tp = cfg.transparent_proxy || {};
 	const out_mark = tp.enabled === "1" ? int(tp.outbound_mark || "0x3a03") : null;
+	const target_ver = (opts && opts.version) || (g.target_version && g.target_version !== "auto" ? g.target_version : null);
+	const features = resolve_core_features("v2ray", "jsonv4", target_ver);
+	const th = features.thresholds || {};
 
 	let doc = {
 		log: { loglevel: g.log_level || "warning", access: g.access_log || "none", error: g.error_log || "" },
@@ -168,7 +172,10 @@ export function compile_v2ray(cfg) {
 	let extra_api_rule = null;
 	if (g.api_enabled === "1") {
 		const api_port = int(g.api_port || 18080);
-		doc.api = { tag: "api", services: ["HandlerService", "LoggerService", "StatsService", "ObservatoryService"] };
+		let api_services = ["HandlerService", "LoggerService"];
+		if (g.stats_enabled === "1") push(api_services, "StatsService");
+		if ((cfg.observatory || {}).enabled === "1") push(api_services, "ObservatoryService");
+		doc.api = { tag: "api", services: api_services };
 		push(doc.inbounds, { tag: "api-in", listen: "127.0.0.1", port: api_port, protocol: "dokodemo-door", settings: { address: "127.0.0.1" } });
 		extra_api_rule = { type: "field", inboundTag: ["api-in"], outboundTag: "api" };
 	}
@@ -178,12 +185,21 @@ export function compile_v2ray(cfg) {
 		if (ib.protocol === "wireguard" || ib.protocol === "masque") {
 			die(`V2Ray jsonv4 不支持入站协议 "${ib.protocol}" (${ib.tag || ib[".name"]})。`);
 		}
+		if ((ib.protocol === "hysteria" || ib.protocol === "hysteria2") && !features.hasHysteria2) {
+			die(`V2Ray ${features.version} 不支持 hysteria2 入站协议（需 >= ${th.hysteria2?.since || "5.18.0"}）。`);
+		}
+		if (ib.packet_encoding === "Stream" && !features.hasPacketEncodingStream) {
+			die(`V2Ray ${features.version} 不支持 packetEncoding="Stream"（需 >= ${th.packetEncodingStream?.since || "5.53.0"}）。`);
+		}
 		push(doc.inbounds, build_inbound(ib));
 	}
 	for (let ob in cfg.outbounds) {
 		if (ob.enabled === "0") continue;
 		if (ob.protocol === "wireguard" || ob.protocol === "masque" || ob.protocol === "shadowsocks2022") {
 			die(`V2Ray jsonv4 不支持出站协议 "${ob.protocol}" (${ob.tag || ob[".name"]})。`);
+		}
+		if ((ob.protocol === "hysteria" || ob.protocol === "hysteria2") && !features.hasHysteria2) {
+			die(`V2Ray ${features.version} 不支持 hysteria2 出站协议（需 >= ${th.hysteria2?.since || "5.18.0"}）。`);
 		}
 		push(doc.outbounds, build_outbound(ob, out_mark));
 	}
@@ -288,6 +304,9 @@ export function compile_v2ray(cfg) {
 	let v4_services = {};
 	const bobs = cfg.burst_observatory || {};
 	if (bobs.enabled === "1") {
+		if (!features.hasV4Services) {
+			die(`V2Ray ${features.version} jsonv4 不支持 services.burstObservatory（需 >= ${th.v4Services?.since || "5.17.0"}）。`);
+		}
 		v4_services.burstObservatory = {
 			subjectSelector: to_array(bobs.subject_selector),
 			pingConfig: {
@@ -301,6 +320,12 @@ export function compile_v2ray(cfg) {
 	}
 	for (let ib in cfg.inbounds) {
 		if (ib.enabled === "0" || ib.protocol !== "tun") continue;
+		if (!features.hasV4Services) {
+			die(`V2Ray ${features.version} jsonv4 不支持 services.tun（需 >= ${th.v4Services?.since || "5.17.0"}）。`);
+		}
+		if (ib.packet_encoding === "Stream" && !features.hasPacketEncodingStream) {
+			die(`V2Ray ${features.version} 不支持 packetEncoding="Stream"（需 >= ${th.packetEncodingStream?.since || "5.53.0"}）。`);
+		}
 		let ips = [];
 		for (let c in to_array(ib.tun_ips)) {
 			const parts = split(trim(c || ""), "/");

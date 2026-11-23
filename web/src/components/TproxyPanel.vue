@@ -138,7 +138,7 @@ function addLanHost() {
           <label>Dnsmasq 集成模式</label>
           <select v-model="config.transparent_proxy.dnsmasq_integration_mode">
             <option value="global">global（所有实例）</option>
-            <option value="per_instance">per_instance（OpenWrt 24.10+ 指定实例）</option>
+            <option value="per_instance">per_instance（仅写入指定 dnsmasq 实例）</option>
           </select>
         </div>
         <ArrayInput

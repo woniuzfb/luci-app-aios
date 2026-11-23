@@ -408,11 +408,19 @@ textarea {
   flex-wrap: wrap;
 }
 
+.row:has(> .switch-label) {
+  gap: 12px 24px;
+}
+
 .row-nowrap {
   display: flex;
   gap: 8px;
   align-items: center;
   flex-wrap: nowrap;
+}
+
+.row-nowrap:has(> .switch-label) {
+  gap: 16px;
 }
 
 .badge {
@@ -478,6 +486,14 @@ textarea {
   color: var(--success);
 }
 
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
 .table {
   width: 100%;
   border-collapse: collapse;
@@ -487,7 +503,7 @@ textarea {
 .table th,
 .table td {
   text-align: left;
-  padding: 9px 10px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
 }
@@ -496,6 +512,26 @@ textarea {
   color: var(--muted);
   font-weight: 500;
   font-size: 12px;
+  background: var(--surface-elevated);
+  white-space: nowrap;
+}
+
+.table-wrap .table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table th.col-actions,
+.table td.col-actions {
+  text-align: right;
+  white-space: nowrap;
+  width: 1%;
+}
+
+.table-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .code-block {
@@ -643,6 +679,8 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  min-height: 28px;
+  line-height: 1.4;
   cursor: pointer;
   user-select: none;
   font-size: 13px;

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "xray": {
+    "defaultVersion": "26.11.9",
+    "features": {
+      "flatOutbounds": { "since": "25.10.15" },
+      "tunInbound": { "since": "26.1.13" },
+      "hysteria": { "since": "26.1.13" },
+      "legacyReverse": { "removedIn": "26.4.25" },
+      "inboundUsersKey": { "since": "26.5.9" },
+      "streamMethodKey": { "since": "26.7.11" },
+      "masque": { "since": "26.9.30" }
+    },
+    "presets": [
+      { "id": "xray-legacy", "label": "Xray 传统版 (1.8 / 25.x)", "version": "25.9.0" },
+      { "id": "xray-26-early", "label": "Xray 26 过渡版 (26.5–26.6)", "version": "26.6.27" },
+      { "id": "xray-latest", "label": "Xray 最新版 (26.10+)", "version": "26.11.9" }
+    ]
+  },
+  "v2ray": {
+    "defaultVersion": "5.56.0",
+    "features": {
+      "jsonv5": { "since": "5.1.0" },
+      "v5ServicesTun": { "since": "5.9.0" },
+      "shadowsocks2022": { "since": "5.12.0" },
+      "v4Services": { "since": "5.17.0" },
+      "hysteria2": { "since": "5.18.0" },
+      "packetEncodingStream": { "since": "5.53.0" }
+    },
+    "presets": [
+      { "id": "v2ray-5-compat", "label": "V2Ray 5.18+", "version": "5.18.0" },
+      { "id": "v2ray-5-latest", "label": "V2Ray 最新版 (5.56+)", "version": "5.56.0" }
+    ]
+  }
+}

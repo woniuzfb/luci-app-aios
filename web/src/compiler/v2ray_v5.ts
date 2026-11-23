@@ -1,5 +1,6 @@
 import type { AiosConfig, InboundConfig, OutboundConfig, StreamFields } from '@/schema/types';
 import { validateStreamCombination } from '@/schema/capabilities';
+import { CORE_FEATURES_SPEC, type ResolvedV2RayFeatures } from '@/schema/features';
 import type { CompileDiagnostic, CompileResult } from './index';
 
 function toV5LogLevel(level?: string): string {
@@ -420,7 +421,8 @@ function buildV5Stream(
 
 function compileV5Inbound(
   item: InboundConfig,
-  diagnostics: CompileDiagnostic[]
+  diagnostics: CompileDiagnostic[],
+  v2rayFeatures?: ResolvedV2RayFeatures
 ): Record<string, unknown> | null {
   if (item.protocol === 'tun') return null; // Mapped to services.tun
   if (item.protocol === 'wireguard' || item.protocol === 'masque') {
@@ -432,6 +434,24 @@ function compileV5Inbound(
     return null;
   }
   const proto = item.protocol === 'tunnel' ? 'dokodemo-door' : item.protocol === 'hysteria' ? 'hysteria2' : item.protocol;
+  const vfSpec = CORE_FEATURES_SPEC.v2ray.features;
+  if (v2rayFeatures) {
+    if (proto === 'hysteria2' && !v2rayFeatures.hasHysteria2) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 hysteria2 入站协议（需 >= ${vfSpec.hysteria2.since}）。`
+      });
+      return null;
+    }
+    if (item.packet_encoding === 'Stream' && !v2rayFeatures.hasPacketEncodingStream) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}.packet_encoding`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 packetEncoding="Stream"（需 >= ${vfSpec.packetEncodingStream.since}）。`
+      });
+    }
+  }
   const settings: Record<string, unknown> = {};
   if (proto === 'socks') {
     if (item.socks_ip) settings.address = item.socks_ip;
@@ -493,7 +513,8 @@ function compileV5Inbound(
 function compileV5Outbound(
   item: OutboundConfig,
   defaultMark: number | null,
-  diagnostics: CompileDiagnostic[]
+  diagnostics: CompileDiagnostic[],
+  v2rayFeatures?: ResolvedV2RayFeatures
 ): Record<string, unknown> | null {
   if (item.protocol === 'wireguard' || item.protocol === 'masque') {
     diagnostics.push({
@@ -505,6 +526,25 @@ function compileV5Outbound(
   }
 
   const proto = item.protocol === 'hysteria' ? 'hysteria2' : item.protocol;
+  const vfSpec = CORE_FEATURES_SPEC.v2ray.features;
+  if (v2rayFeatures) {
+    if (proto === 'shadowsocks2022' && !v2rayFeatures.hasShadowsocks2022) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 shadowsocks2022 出站协议（需 >= ${vfSpec.shadowsocks2022.since}）。`
+      });
+      return null;
+    }
+    if (proto === 'hysteria2' && !v2rayFeatures.hasHysteria2) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 hysteria2 出站协议（需 >= ${vfSpec.hysteria2.since}）。`
+      });
+      return null;
+    }
+  }
   let settings: Record<string, unknown> = {};
 
   if (proto === 'shadowsocks2022') {
@@ -571,8 +611,19 @@ function compileV5Outbound(
   return custom ? deepMerge(obj, custom) : obj;
 }
 
-export function compileV2RayV5(cfg: AiosConfig): CompileResult {
+export function compileV2RayV5(
+  cfg: AiosConfig,
+  v2rayFeatures?: ResolvedV2RayFeatures
+): CompileResult {
   const diagnostics: CompileDiagnostic[] = [];
+  const vfSpec = CORE_FEATURES_SPEC.v2ray.features;
+  if (v2rayFeatures && !v2rayFeatures.hasJsonV5) {
+    diagnostics.push({
+      level: 'error',
+      path: 'general.v2ray_format',
+      message: `V2Ray ${v2rayFeatures.version} 不支持 jsonv5 格式（需 >= ${vfSpec.jsonv5.since}）。`
+    });
+  }
   const outMark = cfg.transparent_proxy.enabled
     ? Number.parseInt(cfg.transparent_proxy.outbound_mark, 16) || null
     : null;
@@ -671,43 +722,58 @@ export function compileV2RayV5(cfg: AiosConfig): CompileResult {
   // Convert any TUN inbound into V2Ray v5 services.tun
   const tunInbound = cfg.inbounds.find((i) => i.enabled && i.protocol === 'tun');
   if (tunInbound) {
-    const parsedIps = (tunInbound.tun_ips || [])
-      .map(parseCidrToBytes)
-      .filter((x): x is { ip: number[]; prefix: number } => x !== null);
-    const parsedRoutes = (tunInbound.tun_routes || [])
-      .map(parseCidrToBytes)
-      .filter((x): x is { ip: number[]; prefix: number } => x !== null);
-    const tunSvc: Record<string, unknown> = {
-      name: tunInbound.tun_name || 'aios0',
-      mtu: tunInbound.tun_mtu || 1500,
-      tag: tunInbound.tag || 'tun-in',
-      ips: parsedIps.length > 0 ? parsedIps : [{ ip: [10, 0, 0, 1], prefix: 24 }],
-      routes: parsedRoutes.length > 0 ? parsedRoutes : [{ ip: [0, 0, 0, 0], prefix: 0 }],
-      enablePromiscuousMode: tunInbound.tun_promiscuous !== false,
-      enableSpoofing: tunInbound.tun_spoofing !== false
-    };
-    if (tunInbound.packet_encoding) tunSvc.packetEncoding = tunInbound.packet_encoding;
-    if (tunInbound.sniffing_enabled) {
-      tunSvc.sniffingSettings = {
-        enabled: true,
-        destinationOverride:
-          tunInbound.sniffing_dest_override && tunInbound.sniffing_dest_override.length > 0
-            ? tunInbound.sniffing_dest_override
-            : ['http', 'tls'],
-        metadataOnly: !!tunInbound.sniffing_metadata_only
+    if (v2rayFeatures && !v2rayFeatures.hasV5ServicesTun) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${tunInbound.tag}`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 services.tun（需 >= ${vfSpec.v5ServicesTun.since}）。`
+      });
+    } else {
+      if (v2rayFeatures && tunInbound.packet_encoding === 'Stream' && !v2rayFeatures.hasPacketEncodingStream) {
+        diagnostics.push({
+          level: 'error',
+          path: `inbounds.${tunInbound.tag}.packet_encoding`,
+          message: `V2Ray ${v2rayFeatures.version} 不支持 packetEncoding="Stream"（需 >= ${vfSpec.packetEncodingStream.since}）。`
+        });
+      }
+      const parsedIps = (tunInbound.tun_ips || [])
+        .map(parseCidrToBytes)
+        .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+      const parsedRoutes = (tunInbound.tun_routes || [])
+        .map(parseCidrToBytes)
+        .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+      const tunSvc: Record<string, unknown> = {
+        name: tunInbound.tun_name || 'aios0',
+        mtu: tunInbound.tun_mtu || 1500,
+        tag: tunInbound.tag || 'tun-in',
+        ips: parsedIps.length > 0 ? parsedIps : [{ ip: [10, 0, 0, 1], prefix: 24 }],
+        routes: parsedRoutes.length > 0 ? parsedRoutes : [{ ip: [0, 0, 0, 0], prefix: 0 }],
+        enablePromiscuousMode: tunInbound.tun_promiscuous !== false,
+        enableSpoofing: tunInbound.tun_spoofing !== false
       };
+      if (tunInbound.packet_encoding) tunSvc.packetEncoding = tunInbound.packet_encoding;
+      if (tunInbound.sniffing_enabled) {
+        tunSvc.sniffingSettings = {
+          enabled: true,
+          destinationOverride:
+            tunInbound.sniffing_dest_override && tunInbound.sniffing_dest_override.length > 0
+              ? tunInbound.sniffing_dest_override
+              : ['http', 'tls'],
+          metadataOnly: !!tunInbound.sniffing_metadata_only
+        };
+      }
+      services.tun = tunSvc;
     }
-    services.tun = tunSvc;
   }
 
   const inbounds = cfg.inbounds
     .filter((i) => i.enabled)
-    .map((i) => compileV5Inbound(i, diagnostics))
+    .map((i) => compileV5Inbound(i, diagnostics, v2rayFeatures))
     .filter((x): x is Record<string, unknown> => x !== null);
 
   const outbounds = cfg.outbounds
     .filter((o) => o.enabled)
-    .map((o) => compileV5Outbound(o, outMark, diagnostics))
+    .map((o) => compileV5Outbound(o, outMark, diagnostics, v2rayFeatures))
     .filter((x): x is Record<string, unknown> => x !== null);
 
   let dnsObj: Record<string, unknown> | undefined;

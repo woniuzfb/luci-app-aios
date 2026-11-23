@@ -6,6 +6,8 @@ export function createDefaultConfig(): AiosConfig {
       enabled: false,
       core_type: 'auto',
       core_bin: '/usr/bin/xray',
+      bins_dir: '',
+      target_version: 'auto',
       v2ray_format: 'jsonv4',
       asset_location: '/usr/share/xray',
       geoloader: 'memconservative',

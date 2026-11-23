@@ -111,6 +111,17 @@ export function applyPresetToConfig(
   options: { preserveOutbounds?: boolean } = {}
 ): AiosConfig {
   const next = cloneConfig(preset.config);
+  // Preserve host runtime & multi-version environment fields so applying a preset
+  // never wipes the user's selected binary slot, storage dir, or target version.
+  next.general.core_bin = current.general.core_bin;
+  next.general.bins_dir = current.general.bins_dir;
+  next.general.asset_location = current.general.asset_location;
+  next.general.target_version = current.general.target_version;
+  next.general.v2ray_format = current.general.v2ray_format;
+  if (preset.recommendedCore === 'auto') {
+    next.general.core_type = current.general.core_type;
+  }
+
   if (options.preserveOutbounds) {
     const userProxyOutbounds = current.outbounds.filter(
       (o) => !['freedom', 'blackhole', 'dns', 'loopback'].includes(o.protocol)

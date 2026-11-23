@@ -1,7 +1,7 @@
 "use strict";
 
 import { cursor } from "uci";
-import { popen } from "fs";
+import { access, popen } from "fs";
 
 export function to_array(v) {
 	if (v == null || v === "") return [];
@@ -46,12 +46,20 @@ export function kv_to_map(pairs) {
 	return length(keys(out)) > 0 ? out : null;
 }
 
+export function resolve_core_bin(general) {
+	if (general && general.core_bin && general.core_bin !== "") return general.core_bin;
+	for (let cand in ["/usr/bin/aios-xray", "/usr/bin/aios-v2ray", "/usr/bin/xray", "/usr/bin/v2ray"]) {
+		if (access(cand, "x")) return cand;
+	}
+	return "/usr/bin/aios-xray";
+}
+
 export function detect_core_type(general) {
 	const configured = general.core_type || "auto";
 	if (configured === "xray" || configured === "v2ray") {
 		return configured;
 	}
-	const bin = general.core_bin || "/usr/bin/xray";
+	const bin = resolve_core_bin(general);
 	const proc = popen(`${bin} version 2>/dev/null`, "r");
 	if (proc) {
 		const line = proc.read("line") || "";
@@ -60,6 +68,18 @@ export function detect_core_type(general) {
 		if (index(lc(line), "v2ray") >= 0) return "v2ray";
 	}
 	return index(lc(bin), "v2ray") >= 0 ? "v2ray" : "xray";
+}
+
+export function detect_core_version(general) {
+	const bin = resolve_core_bin(general);
+	const proc = popen(`${bin} version 2>/dev/null`, "r");
+	if (proc) {
+		const line = proc.read("line") || "";
+		proc.close();
+		const m = match(line, /([0-9]+\.[0-9]+\.[0-9]+)/);
+		if (m) return m[1];
+	}
+	return null;
 }
 
 export function deep_merge(target, source) {

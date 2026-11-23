@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue';
 import type { AiosConfig, AiosPreset } from '@/schema/types';
 import { createDefaultConfig } from '@/schema/defaults';
 import { resolveEffectiveCore } from '@/schema/capabilities';
+import { getVersionPresets } from '@/schema/features';
 import { compileConfig } from '@/compiler';
 import { createUserPresetFromConfig } from '@/presets/manager';
 import {
@@ -21,6 +22,7 @@ import RoutingDnsPanel from '@/components/RoutingDnsPanel.vue';
 import TproxyPanel from '@/components/TproxyPanel.vue';
 import FirewallPanel from '@/components/FirewallPanel.vue';
 import PreviewToolsPanel from '@/components/PreviewToolsPanel.vue';
+import CoreManagerPanel from '@/components/CoreManagerPanel.vue';
 
 type TabKey = 'general' | 'presets' | 'inbounds' | 'outbounds' | 'routing' | 'tproxy' | 'firewall' | 'tools';
 
@@ -49,7 +51,20 @@ const effectiveCore = computed(() =>
   )
 );
 
-const compiled = computed(() => compileConfig(config.value, effectiveCore.value));
+const versionPresets = computed(() => getVersionPresets(effectiveCore.value));
+
+const resolvedTargetVersion = computed(() => {
+  const configured = config.value.general.target_version;
+  if (configured && configured !== 'auto') return configured;
+  return coreInfo.value?.core_version || undefined;
+});
+
+const compiled = computed(() =>
+  compileConfig(config.value, {
+    core: effectiveCore.value,
+    version: resolvedTargetVersion.value
+  })
+);
 
 function applyTheme(t: 'dark' | 'light') {
   theme.value = t;
@@ -284,6 +299,17 @@ onMounted(async () => {
                     <option value="v2ray">V2Ray (v2fly)</option>
                   </select>
                 </div>
+                <div class="field">
+                  <label>目标版本基线 (target_version)</label>
+                  <select v-model="config.general.target_version">
+                    <option value="auto">
+                      auto（{{ coreInfo?.core_version ? `已探测 v${coreInfo.core_version}` : `默认 v${compiled.version}` }}）
+                    </option>
+                    <option v-for="vp in versionPresets" :key="vp.id" :value="vp.version">
+                      {{ vp.label }} (v{{ vp.version }})
+                    </option>
+                  </select>
+                </div>
                 <div v-if="effectiveCore === 'v2ray'" class="field">
                   <label>V2Ray 配置格式 (v2ray_format)</label>
                   <select v-model="config.general.v2ray_format">
@@ -293,11 +319,15 @@ onMounted(async () => {
                 </div>
                 <div class="field">
                   <label>可执行文件路径 (core_bin)</label>
-                  <input v-model="config.general.core_bin" type="text" placeholder="/usr/bin/xray 或 /usr/bin/v2ray" />
+                  <input v-model="config.general.core_bin" type="text" placeholder="留空自动探测 /usr/bin/aios-xray 等" />
+                </div>
+                <div class="field">
+                  <label>多版本存储目录 (bins_dir，可选)</label>
+                  <input v-model="config.general.bins_dir" type="text" placeholder="外置存储，如 /mnt/sda1/aios/bins" />
                 </div>
                 <div class="field">
                   <label>GeoData 资产目录</label>
-                  <input v-model="config.general.asset_location" type="text" placeholder="/usr/share/xray" />
+                  <input v-model="config.general.asset_location" type="text" placeholder="留空自动探测 /usr/share/aios/geodata 等" />
                 </div>
                 <div class="field">
                   <label>日志级别 (log_level)</label>
@@ -350,6 +380,14 @@ onMounted(async () => {
                 />
               </div>
             </div>
+
+            <CoreManagerPanel
+              :api="api"
+              :config="config"
+              :core-info="coreInfo"
+              @switched="refreshSystem"
+              @notify="notify"
+            />
           </div>
 
           <PresetsPanel

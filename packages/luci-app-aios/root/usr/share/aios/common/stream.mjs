@@ -11,7 +11,7 @@ function parse_seconds_num(val) {
 	return n > 0 ? n : null;
 }
 
-export function build_stream_settings(item, core, is_inbound, default_mark, protocol) {
+export function build_stream_settings(item, core, is_inbound, default_mark, protocol, features) {
 	const is_xray = core === "xray";
 	let net = item.transport || (is_xray ? "raw" : "tcp");
 	if (is_xray && net === "tcp") net = "raw";
@@ -30,7 +30,9 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 		die(`AIOS stream validation error (${item.tag || item[".name"] || "node"}): ${join("; ", errs)}`);
 	}
 
-	let ss = is_xray ? { method: net } : { network: net };
+	const streamKey = is_xray ? ((features && features.streamMethodKey) || "method") : "network";
+	let ss = {};
+	ss[streamKey] = net;
 	ss.security = security;
 
 	if (security === "tls") {

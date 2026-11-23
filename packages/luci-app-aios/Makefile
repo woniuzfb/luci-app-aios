@@ -36,7 +36,7 @@ menu "luci-app-aios Configuration"
 
 config PACKAGE_AIOS_INCLUDE_FW4
 	bool "Depend on firewall4 + kmod-nft-tproxy (OpenWrt 22.03+)"
-	default y
+	default n
 
 config PACKAGE_AIOS_INCLUDE_FW3
 	bool "Depend on iptables + ipset + iptables-mod-tproxy (OpenWrt 19.07/21.02)"
@@ -105,6 +105,8 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DATA) ./root/usr/share/aios/dnsmasq.ut $(1)/usr/share/aios/dnsmasq.ut
 	$(INSTALL_DATA) ./root/usr/share/aios/common/config.mjs $(1)/usr/share/aios/common/config.mjs
 	$(INSTALL_DATA) ./root/usr/share/aios/common/capabilities.mjs $(1)/usr/share/aios/common/capabilities.mjs
+	$(INSTALL_DATA) ./root/usr/share/aios/common/core_features.json $(1)/usr/share/aios/common/core_features.json
+	$(INSTALL_DATA) ./root/usr/share/aios/common/features.mjs $(1)/usr/share/aios/common/features.mjs
 	$(INSTALL_DATA) ./root/usr/share/aios/common/stream.mjs $(1)/usr/share/aios/common/stream.mjs
 	$(INSTALL_DATA) ./root/usr/share/aios/adapter/xray.mjs $(1)/usr/share/aios/adapter/xray.mjs
 	$(INSTALL_DATA) ./root/usr/share/aios/adapter/v2ray.mjs $(1)/usr/share/aios/adapter/v2ray.mjs
@@ -112,6 +114,7 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DATA) ./root/usr/share/aios/firewall/fw4_nft.ut $(1)/usr/share/aios/firewall/fw4_nft.ut
 	$(INSTALL_BIN) ./root/usr/share/aios/firewall/fw3_ipt.sh $(1)/usr/share/aios/firewall/fw3_ipt.sh
 	$(INSTALL_BIN) ./root/usr/share/aios/firewall/gateway.uc $(1)/usr/share/aios/firewall/gateway.uc
+	$(INSTALL_BIN) ./root/usr/share/aios/core_manager.sh $(1)/usr/share/aios/core_manager.sh
 
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/aios
 	$(INSTALL_DATA) ./root/www/luci-static/resources/view/aios/entry.js $(1)/www/luci-static/resources/view/aios/entry.js

@@ -7,6 +7,13 @@ import type {
   StreamFields
 } from '@/schema/types';
 import { resolveEffectiveCore, validateStreamCombination } from '@/schema/capabilities';
+import {
+  CORE_FEATURES_SPEC,
+  resolveCoreFeatures,
+  type ResolvedCoreFeatures,
+  type ResolvedV2RayFeatures,
+  type ResolvedXrayFeatures
+} from '@/schema/features';
 import { compileV2RayV5, parseDurationToNs } from './v2ray_v5';
 
 export interface CompileDiagnostic {
@@ -17,6 +24,8 @@ export interface CompileDiagnostic {
 
 export interface CompileResult {
   core: CoreType;
+  version?: string;
+  features?: ResolvedCoreFeatures;
   json: Record<string, unknown>;
   diagnostics: CompileDiagnostic[];
 }
@@ -126,7 +135,8 @@ function buildStreamSettings(
   isInbound: boolean,
   defaultMark: number | null,
   diagnostics: CompileDiagnostic[],
-  pathPrefix: string
+  pathPrefix: string,
+  xrayFeatures?: ResolvedXrayFeatures
 ): Record<string, unknown> {
   const isXray = core === 'xray';
   let net = item.transport || (isXray ? 'raw' : 'tcp');
@@ -181,7 +191,8 @@ function buildStreamSettings(
     diagnostics.push({ level: issue.level, path: `${pathPrefix}.streamSettings`, message: issue.message });
   }
 
-  const ss: Record<string, unknown> = isXray ? { method: net } : { network: net };
+  const streamKey = isXray ? xrayFeatures?.streamMethodKey || 'method' : 'network';
+  const ss: Record<string, unknown> = { [streamKey]: net };
   ss.security = security;
 
   if (security === 'tls') {
@@ -505,9 +516,12 @@ function buildStreamSettings(
 function compileInbound(
   item: InboundConfig,
   core: CoreType,
-  diagnostics: CompileDiagnostic[]
+  diagnostics: CompileDiagnostic[],
+  xrayFeatures?: ResolvedXrayFeatures,
+  v2rayFeatures?: ResolvedV2RayFeatures
 ): Record<string, unknown> | null {
   const isXray = core === 'xray';
+  const useInboundUsers = isXray && (!xrayFeatures || xrayFeatures.inboundUsersKey === 'users');
   if (!isXray && item.protocol === 'tun') {
     return null; // Handled via v4 services.tun
   }
@@ -518,6 +532,51 @@ function compileInbound(
       message: `V2Ray jsonv4 不支持入站协议 "${item.protocol}"。`
     });
     return null;
+  }
+  if (!isXray && v2rayFeatures) {
+    const vfSpec = CORE_FEATURES_SPEC.v2ray.features;
+    if ((item.protocol === 'hysteria' || item.protocol === 'hysteria2') && !v2rayFeatures.hasHysteria2) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 hysteria2 入站协议（需 >= ${vfSpec.hysteria2.since}）。`
+      });
+      return null;
+    }
+    if (item.packet_encoding === 'Stream' && !v2rayFeatures.hasPacketEncodingStream) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}.packet_encoding`,
+        message: `V2Ray ${v2rayFeatures.version} 不支持 packetEncoding="Stream"（需 >= ${vfSpec.packetEncodingStream.since}）。`
+      });
+    }
+  }
+  if (isXray && xrayFeatures) {
+    const xfSpec = CORE_FEATURES_SPEC.xray.features;
+    if (item.protocol === 'masque' && !xrayFeatures.hasMasque) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}`,
+        message: `Xray ${xrayFeatures.version} 不支持 masque 入站协议（需 >= ${xfSpec.masque.since}）。`
+      });
+      return null;
+    }
+    if ((item.protocol === 'hysteria' || item.protocol === 'hysteria2') && !xrayFeatures.hasHysteria) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}`,
+        message: `Xray ${xrayFeatures.version} 不支持 hysteria 入站协议（需 >= ${xfSpec.hysteria.since}）。`
+      });
+      return null;
+    }
+    if (item.protocol === 'tun' && !xrayFeatures.hasTunInbound) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}`,
+        message: `Xray ${xrayFeatures.version} 不支持 tun 入站协议（需 >= ${xfSpec.tunInbound.since}）。`
+      });
+      return null;
+    }
   }
 
   let proto = item.protocol || 'socks';
@@ -549,7 +608,7 @@ function compileInbound(
           ? [{ user: item.username, pass: item.password || '' }]
           : [];
       if (creds.length > 0) {
-        s[isXray ? 'users' : 'accounts'] = creds;
+        s[useInboundUsers ? 'users' : 'accounts'] = creds;
       }
     }
     obj.settings = s;
@@ -561,7 +620,7 @@ function compileInbound(
         ? [{ user: item.username, pass: item.password || '' }]
         : [];
     if (creds.length > 0) {
-      s[isXray ? 'users' : 'accounts'] = creds;
+      s[useInboundUsers ? 'users' : 'accounts'] = creds;
     }
     if (item.http_allow_transparent) s.allowTransparent = true;
     if (!isXray && item.http_timeout) s.timeout = item.http_timeout;
@@ -594,7 +653,7 @@ function compileInbound(
         )
       : [isXray ? { id: item.uuid || '', flow: item.flow || '' } : { id: item.uuid || '' }];
     const s: Record<string, unknown> = {
-      [isXray ? 'users' : 'clients']: entries,
+      [useInboundUsers ? 'users' : 'clients']: entries,
       decryption: isXray ? item.decryption || 'none' : 'none'
     };
     if (item.fallbacks && item.fallbacks.length > 0) s.fallbacks = item.fallbacks;
@@ -611,12 +670,12 @@ function compileInbound(
             ? { id: item.uuid || '' }
             : { id: item.uuid || '', alterId: item.alter_id || 0 }
         ];
-    obj.settings = { [isXray ? 'users' : 'clients']: entries };
+    obj.settings = { [useInboundUsers ? 'users' : 'clients']: entries };
   } else if (proto === 'trojan') {
     const entries = userList
       ? userList.map((u) => ({ password: u.password || '', email: u.email || undefined, level: u.level ?? 0 }))
       : [{ password: item.password || '' }];
-    const s: Record<string, unknown> = { [isXray ? 'users' : 'clients']: entries };
+    const s: Record<string, unknown> = { [useInboundUsers ? 'users' : 'clients']: entries };
     if (item.fallbacks && item.fallbacks.length > 0) s.fallbacks = item.fallbacks;
     if (!isXray && item.packet_encoding) s.packetEncoding = item.packet_encoding;
     obj.settings = s;
@@ -721,7 +780,7 @@ function compileInbound(
     proto !== 'wireguard' &&
     (item.transport || item.security !== 'none' || (item.sockopt_tproxy && item.sockopt_tproxy !== 'off'))
   ) {
-    obj.streamSettings = buildStreamSettings(item, core, proto, true, null, diagnostics, `inbounds.${item.tag}`);
+    obj.streamSettings = buildStreamSettings(item, core, proto, true, null, diagnostics, `inbounds.${item.tag}`, xrayFeatures);
   }
 
   const custom = parseJsonObjectChecked(item.custom_config, diagnostics, `inbounds.${item.tag}.custom_config`);
@@ -732,9 +791,12 @@ function compileOutbound(
   item: OutboundConfig,
   core: CoreType,
   defaultMark: number | null,
-  diagnostics: CompileDiagnostic[]
+  diagnostics: CompileDiagnostic[],
+  xrayFeatures?: ResolvedXrayFeatures,
+  v2rayFeatures?: ResolvedV2RayFeatures
 ): Record<string, unknown> | null {
   const isXray = core === 'xray';
+  const useFlatOutbounds = !xrayFeatures || xrayFeatures.flatOutbounds;
   if (!isXray && (item.protocol === 'wireguard' || item.protocol === 'masque')) {
     diagnostics.push({
       level: 'error',
@@ -750,6 +812,33 @@ function compileOutbound(
       message: 'V2Ray jsonv4 不支持 shadowsocks2022，请将 V2Ray 格式切换为 jsonv5 或改用 Xray-core。'
     });
     return null;
+  }
+  if (!isXray && v2rayFeatures && (item.protocol === 'hysteria' || item.protocol === 'hysteria2') && !v2rayFeatures.hasHysteria2) {
+    diagnostics.push({
+      level: 'error',
+      path: `outbounds.${item.tag}`,
+      message: `V2Ray ${v2rayFeatures.version} 不支持 hysteria2 出站协议（需 >= ${CORE_FEATURES_SPEC.v2ray.features.hysteria2.since}）。`
+    });
+    return null;
+  }
+  if (isXray && xrayFeatures) {
+    const xfSpec = CORE_FEATURES_SPEC.xray.features;
+    if (item.protocol === 'masque' && !xrayFeatures.hasMasque) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}`,
+        message: `Xray ${xrayFeatures.version} 不支持 masque 出站协议（需 >= ${xfSpec.masque.since}）。`
+      });
+      return null;
+    }
+    if ((item.protocol === 'hysteria' || item.protocol === 'hysteria2') && !xrayFeatures.hasHysteria) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}`,
+        message: `Xray ${xrayFeatures.version} 不支持 hysteria 出站协议（需 >= ${xfSpec.hysteria.since}）。`
+      });
+      return null;
+    }
   }
 
   let proto = item.protocol || 'freedom';
@@ -818,7 +907,7 @@ function compileOutbound(
         message: 'V2Ray 不支持 VLESS flow (xtls-rprx-vision)，已自动忽略。'
       });
     }
-    if (isXray) {
+    if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 443,
@@ -829,6 +918,11 @@ function compileOutbound(
       if (item.user_level !== undefined) s.level = item.user_level;
       if (item.vless_reverse_tag) s.reverse = { tag: item.vless_reverse_tag };
       obj.settings = s;
+    } else if (isXray) {
+      const u: Record<string, unknown> = { id: item.uuid || '', encryption: item.encryption || 'none' };
+      if (item.flow) u.flow = item.flow;
+      if (item.user_level !== undefined) u.level = item.user_level;
+      obj.settings = { vnext: [{ address: item.address || '', port: item.port || 443, users: [u] }] };
     } else {
       obj.settings = {
         vnext: [
@@ -841,7 +935,7 @@ function compileOutbound(
       };
     }
   } else if (proto === 'vmess') {
-    if (isXray) {
+    if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 443,
@@ -851,6 +945,11 @@ function compileOutbound(
       if (item.user_level !== undefined) s.level = item.user_level;
       if (item.vmess_experiments) s.experiments = item.vmess_experiments;
       obj.settings = s;
+    } else if (isXray) {
+      const u: Record<string, unknown> = { id: item.uuid || '', security: item.security_cipher || 'auto' };
+      if (item.user_level !== undefined) u.level = item.user_level;
+      if (item.vmess_experiments) u.experiments = item.vmess_experiments;
+      obj.settings = { vnext: [{ address: item.address || '', port: item.port || 443, users: [u] }] };
     } else {
       obj.settings = {
         vnext: [
@@ -869,7 +968,7 @@ function compileOutbound(
       };
     }
   } else if (proto === 'trojan') {
-    if (isXray) {
+    if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 443,
@@ -879,14 +978,17 @@ function compileOutbound(
       if (item.user_level !== undefined) s.level = item.user_level;
       obj.settings = s;
     } else {
-      obj.settings = {
-        servers: [
-          { address: item.address || '', port: item.port || 443, password: item.password || '' }
-        ]
+      const srv: Record<string, unknown> = {
+        address: item.address || '',
+        port: item.port || 443,
+        password: item.password || ''
       };
+      if (isXray && item.email) srv.email = item.email;
+      if (isXray && item.user_level !== undefined) srv.level = item.user_level;
+      obj.settings = { servers: [srv] };
     }
   } else if (proto === 'shadowsocks') {
-    if (isXray) {
+    if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 8388,
@@ -905,7 +1007,9 @@ function compileOutbound(
         method: item.method || 'aes-256-gcm',
         password: item.password || ''
       };
-      if (item.ss_iv_check) srv.ivCheck = true;
+      if (!isXray && item.ss_iv_check) srv.ivCheck = true;
+      if (isXray && item.ss_uot) srv.uot = true;
+      if (isXray && item.ss_uot_version) srv.UoTVersion = item.ss_uot_version;
       obj.settings = { servers: [srv] };
     }
   } else if (proto === 'hysteria') {
@@ -913,7 +1017,7 @@ function compileOutbound(
   } else if (proto === 'hysteria2') {
     obj.settings = { servers: [{ address: item.address || '', port: item.port || 443 }] };
   } else if (proto === 'socks') {
-    if (isXray) {
+    if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 1080
@@ -929,11 +1033,11 @@ function compileOutbound(
       const srv: Record<string, unknown> = { address: item.address || '', port: item.port || 1080 };
       if (item.username) srv.users = [{ user: item.username, pass: item.password || '' }];
       const s: Record<string, unknown> = { servers: [srv] };
-      if (item.socks_version) s.version = item.socks_version;
+      if (!isXray && item.socks_version) s.version = item.socks_version;
       obj.settings = s;
     }
   } else if (proto === 'http') {
-    if (isXray) {
+    if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 8080
@@ -988,7 +1092,7 @@ function compileOutbound(
 
   const mark = proto === 'dns' ? null : defaultMark;
   if (proto !== 'wireguard') {
-    obj.streamSettings = buildStreamSettings(item, core, proto, false, mark, diagnostics, `outbounds.${item.tag}`);
+    obj.streamSettings = buildStreamSettings(item, core, proto, false, mark, diagnostics, `outbounds.${item.tag}`, xrayFeatures);
   } else {
     const wgSock: Record<string, unknown> = {};
     const m = item.sockopt_mark ?? mark;
@@ -1030,12 +1134,34 @@ function compileOutbound(
   return custom ? deepMerge(obj, custom) : obj;
 }
 
-export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): CompileResult {
-  const core = resolveEffectiveCore(cfg.general.core_type, detectedCore, cfg.general.core_bin);
+export interface CompileOptions {
+  core?: CoreType;
+  version?: string | null;
+}
+
+export function compileConfig(
+  cfg: AiosConfig,
+  detectedCoreOrOpts?: CoreType | CompileOptions
+): CompileResult {
+  const opts: CompileOptions =
+    typeof detectedCoreOrOpts === 'string'
+      ? { core: detectedCoreOrOpts }
+      : detectedCoreOrOpts || {};
+  const core = resolveEffectiveCore(cfg.general.core_type, opts.core, cfg.general.core_bin);
+  const requestedVersion =
+    opts.version ||
+    (cfg.general.target_version && cfg.general.target_version !== 'auto'
+      ? cfg.general.target_version
+      : undefined);
+  const features = resolveCoreFeatures(core, cfg.general.v2ray_format, requestedVersion);
+
   if (core === 'v2ray' && cfg.general.v2ray_format === 'jsonv5') {
-    return compileV2RayV5(cfg);
+    const v5Res = compileV2RayV5(cfg, features.core === 'v2ray' ? features : undefined);
+    return { ...v5Res, version: features.version, features };
   }
   const isXray = core === 'xray';
+  const xrayFeatures = features.core === 'xray' ? features : undefined;
+  const v2rayFeatures = features.core === 'v2ray' ? features : undefined;
   const diagnostics: CompileDiagnostic[] = [];
   const outMark = cfg.transparent_proxy.enabled
     ? parseHexOrInt(cfg.transparent_proxy.outbound_mark)
@@ -1084,9 +1210,12 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
         services: ['HandlerService', 'LoggerService', 'StatsService', 'RoutingService']
       };
     } else {
+      const v2ApiServices = ['HandlerService', 'LoggerService'];
+      if (cfg.general.stats_enabled) v2ApiServices.push('StatsService');
+      if (cfg.observatory.enabled) v2ApiServices.push('ObservatoryService');
       doc.api = {
         tag: 'api',
-        services: ['HandlerService', 'LoggerService', 'StatsService', 'ObservatoryService']
+        services: v2ApiServices
       };
       (doc.inbounds as Record<string, unknown>[]).push({
         tag: 'api-in',
@@ -1105,13 +1234,13 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
 
   for (const ib of cfg.inbounds) {
     if (!ib.enabled) continue;
-    const compiled = compileInbound(ib, core, diagnostics);
+    const compiled = compileInbound(ib, core, diagnostics, xrayFeatures, v2rayFeatures);
     if (compiled) (doc.inbounds as Record<string, unknown>[]).push(compiled);
   }
 
   for (const ob of cfg.outbounds) {
     if (!ob.enabled) continue;
-    const compiled = compileOutbound(ob, core, outMark, diagnostics);
+    const compiled = compileOutbound(ob, core, outMark, diagnostics, xrayFeatures, v2rayFeatures);
     if (compiled) (doc.outbounds as Record<string, unknown>[]).push(compiled);
   }
 
@@ -1303,48 +1432,72 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
 
   // V2Ray jsonv4 services: burstObservatory, tun
   if (!isXray) {
+    const vfSpec = CORE_FEATURES_SPEC.v2ray.features;
     const v4Services: Record<string, unknown> = {};
     if (cfg.burst_observatory?.enabled) {
-      v4Services.burstObservatory = {
-        subjectSelector: cfg.burst_observatory.subject_selector,
-        pingConfig: {
-          destination: cfg.burst_observatory.destination || 'https://www.google.com/generate_204',
-          connectivity: cfg.burst_observatory.connectivity || undefined,
-          interval: parseDurationToNs(cfg.burst_observatory.interval, 60e9),
-          samplingCount: cfg.burst_observatory.sampling || 3,
-          timeout: parseDurationToNs(cfg.burst_observatory.timeout, 5e9)
-        }
-      };
+      if (v2rayFeatures && !v2rayFeatures.hasV4Services) {
+        diagnostics.push({
+          level: 'error',
+          path: 'burst_observatory',
+          message: `V2Ray ${v2rayFeatures.version} jsonv4 不支持 services.burstObservatory（需 >= ${vfSpec.v4Services.since}）。`
+        });
+      } else {
+        v4Services.burstObservatory = {
+          subjectSelector: cfg.burst_observatory.subject_selector,
+          pingConfig: {
+            destination: cfg.burst_observatory.destination || 'https://www.google.com/generate_204',
+            connectivity: cfg.burst_observatory.connectivity || undefined,
+            interval: parseDurationToNs(cfg.burst_observatory.interval, 60e9),
+            samplingCount: cfg.burst_observatory.sampling || 3,
+            timeout: parseDurationToNs(cfg.burst_observatory.timeout, 5e9)
+          }
+        };
+      }
     }
     const tunInbound = cfg.inbounds.find((i) => i.enabled && i.protocol === 'tun');
     if (tunInbound) {
-      const parsedIps = (tunInbound.tun_ips || [])
-        .map(parseCidrToBytes)
-        .filter((x): x is { ip: number[]; prefix: number } => x !== null);
-      const parsedRoutes = (tunInbound.tun_routes || [])
-        .map(parseCidrToBytes)
-        .filter((x): x is { ip: number[]; prefix: number } => x !== null);
-      const tunSvc: Record<string, unknown> = {
-        name: tunInbound.tun_name || 'aios0',
-        mtu: tunInbound.tun_mtu || 1500,
-        tag: tunInbound.tag || 'tun-in',
-        ips: parsedIps.length > 0 ? parsedIps : [{ ip: [10, 0, 0, 1], prefix: 24 }],
-        routes: parsedRoutes.length > 0 ? parsedRoutes : [{ ip: [0, 0, 0, 0], prefix: 0 }],
-        enablePromiscuousMode: tunInbound.tun_promiscuous !== false,
-        enableSpoofing: tunInbound.tun_spoofing !== false
-      };
-      if (tunInbound.packet_encoding) tunSvc.packetEncoding = tunInbound.packet_encoding;
-      if (tunInbound.sniffing_enabled) {
-        tunSvc.sniffingSettings = {
-          enabled: true,
-          destinationOverride:
-            tunInbound.sniffing_dest_override && tunInbound.sniffing_dest_override.length > 0
-              ? tunInbound.sniffing_dest_override
-              : ['http', 'tls'],
-          metadataOnly: !!tunInbound.sniffing_metadata_only
+      if (v2rayFeatures && !v2rayFeatures.hasV4Services) {
+        diagnostics.push({
+          level: 'error',
+          path: `inbounds.${tunInbound.tag}`,
+          message: `V2Ray ${v2rayFeatures.version} jsonv4 不支持 services.tun（需 >= ${vfSpec.v4Services.since}）。`
+        });
+      } else {
+        if (v2rayFeatures && tunInbound.packet_encoding === 'Stream' && !v2rayFeatures.hasPacketEncodingStream) {
+          diagnostics.push({
+            level: 'error',
+            path: `inbounds.${tunInbound.tag}.packet_encoding`,
+            message: `V2Ray ${v2rayFeatures.version} 不支持 packetEncoding="Stream"（需 >= ${vfSpec.packetEncodingStream.since}）。`
+          });
+        }
+        const parsedIps = (tunInbound.tun_ips || [])
+          .map(parseCidrToBytes)
+          .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+        const parsedRoutes = (tunInbound.tun_routes || [])
+          .map(parseCidrToBytes)
+          .filter((x): x is { ip: number[]; prefix: number } => x !== null);
+        const tunSvc: Record<string, unknown> = {
+          name: tunInbound.tun_name || 'aios0',
+          mtu: tunInbound.tun_mtu || 1500,
+          tag: tunInbound.tag || 'tun-in',
+          ips: parsedIps.length > 0 ? parsedIps : [{ ip: [10, 0, 0, 1], prefix: 24 }],
+          routes: parsedRoutes.length > 0 ? parsedRoutes : [{ ip: [0, 0, 0, 0], prefix: 0 }],
+          enablePromiscuousMode: tunInbound.tun_promiscuous !== false,
+          enableSpoofing: tunInbound.tun_spoofing !== false
         };
+        if (tunInbound.packet_encoding) tunSvc.packetEncoding = tunInbound.packet_encoding;
+        if (tunInbound.sniffing_enabled) {
+          tunSvc.sniffingSettings = {
+            enabled: true,
+            destinationOverride:
+              tunInbound.sniffing_dest_override && tunInbound.sniffing_dest_override.length > 0
+                ? tunInbound.sniffing_dest_override
+                : ['http', 'tls'],
+            metadataOnly: !!tunInbound.sniffing_metadata_only
+          };
+        }
+        v4Services.tun = tunSvc;
       }
-      v4Services.tun = tunSvc;
     }
     if (Object.keys(v4Services).length > 0) doc.services = v4Services;
   }
@@ -1396,13 +1549,13 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
     };
   }
 
-  // Reverse (Xray removed legacy top-level reverse in favor of VLESS Reverse Proxy)
+  // Reverse (Xray removed legacy top-level reverse in v26.4.25 in favor of VLESS Reverse Proxy)
   if (cfg.reverse.enabled) {
-    if (isXray) {
+    if (isXray && !xrayFeatures?.hasLegacyReverse) {
       diagnostics.push({
         level: 'warning',
         path: 'reverse',
-        message: 'Xray 26+ 已移除顶层 legacy reverse，请改用 VLESS 入出站 reverse 配置，已跳过生成顶层 reverse。'
+        message: `Xray ${features.version} 已移除顶层 legacy reverse，请改用 VLESS 入出站 reverse 配置，已跳过生成顶层 reverse。`
       });
     } else {
       const mapPair = (arr: string[]) =>
@@ -1417,5 +1570,5 @@ export function compileConfig(cfg: AiosConfig, detectedCore?: CoreType): Compile
     }
   }
 
-  return { core, json: doc, diagnostics };
+  return { core, version: features.version, features, json: doc, diagnostics };
 }

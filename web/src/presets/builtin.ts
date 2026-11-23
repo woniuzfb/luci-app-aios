@@ -4,7 +4,6 @@ import { createDefaultConfig } from '@/schema/defaults';
 function buildXrayDualStackTproxyPreset(): AiosPreset {
   const cfg = createDefaultConfig();
   cfg.general.core_type = 'xray';
-  cfg.general.core_bin = '/usr/bin/xray';
   cfg.inbounds.push(
     {
       id: 'tproxy_tcp4',
@@ -110,7 +109,7 @@ function buildClassicSplitPreset(): AiosPreset {
   return {
     id: 'builtin-classic-cn-split',
     name: '经典国内直连 / 国外代理（Xray & V2Ray 通用）',
-    description: '同时兼容 Xray-core 与 V2Ray jsonv4，兼顾 OpenWrt fw4 与旧版 fw3 iptables。',
+    description: '同时兼容 Xray-core（全版本）与 V2Ray jsonv4/jsonv5，兼顾 OpenWrt fw4 与旧版 fw3 iptables。',
     builtin: true,
     recommendedCore: 'auto',
     createdAt: '2026-01-01T00:00:00.000Z',
@@ -125,7 +124,7 @@ function buildTunPreset(): AiosPreset {
   cfg.inbounds.push({
     id: 'tun_in',
     enabled: true,
-    alias: 'Xray TUN Interface',
+    alias: 'TUN Interface',
     tag: 'tun-in',
     listen: '0.0.0.0',
     port: 0,
@@ -142,11 +141,11 @@ function buildTunPreset(): AiosPreset {
   return {
     id: 'builtin-xray-tun',
     name: '极简 TUN 模式（免防火墙规则）',
-    description: '利用 Xray 原生 TUN 入站接管流量，无需配置 nftables/iptables，适合与复杂防火墙共存。',
+    description: '利用原生 TUN 接管流量（需 Xray >= 26.1.13，或 V2Ray >= 5.17 jsonv4 / >= 5.9 jsonv5），无需配置 nftables/iptables。',
     builtin: true,
     recommendedCore: 'xray',
     createdAt: '2026-01-01T00:00:00.000Z',
-    tags: ['xray', 'tun', 'zero-firewall'],
+    tags: ['xray', 'v2ray', 'tun', 'zero-firewall'],
     config: cfg
   };
 }

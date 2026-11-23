@@ -2,18 +2,23 @@ name: Build & Verify luci-app-aios
 
 on:
   push:
-    branches: [main, master]
+    tags:
+      - 'v*'
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   web-and-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -29,33 +34,31 @@ jobs:
           sh -n packages/luci-app-aios/root/etc/init.d/aios
           sh -n packages/luci-app-aios/root/usr/libexec/rpcd/luci.aios
           sh -n packages/luci-app-aios/root/usr/share/aios/firewall/fw3_ipt.sh
+          sh -n packages/luci-app-aios/root/usr/share/aios/core_manager.sh
           sh -n packages/luci-app-aios/root/etc/hotplug.d/iface/90-aios-gateway
           sh -n packages/luci-app-aios/root/etc/uci-defaults/90-luci-aios
       - name: Upload compiled web assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aios-www
           path: packages/luci-app-aios/root/www/aios
 
   openwrt-sdk-package:
     needs: web-and-tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: openwrt-23.05.5-x86_64
-            sdk_url: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64/openwrt-sdk-23.05.5-x86-64_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-            ext: txz
-          - name: openwrt-24.10.0-x86_64
-            sdk_url: https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst
-            ext: tzst
-          - name: openwrt-21.02.7-legacy-fw3
-            sdk_url: https://downloads.openwrt.org/releases/21.02.7/targets/x86/64/openwrt-sdk-21.02.7-x86-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
-            ext: txz
+          - name: openwrt-23.05.5
+            sdk_url_path: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64
+            sdk_name: -sdk-23.05.5-x86-64_
+          - name: openwrt-25.12.4
+            sdk_url_path: https://downloads.openwrt.org/releases/25.12.4/targets/x86/64
+            sdk_name: -sdk-25.12.4-x86-64_
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: aios-www
           path: packages/luci-app-aios/root/www/aios
@@ -65,13 +68,13 @@ jobs:
           sudo apt-get install -y build-essential libncurses5-dev gawk git libssl-dev gettext zlib1g-dev swig unzip time rsync zstd xz-utils
       - name: Download & Extract OpenWrt SDK
         run: |
-          mkdir -p /tmp/sdk
-          curl -fsSL "${{ matrix.sdk_url }}" -o /tmp/sdk/sdk.archive
-          if [ "${{ matrix.ext }}" = "tzst" ]; then
-            tar --zstd -xf /tmp/sdk/sdk.archive -C /tmp/sdk --strip-components=1
-          else
-            tar -xJf /tmp/sdk/sdk.archive -C /tmp/sdk --strip-components=1
-          fi
+          mkdir -p /tmp/sdk /tmp/sdk-dl
+          cd /tmp/sdk-dl
+          wget -q -O - "${{ matrix.sdk_url_path }}/sha256sums" | grep -- "${{ matrix.sdk_name }}" > sha256sums.small
+          SDK_FILE="$(awk '{print $2}' sha256sums.small | sed 's/^\*//')"
+          wget -q -O "$SDK_FILE" "${{ matrix.sdk_url_path }}/${SDK_FILE}"
+          sha256sum -c sha256sums.small
+          tar -xf "$SDK_FILE" -C /tmp/sdk --strip-components=1
       - name: Compile luci-app-aios packages
         working-directory: /tmp/sdk
         run: |
@@ -86,7 +89,32 @@ jobs:
           find bin/packages -type f \( -name 'luci-app-aios*.ipk' -o -name 'luci-app-aios*.apk' \) -exec cp {} "${GITHUB_WORKSPACE}/dist-packages/${{ matrix.name }}/" \;
           ls -lh "${GITHUB_WORKSPACE}/dist-packages/${{ matrix.name }}"
       - name: Upload built OpenWrt packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.name }}
           path: dist-packages/${{ matrix.name }}
+
+  release:
+    name: Publish GitHub Release
+    needs: [openwrt-sdk-package]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Package Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: packages-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256 Checksums
+        run: |
+          cd release-assets
+          sha256sum *.ipk *.apk 2>/dev/null | sort -k2 > sha256sums.txt || sha256sum * | grep -v 'sha256sums.txt' | sort -k2 > sha256sums.txt
+          ls -lh
+          cat sha256sums.txt
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

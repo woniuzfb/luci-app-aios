@@ -374,6 +374,8 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
   setIfNonEmpty(gVals, 'enabled', g.enabled);
   setIfNonEmpty(gVals, 'core_type', g.core_type);
   setIfNonEmpty(gVals, 'core_bin', g.core_bin);
+  setIfNonEmpty(gVals, 'bins_dir', g.bins_dir);
+  setIfNonEmpty(gVals, 'target_version', g.target_version || 'auto');
   setIfNonEmpty(gVals, 'v2ray_format', g.v2ray_format);
   setIfNonEmpty(gVals, 'asset_location', g.asset_location);
   setIfNonEmpty(gVals, 'geoloader', g.geoloader);
@@ -769,6 +771,8 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
         enabled: asBool(s.enabled, def.general.enabled),
         core_type: asStr(s.core_type, def.general.core_type) as AiosConfig['general']['core_type'],
         core_bin: asStr(s.core_bin, def.general.core_bin),
+        bins_dir: asStr(s.bins_dir, ''),
+        target_version: asStr(s.target_version, 'auto'),
         v2ray_format: asStr(s.v2ray_format, def.general.v2ray_format) as 'jsonv4' | 'jsonv5',
         asset_location: asStr(s.asset_location, def.general.asset_location),
         geoloader: asStr(s.geoloader, def.general.geoloader) as 'memconservative' | 'standard',

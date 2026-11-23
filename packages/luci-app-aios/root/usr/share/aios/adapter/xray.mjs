@@ -1,10 +1,24 @@
 "use strict";
 
 import { deep_merge, kv_to_map, parse_json_safe, to_array } from "../common/config.mjs";
+import { resolve_core_features } from "../common/features.mjs";
 import { build_stream_settings } from "../common/stream.mjs";
 
-function build_inbound(item) {
+function build_inbound(item, features) {
 	const proto = item.protocol === "dokodemo-door" && item.use_tunnel === "1" ? "tunnel" : (item.protocol || "socks");
+	const use_users = !features || features.inboundUsersKey === "users";
+	if (features) {
+		const th = features.thresholds || {};
+		if (proto === "masque" && !features.hasMasque) {
+			die(`Xray ${features.version} 不支持 masque 入站协议（需 >= ${th.masque?.since || "26.9.30"}）。`);
+		}
+		if (proto === "hysteria" && !features.hasHysteria) {
+			die(`Xray ${features.version} 不支持 hysteria 入站协议（需 >= ${th.hysteria?.since || "26.1.13"}）。`);
+		}
+		if (proto === "tun" && !features.hasTunInbound) {
+			die(`Xray ${features.version} 不支持 tun 入站协议（需 >= ${th.tunInbound?.since || "26.1.13"}）。`);
+		}
+	}
 	let obj = {
 		tag: item.tag || item[".name"],
 		listen: item.listen || "0.0.0.0",
@@ -21,12 +35,14 @@ function build_inbound(item) {
 		obj.settings = { auth: item.socks_auth || "noauth", udp: item.socks_udp === "1" };
 		if (item.socks_ip) obj.settings.ip = item.socks_ip;
 		if (item.socks_auth === "password") {
-			if (has_users) obj.settings.users = map(users, u => ({ user: u.username || "", pass: u.password || "" }));
-			else if (item.username) obj.settings.users = [{ user: item.username, pass: item.password || "" }];
+			const accKey = use_users ? "users" : "accounts";
+			if (has_users) obj.settings[accKey] = map(users, u => ({ user: u.username || "", pass: u.password || "" }));
+			else if (item.username) obj.settings[accKey] = [{ user: item.username, pass: item.password || "" }];
 		}
 	} else if (proto === "http") {
-		if (has_users) obj.settings.users = map(users, u => ({ user: u.username || "", pass: u.password || "" }));
-		else if (item.username) obj.settings.users = [{ user: item.username, pass: item.password || "" }];
+		const accKey = use_users ? "users" : "accounts";
+		if (has_users) obj.settings[accKey] = map(users, u => ({ user: u.username || "", pass: u.password || "" }));
+		else if (item.username) obj.settings[accKey] = [{ user: item.username, pass: item.password || "" }];
 		if (item.http_allow_transparent === "1") obj.settings.allowTransparent = true;
 	} else if (proto === "dokodemo-door") {
 		obj.settings = { network: item.dokodemo_network || "tcp,udp", followRedirect: item.dokodemo_follow_redirect === "1" };
@@ -40,37 +56,36 @@ function build_inbound(item) {
 		if (pm) obj.settings.portMap = pm;
 		if (item.tunnel_user_level != null && item.tunnel_user_level !== "") obj.settings.userLevel = int(item.tunnel_user_level);
 	} else if (proto === "vless") {
-		obj.settings = {
-			users: has_users
-				? map(users, u => {
-					let x = { id: u.id || "", flow: u.flow || "", level: int(u.level || 0) };
-					if (u.email) x.email = u.email;
-					return x;
-				})
-				: [{ id: item.uuid || "", flow: item.flow || "" }],
-			decryption: item.decryption || "none"
-		};
+		const uKey = use_users ? "users" : "clients";
+		obj.settings = { decryption: item.decryption || "none" };
+		obj.settings[uKey] = has_users
+			? map(users, u => {
+				let x = { id: u.id || "", flow: u.flow || "", level: int(u.level || 0) };
+				if (u.email) x.email = u.email;
+				return x;
+			})
+			: [{ id: item.uuid || "", flow: item.flow || "" }];
 		if (type(fallbacks) === "array" && length(fallbacks) > 0) obj.settings.fallbacks = fallbacks;
 	} else if (proto === "vmess") {
-		obj.settings = {
-			users: has_users
-				? map(users, u => {
-					let x = { id: u.id || "", level: int(u.level || 0) };
-					if (u.email) x.email = u.email;
-					return x;
-				})
-				: [{ id: item.uuid || "" }]
-		};
+		const uKey = use_users ? "users" : "clients";
+		obj.settings = {};
+		obj.settings[uKey] = has_users
+			? map(users, u => {
+				let x = { id: u.id || "", level: int(u.level || 0) };
+				if (u.email) x.email = u.email;
+				return x;
+			})
+			: [{ id: item.uuid || "" }];
 	} else if (proto === "trojan") {
-		obj.settings = {
-			users: has_users
-				? map(users, u => {
-					let x = { password: u.password || "", level: int(u.level || 0) };
-					if (u.email) x.email = u.email;
-					return x;
-				})
-				: [{ password: item.password || "" }]
-		};
+		const uKey = use_users ? "users" : "clients";
+		obj.settings = {};
+		obj.settings[uKey] = has_users
+			? map(users, u => {
+				let x = { password: u.password || "", level: int(u.level || 0) };
+				if (u.email) x.email = u.email;
+				return x;
+			})
+			: [{ password: item.password || "" }];
 		if (type(fallbacks) === "array" && length(fallbacks) > 0) obj.settings.fallbacks = fallbacks;
 	} else if (proto === "shadowsocks") {
 		obj.settings = { method: item.method || "aes-256-gcm", password: item.password || "", network: item.ss_network || "tcp,udp" };
@@ -145,15 +160,25 @@ function build_inbound(item) {
 	}
 
 	if (proto !== "tun" && proto !== "wireguard" && (item.transport || item.security || item.sockopt_tproxy)) {
-		obj.streamSettings = build_stream_settings(item, "xray", true, null, proto);
+		obj.streamSettings = build_stream_settings(item, "xray", true, null, proto, features);
 	}
 
 	const custom = parse_json_safe(item.custom_config);
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
-function build_outbound(item, default_mark) {
+function build_outbound(item, default_mark, features) {
 	const proto = item.protocol === "hysteria2" ? "hysteria" : (item.protocol || "freedom");
+	const use_flat = !features || features.flatOutbounds;
+	if (features) {
+		const th = features.thresholds || {};
+		if (proto === "masque" && !features.hasMasque) {
+			die(`Xray ${features.version} 不支持 masque 出站协议（需 >= ${th.masque?.since || "26.9.30"}）。`);
+		}
+		if (proto === "hysteria" && !features.hasHysteria) {
+			die(`Xray ${features.version} 不支持 hysteria 出站协议（需 >= ${th.hysteria?.since || "26.1.13"}）。`);
+		}
+	}
 	let obj = { tag: item.tag || item[".name"], protocol: proto, settings: {} };
 	if (item.send_through) obj.sendThrough = item.send_through;
 	if (item.target_strategy) obj.targetStrategy = item.target_strategy;
@@ -189,59 +214,99 @@ function build_outbound(item, default_mark) {
 			obj.settings.sniffing = sn;
 		}
 	} else if (proto === "vless") {
-		obj.settings = {
-			address: item.address || "",
-			port: int(item.port || 443),
-			id: item.uuid || "",
-			encryption: item.encryption || "none"
-		};
-		if (item.flow) obj.settings.flow = item.flow;
-		if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
-		if (item.vless_reverse_tag) obj.settings.reverse = { tag: item.vless_reverse_tag };
+		if (use_flat) {
+			obj.settings = {
+				address: item.address || "",
+				port: int(item.port || 443),
+				id: item.uuid || "",
+				encryption: item.encryption || "none"
+			};
+			if (item.flow) obj.settings.flow = item.flow;
+			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+			if (item.vless_reverse_tag) obj.settings.reverse = { tag: item.vless_reverse_tag };
+		} else {
+			let u = { id: item.uuid || "", encryption: item.encryption || "none" };
+			if (item.flow) u.flow = item.flow;
+			if (item.user_level != null && item.user_level !== "") u.level = int(item.user_level);
+			obj.settings = { vnext: [{ address: item.address || "", port: int(item.port || 443), users: [u] }] };
+		}
 	} else if (proto === "vmess") {
-		obj.settings = {
-			address: item.address || "",
-			port: int(item.port || 443),
-			id: item.uuid || "",
-			security: item.security_cipher || "auto"
-		};
-		if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
-		if (item.vmess_experiments) obj.settings.experiments = item.vmess_experiments;
+		if (use_flat) {
+			obj.settings = {
+				address: item.address || "",
+				port: int(item.port || 443),
+				id: item.uuid || "",
+				security: item.security_cipher || "auto"
+			};
+			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+			if (item.vmess_experiments) obj.settings.experiments = item.vmess_experiments;
+		} else {
+			let u = { id: item.uuid || "", security: item.security_cipher || "auto" };
+			if (item.user_level != null && item.user_level !== "") u.level = int(item.user_level);
+			if (item.vmess_experiments) u.experiments = item.vmess_experiments;
+			obj.settings = { vnext: [{ address: item.address || "", port: int(item.port || 443), users: [u] }] };
+		}
 	} else if (proto === "trojan") {
-		obj.settings = { address: item.address || "", port: int(item.port || 443), password: item.password || "" };
-		if (item.email) obj.settings.email = item.email;
-		if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+		if (use_flat) {
+			obj.settings = { address: item.address || "", port: int(item.port || 443), password: item.password || "" };
+			if (item.email) obj.settings.email = item.email;
+			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+		} else {
+			let srv = { address: item.address || "", port: int(item.port || 443), password: item.password || "" };
+			if (item.email) srv.email = item.email;
+			if (item.user_level != null && item.user_level !== "") srv.level = int(item.user_level);
+			obj.settings = { servers: [srv] };
+		}
 	} else if (proto === "shadowsocks") {
-		obj.settings = {
-			address: item.address || "",
-			port: int(item.port || 8388),
-			method: item.method || "aes-256-gcm",
-			password: item.password || ""
-		};
-		if (item.email) obj.settings.email = item.email;
-		if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
-		if (item.ss_uot === "1") obj.settings.uot = true;
-		if (item.ss_uot_version) obj.settings.UoTVersion = int(item.ss_uot_version);
+		if (use_flat) {
+			obj.settings = {
+				address: item.address || "",
+				port: int(item.port || 8388),
+				method: item.method || "aes-256-gcm",
+				password: item.password || ""
+			};
+			if (item.email) obj.settings.email = item.email;
+			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+			if (item.ss_uot === "1") obj.settings.uot = true;
+			if (item.ss_uot_version) obj.settings.UoTVersion = int(item.ss_uot_version);
+		} else {
+			let srv = { address: item.address || "", port: int(item.port || 8388), method: item.method || "aes-256-gcm", password: item.password || "" };
+			if (item.ss_uot === "1") srv.uot = true;
+			if (item.ss_uot_version) srv.UoTVersion = int(item.ss_uot_version);
+			obj.settings = { servers: [srv] };
+		}
 	} else if (proto === "hysteria") {
 		obj.settings = { version: 2, address: item.address || "", port: int(item.port || 443) };
 	} else if (proto === "socks") {
-		obj.settings = { address: item.address || "", port: int(item.port || 1080) };
-		if (item.username) {
-			obj.settings.user = item.username;
-			obj.settings.pass = item.password || "";
-			if (item.email) obj.settings.email = item.email;
-			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+		if (use_flat) {
+			obj.settings = { address: item.address || "", port: int(item.port || 1080) };
+			if (item.username) {
+				obj.settings.user = item.username;
+				obj.settings.pass = item.password || "";
+				if (item.email) obj.settings.email = item.email;
+				if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+			}
+		} else {
+			let srv = { address: item.address || "", port: int(item.port || 1080) };
+			if (item.username) srv.users = [{ user: item.username, pass: item.password || "" }];
+			obj.settings = { servers: [srv] };
 		}
 	} else if (proto === "http") {
-		obj.settings = { address: item.address || "", port: int(item.port || 8080) };
-		if (item.username) {
-			obj.settings.user = item.username;
-			obj.settings.pass = item.password || "";
-			if (item.email) obj.settings.email = item.email;
-			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+		if (use_flat) {
+			obj.settings = { address: item.address || "", port: int(item.port || 8080) };
+			if (item.username) {
+				obj.settings.user = item.username;
+				obj.settings.pass = item.password || "";
+				if (item.email) obj.settings.email = item.email;
+				if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
+			}
+			const hh = kv_to_map(parse_json_safe(item.http_headers_json));
+			if (hh) obj.settings.headers = hh;
+		} else {
+			let srv = { address: item.address || "", port: int(item.port || 8080) };
+			if (item.username) srv.users = [{ user: item.username, pass: item.password || "" }];
+			obj.settings = { servers: [srv] };
 		}
-		const hh = kv_to_map(parse_json_safe(item.http_headers_json));
-		if (hh) obj.settings.headers = hh;
 	} else if (proto === "wireguard") {
 		const peers = parse_json_safe(item.wg_peers_json);
 		obj.settings = {
@@ -263,7 +328,7 @@ function build_outbound(item, default_mark) {
 
 	const mark = proto === "dns" ? null : default_mark;
 	if (proto !== "wireguard") {
-		obj.streamSettings = build_stream_settings(item, "xray", false, mark, proto);
+		obj.streamSettings = build_stream_settings(item, "xray", false, mark, proto, features);
 	} else {
 		let wgSock = {};
 		const m = item.sockopt_mark ? int(item.sockopt_mark) : mark;
@@ -286,10 +351,12 @@ function build_outbound(item, default_mark) {
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
-export function compile_xray(cfg) {
+export function compile_xray(cfg, opts) {
 	const g = cfg.general || {};
 	const tp = cfg.transparent_proxy || {};
 	const out_mark = tp.enabled === "1" ? int(tp.outbound_mark || "0x3a03") : null;
+	const target_ver = (opts && opts.version) || (g.target_version && g.target_version !== "auto" ? g.target_version : null);
+	const features = resolve_core_features("xray", "json", target_ver);
 
 	let doc = {
 		log: { loglevel: g.log_level || "warning", access: g.access_log || "none", error: g.error_log || "", dnsLog: g.dns_log === "1" },
@@ -317,11 +384,11 @@ export function compile_xray(cfg) {
 
 	for (let ib in cfg.inbounds) {
 		if (ib.enabled === "0") continue;
-		push(doc.inbounds, build_inbound(ib));
+		push(doc.inbounds, build_inbound(ib, features));
 	}
 	for (let ob in cfg.outbounds) {
 		if (ob.enabled === "0") continue;
-		push(doc.outbounds, build_outbound(ob, out_mark));
+		push(doc.outbounds, build_outbound(ob, out_mark, features));
 	}
 
 	// DNS
@@ -497,8 +564,20 @@ export function compile_xray(cfg) {
 		};
 	}
 
-	// Xray removed legacy top-level reverse in favor of VLESS Reverse Proxy.
-	// Skip emitting top-level doc.reverse to avoid Xray startup failure.
+	const rev = cfg.reverse || {};
+	if (rev.enabled === "1" && features.hasLegacyReverse) {
+		let bridges = [];
+		for (let b in to_array(rev.bridges)) {
+			const parts = split(b, "|");
+			if (length(parts) === 2) push(bridges, { tag: trim(parts[0]), domain: trim(parts[1]) });
+		}
+		let portals = [];
+		for (let pt in to_array(rev.portals)) {
+			const parts = split(pt, "|");
+			if (length(parts) === 2) push(portals, { tag: trim(parts[0]), domain: trim(parts[1]) });
+		}
+		doc.reverse = { bridges: bridges, portals: portals };
+	}
 
 	return doc;
 }

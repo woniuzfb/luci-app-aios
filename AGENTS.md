@@ -18,7 +18,7 @@
 - **构建与验证入口**：
   - 前端测试、类型检查与构建：`cd web && pnpm test && pnpm build`
   - Shell 脚本语法校验：`sh -n packages/luci-app-aios/root/etc/init.d/aios packages/luci-app-aios/root/usr/libexec/rpcd/luci.aios packages/luci-app-aios/root/usr/share/aios/firewall/fw3_ipt.sh`
-  - OpenWrt SDK 打包验证：`./scripts/verify-sdk.sh [x86-64-23.05.5|x86-64-24.10.0|x86-64-21.02.7]` 及 GitHub Actions `.github/workflows/build.yml`
+  - OpenWrt SDK 打包验证：`./scripts/verify-sdk.sh [x86-64-23.05.5|x86-64-25.12.4]` 及 GitHub Actions `.github/workflows/build.yml`
 
 ---
 

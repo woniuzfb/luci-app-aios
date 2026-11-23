@@ -254,7 +254,17 @@ start_service() {
 
 	local core_bin core_type v2ray_format asset_location geoloader go_memlimit
 	local rlimit_nofile rlimit_data custom_file conflict_policy route_table tproxy_mark
-	core_bin="$(uci_get main.core_bin /usr/bin/xray)"
+	core_bin="$(uci_get main.core_bin '')"
+	if [ -z "$core_bin" ]; then
+		local cand
+		for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
+			if [ -x "$cand" ]; then
+				core_bin="$cand"
+				break
+			fi
+		done
+		core_bin="${core_bin:-/usr/bin/aios-xray}"
+	fi
 	if [ ! -x "$core_bin" ]; then
 		_log err "Core binary not executable: ${core_bin}"
 		return 1
@@ -262,7 +272,17 @@ start_service() {
 
 	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$core_bin")"
 	v2ray_format="$(uci_get main.v2ray_format jsonv4)"
-	asset_location="$(uci_get main.asset_location /usr/share/xray)"
+	asset_location="$(uci_get main.asset_location '')"
+	if [ -z "$asset_location" ]; then
+		local acand
+		for acand in /usr/share/aios/geodata /usr/share/xray /usr/share/v2ray; do
+			if [ -d "$acand" ]; then
+				asset_location="$acand"
+				break
+			fi
+		done
+		asset_location="${asset_location:-/usr/share/aios/geodata}"
+	fi
 	geoloader="$(uci_get main.geoloader memconservative)"
 	go_memlimit="$(uci_get main.go_memlimit '')"
 	rlimit_nofile="$(uci_get main.rlimit_nofile 102400)"
