@@ -28,7 +28,8 @@
 				"/var/etc/aios/*": [ "read", "list" ],
 				"/usr/share/xray/*": [ "read", "list" ],
 				"/usr/share/v2ray/*": [ "read", "list" ],
-				"/usr/share/aios/*": [ "read", "list" ]
+				"/usr/share/aios/*": [ "read", "list" ],
+				"/usr/share/aios/geodata/*": [ "read", "list" ]
 			}
 		},
 		"write": {

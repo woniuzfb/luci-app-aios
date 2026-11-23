@@ -9,10 +9,8 @@
 - **双核统一架构（Xray-core & V2Ray）**：
   - 同一套 UCI 配置 `/etc/config/aios` 与 TypeScript/ucode 能力矩阵驱动 **Xray-core**（对齐 `Xray-docs-next`）与 **V2Ray / v2fly**（对齐 `v2fly-github-io`，同时支持 `jsonv4` 与 `jsonv5`）。
   - 保留全手动自由拼装任意 `inbounds` / `outbounds` / `dns` / `fakedns` / `routing` / `balancers` / `observatory` / `policy` / `reverse` 的模式，同时提供推荐设置快捷键与「将当前设置保存为预设」功能。
-- **OpenWrt 三包结构（`packages/`）**：
-  - `packages/luci-app-aios`：主包（`PKGARCH:=all`），含 `init.d/aios`、`rpcd/luci.aios`、双防火墙后端（fw4 独立表 `table inet aios` + fw3 独立 `AIOS_*` 链/ipset）、`ucode` 双核编译器（`gen_config.uc` + `adapter/{xray,v2ray,v2ray_v5}.mjs`）、Dnsmasq 多实例模板、LuCI 轻量入口壳（`entry.js`）及 Vite 独立后台产物（`/www/aios/`）。
-  - `packages/luci-app-aios-geodata`：可选 GeoData 菜单与 ACL 子包。
-  - `packages/luci-app-aios-status`：可选状态监控菜单与 ACL 子包。
+- **OpenWrt 单包结构（`packages/`）**：
+  - `packages/luci-app-aios`：统一单包（`PKGARCH:=all`），含 `init.d/aios`、`rpcd/luci.aios`、双防火墙后端（fw4 独立表 `table inet aios` + fw3 独立 `AIOS_*` 链/ipset）、`ucode` 双核编译器（`gen_config.uc` + `adapter/{xray,v2ray,v2ray_v5}.mjs`）、Dnsmasq 多实例模板、完整 ACL 权限、LuCI 轻量入口壳（`entry.js`）及 Vite 独立后台产物（`/www/aios/`）。
 - **独立后台前端（`web/`）**：
   - 基于 **Vite + TypeScript + Vue 3**，产物输出到 `packages/luci-app-aios/root/www/aios/`，由路由器 `uhttpd` 直接托管（零常驻进程），通过 `/ubus` + `rpcd/luci.aios` 与 `/etc/config/aios` 全量双向同步。
 - **构建与验证入口**：
@@ -36,7 +34,7 @@
   sh -n packages/luci-app-aios/root/usr/libexec/rpcd/luci.aios
   sh -n packages/luci-app-aios/root/usr/share/aios/firewall/fw3_ipt.sh
   ```
-- **打包同步约束**：在 `packages/luci-app-aios/root/` 下新增或移动任何安装文件时，必须同步更新 `packages/luci-app-aios/Makefile` 的 `install` 段，并同步维护三个子包的 `PKG_VERSION`；新增 RPCD 方法时必须同步更新 `packages/luci-app-aios/root/usr/share/rpcd/acl.d/luci-app-aios.json`。
+- **打包同步约束**：在 `packages/luci-app-aios/root/` 下新增或移动任何安装文件时，必须同步更新 `packages/luci-app-aios/Makefile` 的 `install` 段与 `PKG_VERSION`；新增 RPCD 方法时必须同步更新 `packages/luci-app-aios/root/usr/share/rpcd/acl.d/luci-app-aios.json`。
 
 ---
 

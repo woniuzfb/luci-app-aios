@@ -20,8 +20,6 @@ docker run --rm \
     ./scripts/feeds install -a
     make defconfig
     make package/luci-app-aios-bundle/luci-app-aios/{clean,compile} V=s
-    make package/luci-app-aios-bundle/luci-app-aios-geodata/{clean,compile} V=s
-    make package/luci-app-aios-bundle/luci-app-aios-status/{clean,compile} V=s
     mkdir -p /out
     find bin/packages -type f \( -name "luci-app-aios*.ipk" -o -name "luci-app-aios*.apk" \) -exec cp {} /out/ \;
     ls -lh /out

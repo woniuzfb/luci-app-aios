@@ -1,6 +1,6 @@
 # luci-app-aios
 
-面向 OpenWrt 的 **Xray-core & V2Ray (v2fly)** 双核统一代理控制台与三包架构实现。
+面向 OpenWrt 的 **Xray-core & V2Ray (v2fly)** 双核统一代理控制台。
 
 ## 核心特性
 
@@ -24,6 +24,4 @@ pnpm dev     # 启动本地预览（可设置 AIOS_ROUTER_URL=http://<router-ip>
 
 ## 包结构
 
-- `packages/luci-app-aios`：主包（`PKGARCH:=all`），含 `init.d/aios`、`rpcd/luci.aios`、双防火墙后端、`ucode` 编译器、LuCI 入口壳与 Vite 独立后台产物。
-- `packages/luci-app-aios-geodata`：可选 GeoData 菜单与 ACL 权限包。
-- `packages/luci-app-aios-status`：可选状态监控菜单与 ACL 权限包。
+- `packages/luci-app-aios`：单包交付（`PKGARCH:=all`），内置 `init.d/aios`、`rpcd/luci.aios`、双防火墙后端、`ucode` 编译器、完整 ACL 权限、LuCI 入口壳与 Vite 独立后台产物。

@@ -53,18 +53,14 @@ if [ -n "$(git status --porcelain)" ]; then
 	die "Working tree is not clean. Commit or stash changes before running release.sh"
 fi
 
-echo "==> 1. Syncing PKG_VERSION=${PKG_VER} across all three OpenWrt packages..."
-for mk in \
-	packages/luci-app-aios/Makefile \
-	packages/luci-app-aios-geodata/Makefile \
-	packages/luci-app-aios-status/Makefile; do
-	[ -f "$mk" ] || die "Makefile not found: $mk"
-	awk -v v="$PKG_VER" '
-		index($0, "PKG_VERSION:=") == 1 { print "PKG_VERSION:=" v; next }
-		{ print }
-	' "$mk" > "${mk}.tmp"
-	mv -f "${mk}.tmp" "$mk"
-done
+echo "==> 1. Syncing PKG_VERSION=${PKG_VER} in packages/luci-app-aios/Makefile..."
+mk="packages/luci-app-aios/Makefile"
+[ -f "$mk" ] || die "Makefile not found: $mk"
+awk -v v="$PKG_VER" '
+	index($0, "PKG_VERSION:=") == 1 { print "PKG_VERSION:=" v; next }
+	{ print }
+' "$mk" > "${mk}.tmp"
+mv -f "${mk}.tmp" "$mk"
 
 echo "==> 2. Running frontend tests, typecheck, and Vite production build..."
 (cd "${REPO_ROOT}/web" && pnpm test && pnpm build)
@@ -86,10 +82,7 @@ if [ "$SKIP_MATRIX" -eq 0 ] && [ -f "${REPO_ROOT}/.memory/cores/manifest.json" ]
 fi
 
 if ! git diff --quiet packages/; then
-	git add \
-		packages/luci-app-aios/Makefile \
-		packages/luci-app-aios-geodata/Makefile \
-		packages/luci-app-aios-status/Makefile
+	git add packages/luci-app-aios/Makefile
 	git commit -m "chore(release): bump package version to ${TAG}"
 fi
 
