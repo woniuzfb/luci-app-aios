@@ -522,7 +522,7 @@ textarea {
 
 .table th.col-actions,
 .table td.col-actions {
-  text-align: right;
+  text-align: center;
   white-space: nowrap;
   width: 1%;
 }
@@ -530,7 +530,7 @@ textarea {
 .table-actions {
   display: inline-flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   gap: 8px;
 }
 

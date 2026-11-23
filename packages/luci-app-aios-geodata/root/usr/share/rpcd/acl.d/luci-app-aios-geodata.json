@@ -3,9 +3,10 @@
 		"description": "Grant read access to GeoIP and GeoSite assets",
 		"read": {
 			"file": {
+				"/usr/share/aios/geodata/*.dat": [ "read" ],
+				"/usr/share/aios/*.dat": [ "read" ],
 				"/usr/share/xray/*.dat": [ "read" ],
-				"/usr/share/v2ray/*.dat": [ "read" ],
-				"/usr/share/aios/*.dat": [ "read" ]
+				"/usr/share/v2ray/*.dat": [ "read" ]
 			}
 		}
 	}

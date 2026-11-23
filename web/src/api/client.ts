@@ -272,11 +272,11 @@ class LocalMockApiClient implements AiosApiClient {
 
   async getCoreInfo(): Promise<CoreInfo> {
     return {
-      core_bin: '/usr/bin/xray',
+      core_bin: '/usr/bin/aios-xray',
       binary_exists: true,
       core_type: 'xray',
       version: 'Xray 26.9.8 (local preview mode)',
-      asset_location: '/usr/share/xray',
+      asset_location: '/usr/share/aios/geodata',
       has_geoip: true,
       has_geosite: true,
       has_ucode: true,

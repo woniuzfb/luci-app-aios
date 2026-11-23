@@ -243,8 +243,8 @@ onBeforeUnmount(() => {
         </thead>
         <tbody>
           <tr v-for="slot in coreList.slots" :key="slot.id">
-            <td>
-              <span class="badge">{{ slot.source === 'system' ? '系统' : '托管槽位' }}</span>
+            <td style="white-space: nowrap; color: var(--text-secondary)">
+              {{ slot.source === 'system' ? '系统' : '托管槽位' }}
             </td>
             <td>{{ slot.core }}</td>
             <td><code>v{{ slot.version }}</code></td>

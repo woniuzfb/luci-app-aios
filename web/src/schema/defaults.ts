@@ -5,11 +5,11 @@ export function createDefaultConfig(): AiosConfig {
     general: {
       enabled: false,
       core_type: 'auto',
-      core_bin: '/usr/bin/xray',
+      core_bin: '',
       bins_dir: '',
       target_version: 'auto',
       v2ray_format: 'jsonv4',
-      asset_location: '/usr/share/xray',
+      asset_location: '/usr/share/aios/geodata',
       geoloader: 'memconservative',
       go_memlimit: '',
       rlimit_nofile: '102400',

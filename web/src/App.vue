@@ -98,6 +98,17 @@ async function refreshSystem() {
   }
 }
 
+async function handleCoreSwitched() {
+  await refreshSystem();
+  try {
+    const latest = await api.loadConfig();
+    config.value.general.core_bin = latest.general.core_bin;
+    config.value.general.core_type = latest.general.core_type;
+  } catch {
+    // ignore reload failure; coreInfo is already refreshed
+  }
+}
+
 async function handleSaveAndApply() {
   const errors = compiled.value.diagnostics.filter((d) => d.level === 'error');
   if (errors.length > 0) {
@@ -319,7 +330,11 @@ onMounted(async () => {
                 </div>
                 <div class="field">
                   <label>可执行文件路径 (core_bin)</label>
-                  <input v-model="config.general.core_bin" type="text" placeholder="留空自动探测 /usr/bin/aios-xray 等" />
+                  <input
+                    v-model="config.general.core_bin"
+                    type="text"
+                    :placeholder="coreInfo?.core_bin ? `自动探测：${coreInfo.core_bin}` : '留空自动探测 /usr/bin/aios-xray 等'"
+                  />
                 </div>
                 <div class="field">
                   <label>多版本存储目录 (bins_dir，可选)</label>
@@ -327,7 +342,11 @@ onMounted(async () => {
                 </div>
                 <div class="field">
                   <label>GeoData 资产目录</label>
-                  <input v-model="config.general.asset_location" type="text" placeholder="留空自动探测 /usr/share/aios/geodata 等" />
+                  <input
+                    v-model="config.general.asset_location"
+                    type="text"
+                    :placeholder="coreInfo?.asset_location ? `自动探测：${coreInfo.asset_location}` : '留空自动探测 /usr/share/aios/geodata 等'"
+                  />
                 </div>
                 <div class="field">
                   <label>日志级别 (log_level)</label>
@@ -385,7 +404,7 @@ onMounted(async () => {
               :api="api"
               :config="config"
               :core-info="coreInfo"
-              @switched="refreshSystem"
+              @switched="handleCoreSwitched"
               @notify="notify"
             />
           </div>
