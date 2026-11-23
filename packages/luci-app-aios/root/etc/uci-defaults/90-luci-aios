@@ -9,4 +9,45 @@ EOF
 
 mkdir -p /etc/aios/presets /var/etc/aios
 
+# Idempotent UCI schema migration for /etc/config/aios
+# Bump CURRENT_SCHEMA_VERSION and append incremental blocks below on breaking schema changes.
+CURRENT_SCHEMA_VERSION=1
+
+if [ -f /etc/config/aios ]; then
+	schema_ver="$(uci -q get aios.main.schema_version || echo 0)"
+	case "$schema_ver" in
+		''|*[!0-9]*) schema_ver=0 ;;
+	esac
+
+	# v0 -> v1: normalize legacy geodata_reload_interval into geodata_cron (5-field cron only)
+	if [ "$schema_ver" -lt 1 ]; then
+		if [ "$(uci -q get aios.main)" != "general" ]; then
+			uci -q set aios.main='general'
+		fi
+		legacy_interval="$(uci -q get aios.main.geodata_reload_interval || true)"
+		existing_cron="$(uci -q get aios.main.geodata_cron || true)"
+		if [ -n "$legacy_interval" ] && [ -z "$existing_cron" ]; then
+			set -- $legacy_interval
+			if [ "$#" -eq 5 ]; then
+				uci -q set aios.main.geodata_cron="$legacy_interval"
+			fi
+		fi
+		uci -q delete aios.main.geodata_reload_interval
+		uci -q set aios.main.schema_version='1'
+		schema_ver=1
+	fi
+
+	# Future migrations:
+	# if [ "$schema_ver" -lt 2 ]; then
+	# 	...
+	# 	uci -q set aios.main.schema_version='2'
+	# 	schema_ver=2
+	# fi
+
+	if [ "$schema_ver" -lt "$CURRENT_SCHEMA_VERSION" ]; then
+		uci -q set aios.main.schema_version="$CURRENT_SCHEMA_VERSION"
+	fi
+	uci -q commit aios
+fi
+
 exit 0

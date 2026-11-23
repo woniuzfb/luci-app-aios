@@ -79,9 +79,25 @@ fi
 exit 0
 endef
 
+define Package/$(PKG_NAME)/prerm
+#!/bin/sh
+if [ -z "$${IPKG_INSTROOT}" ]; then
+	if [ -x /etc/init.d/aios ]; then
+		/etc/init.d/aios stop >/dev/null 2>&1 || true
+		if [ "$${1:-remove}" != "upgrade" ]; then
+			/etc/init.d/aios disable >/dev/null 2>&1 || true
+		fi
+	fi
+fi
+exit 0
+endef
+
 define Package/$(PKG_NAME)/postrm
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
+	if [ ! -f /etc/init.d/aios ]; then
+		uci -q delete ucitrack.@aios[-1] >/dev/null 2>&1 && uci -q commit ucitrack >/dev/null 2>&1 || true
+	fi
 	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache/
 fi
 exit 0

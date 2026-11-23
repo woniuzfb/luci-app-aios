@@ -9,7 +9,7 @@ import type {
   RoutingRuleConfig,
   StreamFields
 } from '@/schema/types';
-import { createDefaultConfig } from '@/schema/defaults';
+import { createDefaultConfig, CURRENT_SCHEMA_VERSION } from '@/schema/defaults';
 
 export interface UciSectionPayload {
   type: string;
@@ -371,6 +371,7 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
   // 1. general
   const g = cfg.general;
   const gVals: Record<string, string | string[]> = {};
+  setIfNonEmpty(gVals, 'schema_version', g.schema_version ?? CURRENT_SCHEMA_VERSION);
   setIfNonEmpty(gVals, 'enabled', g.enabled);
   setIfNonEmpty(gVals, 'core_type', g.core_type);
   setIfNonEmpty(gVals, 'core_bin', g.core_bin);
@@ -817,6 +818,7 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
       hasMain = true;
       def.general = {
         ...def.general,
+        schema_version: asNum(s.schema_version, CURRENT_SCHEMA_VERSION),
         enabled: asBool(s.enabled, def.general.enabled),
         core_type: asStr(s.core_type, def.general.core_type) as AiosConfig['general']['core_type'],
         core_bin: asStr(s.core_bin, def.general.core_bin),

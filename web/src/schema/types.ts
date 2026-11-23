@@ -9,6 +9,7 @@ export interface KeyValuePair {
 }
 
 export interface GeneralConfig {
+  schema_version?: number;
   enabled: boolean;
   core_type: CoreSelection;
   core_bin: string;

@@ -1,8 +1,11 @@
 import type { AiosConfig } from './types';
 
+export const CURRENT_SCHEMA_VERSION = 1;
+
 export function createDefaultConfig(): AiosConfig {
   return {
     general: {
+      schema_version: CURRENT_SCHEMA_VERSION,
       enabled: false,
       core_type: 'auto',
       core_bin: '',
