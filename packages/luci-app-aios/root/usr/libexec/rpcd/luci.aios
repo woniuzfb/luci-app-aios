@@ -56,29 +56,58 @@ sanitize_id() {
 	echo "$1" | tr -cd 'a-zA-Z0-9_-' | cut -c1-64
 }
 
-rpc_core_info() {
-	local bin configured core_type ver core_version asset has_geoip has_geosite has_ucode fw_backend
+resolve_core_bin() {
+	local bin configured cand cands fallback
 	bin="$(uci_get main.core_bin '')"
-	if [ -z "$bin" ]; then
-		for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
-			if [ -x "$cand" ]; then
-				bin="$cand"
-				break
-			fi
-		done
-		bin="${bin:-/usr/bin/aios-xray}"
+	if [ -n "$bin" ]; then
+		echo "$bin"
+		return 0
 	fi
 	configured="$(uci_get main.core_type auto)"
+	case "$configured" in
+		v2ray)
+			cands="/usr/bin/aios-v2ray /usr/bin/v2ray /usr/bin/aios-xray /usr/bin/xray"
+			fallback="/usr/bin/aios-v2ray"
+			;;
+		xray)
+			cands="/usr/bin/aios-xray /usr/bin/xray /usr/bin/aios-v2ray /usr/bin/v2ray"
+			fallback="/usr/bin/aios-xray"
+			;;
+		*)
+			cands="/usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray"
+			fallback="/usr/bin/aios-xray"
+			;;
+	esac
+	for cand in $cands; do
+		if [ -x "$cand" ]; then
+			echo "$cand"
+			return 0
+		fi
+	done
+	echo "$fallback"
+}
+
+resolve_asset_dir() {
+	local asset cand
 	asset="$(uci_get main.asset_location '')"
-	if [ -z "$asset" ]; then
-		for cand in /usr/share/aios/geodata /usr/share/xray /usr/share/v2ray; do
-			if [ -d "$cand" ]; then
-				asset="$cand"
-				break
-			fi
-		done
-		asset="${asset:-/usr/share/aios/geodata}"
+	if [ -n "$asset" ]; then
+		echo "$asset"
+		return 0
 	fi
+	for cand in /usr/share/aios/geodata /usr/share/xray /usr/share/v2ray; do
+		if [ -d "$cand" ]; then
+			echo "$cand"
+			return 0
+		fi
+	done
+	echo "/usr/share/aios/geodata"
+}
+
+rpc_core_info() {
+	local bin configured core_type ver core_version asset has_geoip has_geosite has_ucode fw_backend
+	bin="$(resolve_core_bin)"
+	configured="$(uci_get main.core_type auto)"
+	asset="$(resolve_asset_dir)"
 	ver=""
 	core_version=""
 	if [ -x "$bin" ]; then
@@ -124,27 +153,99 @@ rpc_service_status() {
 }
 
 rpc_preflight_check() {
-	local table mark
+	local table mark aios_pid svc p cmd arg0 base line
+	local svc_list="" proc_list="" fw_list=""
 	table="$(uci_get main_tproxy.route_table 166)"
 	mark="$(uci_get main_tproxy.tproxy_mark 0x3a01)"
+	aios_pid=""
+	[ -s "$PID_FILE" ] && aios_pid="$(cat "$PID_FILE" 2>/dev/null)"
 
-	json_init
-	json_add_array "warnings"
-
-	local svc
-	for svc in xray_core v2ray passwall passwall2 openclash homeproxy shadowsocksr; do
+	for svc in xray xray_core v2ray passwall passwall2 openclash homeproxy shadowsocksr sing-box v2raya; do
 		if [ -x "/etc/init.d/${svc}" ] && /etc/init.d/"${svc}" running >/dev/null 2>&1; then
-			json_add_string "" "Coexisting proxy service running: ${svc}"
+			svc_list="${svc_list}${svc}
+"
 		fi
 	done
 
-	if ip rule show 2>/dev/null | grep -q "lookup ${table}\b"; then
-		if [ ! -f "${RUNTIME_DIR}/aios_active" ]; then
-			json_add_string "" "Route table ${table} is already used in ip rule"
-		fi
+	for p in /proc/[0-9]*; do
+		p="${p#/proc/}"
+		[ "$p" = "$aios_pid" ] && continue
+		[ -r "/proc/${p}/cmdline" ] || continue
+		cmd="$(tr '\0' ' ' < "/proc/${p}/cmdline" 2>/dev/null | sed 's/[[:space:]]*$//')"
+		[ -n "$cmd" ] || continue
+		arg0="${cmd%% *}"
+		base="$(basename "$arg0" 2>/dev/null)"
+		case "$base" in
+			xray|v2ray|aios-xray|aios-v2ray)
+				proc_list="${proc_list}PID ${p}: ${cmd}
+"
+				;;
+		esac
+	done
+
+	if command -v nft >/dev/null 2>&1; then
+		local nft_hits
+		nft_hits="$(nft list ruleset 2>/dev/null | awk '
+			/^table / { tbl=$2 " " $3; in_aios=(tbl == "inet aios"); next }
+			!in_aios && /(tproxy (to|ip|ip6)|redirect to :)/ { if (tbl != "" && !seen[tbl]++) print "nftables: table " tbl " (存在第三方 tproxy/redirect 规则)" }
+		')"
+		[ -n "$nft_hits" ] && fw_list="${fw_list}${nft_hits}
+"
 	fi
 
+	if command -v iptables-save >/dev/null 2>&1; then
+		local ipt_hits
+		ipt_hits="$(iptables-save 2>/dev/null | awk '
+			/^-A / && ($0 ~ /-j TPROXY/ || $0 ~ /-j REDIRECT/) && $2 !~ /^AIOS_/ {
+				if (!seen[$2]++) print "iptables: chain " $2 " (存在第三方 TPROXY/REDIRECT 规则)"
+			}
+		')"
+		[ -n "$ipt_hits" ] && fw_list="${fw_list}${ipt_hits}
+"
+	fi
+
+	local old_ifs="$IFS"
+	set -f
+	IFS='
+'
+	json_init
+	json_add_array "warnings"
+	for line in $svc_list; do
+		[ -n "$line" ] && json_add_string "" "检测到共存代理服务正在运行: ${line}"
+	done
+	for line in $proc_list; do
+		[ -n "$line" ] && json_add_string "" "检测到外部内核进程: ${line}"
+	done
+	for line in $fw_list; do
+		[ -n "$line" ] && json_add_string "" "检测到第三方透明代理防火墙规则: ${line}"
+	done
+	if ip rule show 2>/dev/null | grep -q "lookup ${table}\b"; then
+		if [ ! -f "${RUNTIME_DIR}/aios_active" ]; then
+			json_add_string "" "路由表 ${table} 已被其他 ip rule 占用"
+		fi
+	fi
 	json_close_array
+
+	json_add_array "conflicting_services"
+	for line in $svc_list; do
+		[ -n "$line" ] && json_add_string "" "$line"
+	done
+	json_close_array
+
+	json_add_array "external_processes"
+	for line in $proc_list; do
+		[ -n "$line" ] && json_add_string "" "$line"
+	done
+	json_close_array
+
+	json_add_array "firewall_conflicts"
+	for line in $fw_list; do
+		[ -n "$line" ] && json_add_string "" "$line"
+	done
+	json_close_array
+	IFS="$old_ifs"
+	set +f
+
 	json_add_string "route_table" "$table"
 	json_add_string "tproxy_mark" "$mark"
 	json_dump
@@ -253,13 +354,14 @@ rpc_firewall_action() {
 }
 
 rpc_validate_config() {
-	local input config_json bin core_type fmt tmp out code
+	local input config_json bin core_type fmt asset tmp out code
 	read -r input
 	json_load "$input"
 	json_get_var config_json "config"
-	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	bin="$(resolve_core_bin)"
 	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$bin")"
 	fmt="$(uci_get main.v2ray_format jsonv4)"
+	asset="$(resolve_asset_dir)"
 
 	if [ ! -x "$bin" ]; then
 		json_init
@@ -284,13 +386,13 @@ rpc_validate_config() {
 	fi
 
 	if [ "$core_type" = "xray" ]; then
-		out="$("$bin" run -test -c "$tmp" 2>&1)"
+		out="$(XRAY_LOCATION_ASSET="$asset" "$bin" run -test -c "$tmp" 2>&1)"
 		code=$?
 	else
 		if [ "$fmt" = "jsonv5" ]; then
-			out="$("$bin" test -c "$tmp" -format jsonv5 2>&1)"
+			out="$(V2RAY_LOCATION_ASSET="$asset" "$bin" test -c "$tmp" -format jsonv5 2>&1)"
 		else
-			out="$("$bin" test -c "$tmp" 2>&1)"
+			out="$(V2RAY_LOCATION_ASSET="$asset" "$bin" test -c "$tmp" 2>&1)"
 		fi
 		code=$?
 	fi
@@ -304,7 +406,7 @@ rpc_validate_config() {
 
 rpc_stats() {
 	local bin core_type metrics_port api_port out
-	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	bin="$(resolve_core_bin)"
 	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$bin")"
 	metrics_port="$(uci_get main.metrics_port 18888)"
 	api_port="$(uci_get main.api_port 18080)"
@@ -336,7 +438,7 @@ rpc_key_gen() {
 	read -r input
 	json_load "$input"
 	json_get_var kind "kind"
-	bin="$(uci_get main.core_bin /usr/bin/xray)"
+	bin="$(resolve_core_bin)"
 	out=""
 	if [ -x "$bin" ]; then
 		case "$kind" in
@@ -450,15 +552,8 @@ rpc_service_action() {
 rpc_list_cores() {
 	local bins_dir active_bin active_real avail_kb has_unzip has_sha256 has_dl
 	bins_dir="$(uci_get main.bins_dir '')"
-	active_bin="$(uci_get main.core_bin '')"
-	if [ -z "$active_bin" ]; then
-		for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
-			if [ -x "$cand" ]; then
-				active_bin="$cand"
-				break
-			fi
-		done
-	fi
+	active_bin="$(resolve_core_bin)"
+	[ -x "$active_bin" ] || active_bin=""
 	active_real="$active_bin"
 	[ -L "$active_bin" ] && active_real="$(readlink -f "$active_bin" 2>/dev/null || echo "$active_bin")"
 
@@ -689,9 +784,38 @@ rpc_remove_core() {
 	printf '{"ok":true,"id":"%s"}\n' "$slot_id"
 }
 
+rpc_stop_conflicting_services() {
+	local input services_csv old_ifs svc
+	read -r input
+	json_load "$input"
+	json_get_var services_csv "services"
+
+	json_init
+	json_add_boolean "ok" 1
+	json_add_array "stopped"
+	old_ifs="$IFS"
+	IFS=','
+	for svc in $services_csv; do
+		IFS="$old_ifs"
+		svc="$(printf '%s' "$svc" | tr -cd 'a-zA-Z0-9_-')"
+		case "$svc" in
+			xray|xray_core|v2ray|passwall|passwall2|openclash|homeproxy|shadowsocksr|sing-box|v2raya)
+				if [ -x "/etc/init.d/${svc}" ]; then
+					/etc/init.d/"${svc}" stop >/dev/null 2>&1 || true
+					json_add_string "" "$svc"
+				fi
+				;;
+		esac
+		IFS=','
+	done
+	IFS="$old_ifs"
+	json_close_array
+	json_dump
+}
+
 case "$1" in
 	list)
-		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"},"listCores":{},"installCore":{"core":"String","tag":"String","mirror":"String"},"installStatus":{},"switchCore":{"path":"String","compiled_json":"String"},"removeCore":{"id":"String"}}'
+		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"},"listCores":{},"installCore":{"core":"String","tag":"String","mirror":"String"},"installStatus":{},"switchCore":{"path":"String","compiled_json":"String"},"removeCore":{"id":"String"},"stopConflictingServices":{"services":"String"}}'
 		;;
 	call)
 		case "$2" in
@@ -715,6 +839,7 @@ case "$1" in
 			installStatus) rpc_install_status ;;
 			switchCore) rpc_switch_core ;;
 			removeCore) rpc_remove_core ;;
+			stopConflictingServices) rpc_stop_conflicting_services ;;
 		esac
 		;;
 esac

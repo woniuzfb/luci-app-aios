@@ -24,6 +24,9 @@ export interface ServiceStatus {
 
 export interface PreflightResult {
   warnings: string[];
+  conflicting_services?: string[];
+  external_processes?: string[];
+  firewall_conflicts?: string[];
   route_table: string;
   tproxy_mark: string;
 }
@@ -117,6 +120,7 @@ export interface AiosApiClient {
   installStatus(): Promise<InstallCoreStatus>;
   switchCore(path: string, compiledJson?: string): Promise<SwitchCoreResult>;
   removeCore(id: string): Promise<{ ok: boolean; id?: string; error?: string }>;
+  stopConflictingServices(services: string[]): Promise<{ ok: boolean; stopped: string[] }>;
 }
 
 const STORAGE_CONFIG_KEY = 'aios_mock_config_v3';
@@ -262,6 +266,11 @@ class UbusApiClient implements AiosApiClient {
   removeCore(id: string): Promise<{ ok: boolean; id?: string; error?: string }> {
     return this.call<{ ok: boolean; id?: string; error?: string }>('luci.aios', 'removeCore', { id });
   }
+  stopConflictingServices(services: string[]): Promise<{ ok: boolean; stopped: string[] }> {
+    return this.call<{ ok: boolean; stopped: string[] }>('luci.aios', 'stopConflictingServices', {
+      services: services.join(',')
+    });
+  }
 }
 
 class LocalMockApiClient implements AiosApiClient {
@@ -287,7 +296,14 @@ class LocalMockApiClient implements AiosApiClient {
     return { running: this.running, pid: this.running ? '14820' : '', rss_kb: this.running ? 24576 : 0 };
   }
   async preflightCheck(): Promise<PreflightResult> {
-    return { warnings: [], route_table: '166', tproxy_mark: '0x3a01' };
+    return {
+      warnings: [],
+      conflicting_services: [],
+      external_processes: [],
+      firewall_conflicts: [],
+      route_table: '166',
+      tproxy_mark: '0x3a01'
+    };
   }
   async getFirewallStatus(): Promise<FirewallStatus> {
     const cfg = await this.loadConfig();
@@ -482,6 +498,9 @@ class LocalMockApiClient implements AiosApiClient {
     if (slot.path === this.mockActivePath) return { ok: false, error: 'Cannot remove active slot' };
     this.mockSlots = this.mockSlots.filter((s) => s.id !== id);
     return { ok: true, id };
+  }
+  async stopConflictingServices(services: string[]): Promise<{ ok: boolean; stopped: string[] }> {
+    return { ok: true, stopped: services };
   }
 }
 

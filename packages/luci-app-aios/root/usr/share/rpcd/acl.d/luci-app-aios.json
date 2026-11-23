@@ -42,7 +42,8 @@
 					"firewallAction",
 					"installCore",
 					"switchCore",
-					"removeCore"
+					"removeCore",
+					"stopConflictingServices"
 				],
 				"uci": [ "set", "add", "delete", "reorder", "commit", "revert" ]
 			},

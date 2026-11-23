@@ -70,12 +70,25 @@ preflight_conflict_check() {
 
 	# Check coexisting proxy services (informational / warning)
 	local svc
-	for svc in xray_core v2ray passwall passwall2 openclash homeproxy shadowsocksr; do
+	for svc in xray xray_core v2ray passwall passwall2 openclash homeproxy shadowsocksr sing-box v2raya; do
 		if [ -x "/etc/init.d/${svc}" ] && /etc/init.d/"${svc}" running >/dev/null 2>&1; then
 			_log warning "Coexisting proxy service detected running: ${svc} (ensure ports, fwmark, and route tables do not overlap)"
 			has_conflict=1
 		fi
 	done
+
+	# Check third-party nftables tproxy/redirect tables outside inet aios
+	if command -v nft >/dev/null 2>&1; then
+		local ext_tbl
+		ext_tbl="$(nft list ruleset 2>/dev/null | awk '
+			/^table / { tbl=$2 " " $3; in_aios=(tbl == "inet aios"); next }
+			!in_aios && /(tproxy (to|ip|ip6)|redirect to :)/ { if (tbl != "" && !seen[tbl]++) print tbl }
+		')"
+		if [ -n "$ext_tbl" ]; then
+			_log warning "Third-party transparent proxy nftables rules detected in: $(echo "$ext_tbl" | tr '\n' ' ')"
+			has_conflict=1
+		fi
+	fi
 
 	# Check ip rule collision on configured route table
 	if ip rule show 2>/dev/null | grep -q "lookup ${route_table}\b"; then
@@ -254,23 +267,39 @@ start_service() {
 
 	local core_bin core_type v2ray_format asset_location geoloader go_memlimit
 	local rlimit_nofile rlimit_data custom_file conflict_policy route_table tproxy_mark
+	local configured_type cands fallback_bin
+	configured_type="$(uci_get main.core_type auto)"
 	core_bin="$(uci_get main.core_bin '')"
 	if [ -z "$core_bin" ]; then
+		case "$configured_type" in
+			v2ray)
+				cands="/usr/bin/aios-v2ray /usr/bin/v2ray /usr/bin/aios-xray /usr/bin/xray"
+				fallback_bin="/usr/bin/aios-v2ray"
+				;;
+			xray)
+				cands="/usr/bin/aios-xray /usr/bin/xray /usr/bin/aios-v2ray /usr/bin/v2ray"
+				fallback_bin="/usr/bin/aios-xray"
+				;;
+			*)
+				cands="/usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray"
+				fallback_bin="/usr/bin/aios-xray"
+				;;
+		esac
 		local cand
-		for cand in /usr/bin/aios-xray /usr/bin/aios-v2ray /usr/bin/xray /usr/bin/v2ray; do
+		for cand in $cands; do
 			if [ -x "$cand" ]; then
 				core_bin="$cand"
 				break
 			fi
 		done
-		core_bin="${core_bin:-/usr/bin/aios-xray}"
+		core_bin="${core_bin:-$fallback_bin}"
 	fi
 	if [ ! -x "$core_bin" ]; then
 		_log err "Core binary not executable: ${core_bin}"
 		return 1
 	fi
 
-	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$core_bin")"
+	core_type="$(detect_core_type "$configured_type" "$core_bin")"
 	v2ray_format="$(uci_get main.v2ray_format jsonv4)"
 	asset_location="$(uci_get main.asset_location '')"
 	if [ -z "$asset_location" ]; then

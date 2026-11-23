@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import type { AiosConfig, AiosPreset } from '@/schema/types';
 import { createDefaultConfig } from '@/schema/defaults';
 import { resolveEffectiveCore } from '@/schema/capabilities';
@@ -43,6 +43,24 @@ const showQuickSavePreset = ref(false);
 const quickPresetName = ref('');
 const quickPresetDesc = ref('');
 
+// Pre-start conflict detection & resolution modal
+const showConflictModal = ref(false);
+const conflictActionBusy = ref(false);
+const pendingAction = ref<'start' | 'restart' | 'save_and_apply' | null>(null);
+const pendingPreflight = ref<PreflightResult | null>(null);
+
+function isPreflightConflicting(pf: PreflightResult | null | undefined): boolean {
+  if (!pf) return false;
+  return Boolean(
+    pf.warnings.length ||
+      pf.conflicting_services?.length ||
+      pf.external_processes?.length ||
+      pf.firewall_conflicts?.length
+  );
+}
+
+const hasPreflightConflicts = computed(() => isPreflightConflicting(preflight.value));
+
 const effectiveCore = computed(() =>
   resolveEffectiveCore(
     config.value.general.core_type,
@@ -53,10 +71,23 @@ const effectiveCore = computed(() =>
 
 const versionPresets = computed(() => getVersionPresets(effectiveCore.value));
 
+const detectedVersionForCore = computed(() => {
+  if (!coreInfo.value?.core_version) return undefined;
+  if (coreInfo.value.core_type !== effectiveCore.value) return undefined;
+  return coreInfo.value.core_version;
+});
+
 const resolvedTargetVersion = computed(() => {
   const configured = config.value.general.target_version;
   if (configured && configured !== 'auto') return configured;
-  return coreInfo.value?.core_version || undefined;
+  return detectedVersionForCore.value;
+});
+
+watch(effectiveCore, () => {
+  const current = config.value.general.target_version;
+  if (current && current !== 'auto' && !versionPresets.value.some((vp) => vp.version === current)) {
+    config.value.general.target_version = 'auto';
+  }
 });
 
 const compiled = computed(() =>
@@ -109,13 +140,7 @@ async function handleCoreSwitched() {
   }
 }
 
-async function handleSaveAndApply() {
-  const errors = compiled.value.diagnostics.filter((d) => d.level === 'error');
-  if (errors.length > 0) {
-    notify(`存在 ${errors.length} 个配置错误，已阻止保存与重启：${errors[0].path} — ${errors[0].message}`);
-    activeTab.value = 'tools';
-    return;
-  }
+async function executeSaveAndApply() {
   try {
     const compiledText = JSON.stringify(compiled.value.json, null, 2);
     await api.saveConfig(config.value, compiledText);
@@ -129,13 +154,106 @@ async function handleSaveAndApply() {
   }
 }
 
-async function handleServiceAction(action: 'start' | 'stop' | 'restart') {
+async function handleSaveAndApply() {
+  const errors = compiled.value.diagnostics.filter((d) => d.level === 'error');
+  if (errors.length > 0) {
+    notify(`存在 ${errors.length} 个配置错误，已阻止保存与重启：${errors[0].path} — ${errors[0].message}`);
+    activeTab.value = 'tools';
+    return;
+  }
+  if (config.value.general.enabled) {
+    try {
+      const pf = await api.preflightCheck();
+      preflight.value = pf;
+      if (isPreflightConflicting(pf)) {
+        pendingPreflight.value = pf;
+        pendingAction.value = 'save_and_apply';
+        showConflictModal.value = true;
+        return;
+      }
+    } catch {
+      // fallback to direct save if preflight fails
+    }
+  }
+  await executeSaveAndApply();
+}
+
+async function executeServiceAction(action: 'start' | 'stop' | 'restart') {
   try {
     await api.serviceAction(action);
     await refreshSystem();
-    notify(`已执行服务操作: ${action}`);
+    if (action === 'stop' && preflight.value && isPreflightConflicting(preflight.value)) {
+      const extras: string[] = [];
+      if (preflight.value.firewall_conflicts?.length) {
+        extras.push(`第三方防火墙规则 ${preflight.value.firewall_conflicts.length} 处`);
+      }
+      if (preflight.value.conflicting_services?.length) {
+        extras.push(`运行中冲突服务: ${preflight.value.conflicting_services.join('、')}`);
+      }
+      if (preflight.value.external_processes?.length) {
+        extras.push(`外部进程 ${preflight.value.external_processes.length} 个`);
+      }
+      notify(`AIOS 自身服务与防火墙规则已清理，但仍检测到外部残留（${extras.join('；') || preflight.value.warnings[0]}），请在上方提示中停止对应服务。`);
+    } else {
+      notify(`已执行服务操作: ${action}`);
+    }
   } catch (e) {
     notify(`服务操作失败: ${String(e)}`);
+  }
+}
+
+async function handleServiceAction(action: 'start' | 'stop' | 'restart') {
+  if (action === 'start' || action === 'restart') {
+    try {
+      const pf = await api.preflightCheck();
+      preflight.value = pf;
+      if (isPreflightConflicting(pf)) {
+        pendingPreflight.value = pf;
+        pendingAction.value = action;
+        showConflictModal.value = true;
+        return;
+      }
+    } catch {
+      // continue directly if preflightCheck is unavailable
+    }
+  }
+  await executeServiceAction(action);
+}
+
+async function handleConflictResolve(mode: 'force' | 'stop_and_start') {
+  const action = pendingAction.value;
+  if (!action) return;
+  conflictActionBusy.value = true;
+  try {
+    if (mode === 'stop_and_start' && pendingPreflight.value?.conflicting_services?.length) {
+      await api.stopConflictingServices(pendingPreflight.value.conflicting_services);
+    }
+    showConflictModal.value = false;
+    pendingAction.value = null;
+    if (action === 'save_and_apply') {
+      await executeSaveAndApply();
+    } else {
+      await executeServiceAction(action);
+    }
+  } catch (e) {
+    notify(`处理冲突失败: ${String(e)}`);
+  } finally {
+    conflictActionBusy.value = false;
+  }
+}
+
+async function handleStopConflictsOnly() {
+  const svcs = preflight.value?.conflicting_services;
+  if (!svcs?.length) return;
+  conflictActionBusy.value = true;
+  try {
+    const res = await api.stopConflictingServices(svcs);
+    await refreshSystem();
+    notify(`已停止冲突服务: ${res.stopped.join('、') || svcs.join('、')}`);
+  } catch (e) {
+    notify(`停止冲突服务失败: ${String(e)}`);
+  } finally {
+    conflictActionBusy.value = false;
   }
 }
 
@@ -292,6 +410,23 @@ onMounted(async () => {
               </div>
             </div>
 
+            <div v-if="hasPreflightConflicts" class="alert alert-warn" style="margin-bottom: 16px">
+              <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 6px">
+                <strong>检测到外部代理或防火墙冲突风险</strong>
+                <button
+                  v-if="preflight?.conflicting_services?.length"
+                  class="btn btn-sm btn-danger"
+                  :disabled="conflictActionBusy"
+                  @click="handleStopConflictsOnly"
+                >
+                  {{ conflictActionBusy ? '停止中...' : `停止冲突服务 (${preflight.conflicting_services.join(', ')})` }}
+                </button>
+              </div>
+              <ul style="margin: 0 0 0 18px; padding: 0">
+                <li v-for="(w, idx) in preflight?.warnings || []" :key="idx">{{ w }}</li>
+              </ul>
+            </div>
+
             <div class="card">
               <div class="card-header">
                 <h3 class="card-title">核心运行设置 (/etc/config/aios)</h3>
@@ -314,7 +449,7 @@ onMounted(async () => {
                   <label>目标版本基线 (target_version)</label>
                   <select v-model="config.general.target_version">
                     <option value="auto">
-                      auto（{{ coreInfo?.core_version ? `已探测 v${coreInfo.core_version}` : `默认 v${compiled.version}` }}）
+                      auto（{{ detectedVersionForCore ? `已探测 v${detectedVersionForCore}` : `默认 v${compiled.version}` }}）
                     </option>
                     <option v-for="vp in versionPresets" :key="vp.id" :value="vp.version">
                       {{ vp.label }} (v{{ vp.version }})
@@ -333,7 +468,13 @@ onMounted(async () => {
                   <input
                     v-model="config.general.core_bin"
                     type="text"
-                    :placeholder="coreInfo?.core_bin ? `自动探测：${coreInfo.core_bin}` : '留空自动探测 /usr/bin/aios-xray 等'"
+                    :placeholder="
+                      coreInfo?.core_bin && coreInfo.core_type === effectiveCore
+                        ? `自动探测：${coreInfo.core_bin}`
+                        : effectiveCore === 'v2ray'
+                          ? '留空自动探测 /usr/bin/aios-v2ray 等'
+                          : '留空自动探测 /usr/bin/aios-xray 等'
+                    "
                   />
                 </div>
                 <div class="field">
@@ -485,6 +626,63 @@ onMounted(async () => {
           <button class="btn" @click="showQuickSavePreset = false">取消</button>
           <button class="btn btn-primary" :disabled="!quickPresetName.trim()" @click="handleQuickSavePreset">
             保存预设
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- Conflict Detection & Resolution Modal -->
+    <div v-if="showConflictModal && pendingPreflight" class="modal-backdrop" @click.self="showConflictModal = false">
+      <div class="modal">
+        <div class="modal-header">
+          <h3 class="modal-title">检测到系统代理 / 防火墙冲突</h3>
+          <button class="btn btn-sm" :disabled="conflictActionBusy" @click="showConflictModal = false">关闭</button>
+        </div>
+        <p class="hint" style="margin-bottom: 12px">
+          启动前检测到同机存在其他代理服务、内核进程或第三方透明代理防火墙规则，直接启动可能导致流量黑洞或端口冲突：
+        </p>
+        <div v-if="pendingPreflight.conflicting_services?.length" class="alert alert-warn" style="margin-bottom: 10px">
+          <strong>运行中的冲突服务：</strong>{{ pendingPreflight.conflicting_services.join('、') }}
+        </div>
+        <div v-if="pendingPreflight.firewall_conflicts?.length" class="alert alert-warn" style="margin-bottom: 10px">
+          <strong>第三方防火墙规则：</strong>
+          <ul style="margin: 6px 0 0 18px; padding: 0">
+            <li v-for="fw in pendingPreflight.firewall_conflicts" :key="fw">{{ fw }}</li>
+          </ul>
+        </div>
+        <div v-if="pendingPreflight.external_processes?.length" class="alert alert-warn" style="margin-bottom: 10px">
+          <strong>外部内核进程（非 AIOS 托管）：</strong>
+          <ul style="margin: 6px 0 0 18px; padding: 0">
+            <li v-for="proc in pendingPreflight.external_processes" :key="proc">
+              <code>{{ proc }}</code>
+            </li>
+          </ul>
+        </div>
+        <div
+          v-if="
+            !pendingPreflight.conflicting_services?.length &&
+            !pendingPreflight.firewall_conflicts?.length &&
+            !pendingPreflight.external_processes?.length &&
+            pendingPreflight.warnings.length
+          "
+          class="alert alert-warn"
+          style="margin-bottom: 10px"
+        >
+          <ul style="margin: 0 0 0 18px; padding: 0">
+            <li v-for="w in pendingPreflight.warnings" :key="w">{{ w }}</li>
+          </ul>
+        </div>
+        <div class="row" style="justify-content: flex-end; margin-top: 16px">
+          <button class="btn" :disabled="conflictActionBusy" @click="showConflictModal = false">取消</button>
+          <button class="btn" :disabled="conflictActionBusy" @click="handleConflictResolve('force')">
+            忽略并强行启动
+          </button>
+          <button
+            v-if="pendingPreflight.conflicting_services?.length"
+            class="btn btn-danger"
+            :disabled="conflictActionBusy"
+            @click="handleConflictResolve('stop_and_start')"
+          >
+            {{ conflictActionBusy ? '正在停止冲突服务...' : '先停止冲突服务再启动' }}
           </button>
         </div>
       </div>
