@@ -396,7 +396,13 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
   setIfNonEmpty(gVals, 'conflict_policy', g.conflict_policy);
   setIfNonEmpty(gVals, 'custom_configuration_hook', g.custom_configuration_hook);
   setJsonIfNonEmpty(gVals, 'inline_env_json', g.inline_env);
-  setIfNonEmpty(gVals, 'geodata_reload_interval', g.geodata_reload_interval);
+  const rawCron = (g.geodata_cron || '').trim() ||
+    ((g.geodata_reload_interval || '').trim().split(/\s+/).filter(Boolean).length === 5
+      ? (g.geodata_reload_interval || '').trim()
+      : '');
+  setIfNonEmpty(gVals, 'geodata_cron', rawCron);
+  setIfNonEmpty(gVals, 'geodata_outbound', g.geodata_outbound);
+  setIfNonEmpty(gVals, 'geodata_assets_json', g.geodata_assets_json);
   setIfNonEmpty(gVals, 'min_version', g.min_version);
   setIfNonEmpty(gVals, 'max_version', g.max_version);
   sections.push({ type: 'general', name: 'main', values: gVals });
@@ -518,6 +524,8 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
     setIfNonEmpty(v, 'wg_remote_dns', ob.wg_remote_dns);
     setIfNonEmpty(v, 'wg_mtu', ob.wg_mtu);
     setIfNonEmpty(v, 'wg_no_kernel_tun', ob.wg_no_kernel_tun);
+    setIfNonEmpty(v, 'wg_peer_public_key', ob.wg_peer_public_key);
+    setIfNonEmpty(v, 'wg_endpoint', ob.wg_endpoint);
     setJsonIfNonEmpty(v, 'wg_peers_json', ob.wg_peers);
     setIfNonEmpty(v, 'masque_remote_dns', ob.masque_remote_dns);
     setIfNonEmpty(v, 'mux_enabled', ob.mux_enabled);
@@ -545,6 +553,7 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
   setIfNonEmpty(dVals, 'serve_expired_ttl', d.serve_expired_ttl);
   setIfNonEmpty(dVals, 'use_system_hosts', d.use_system_hosts);
   setIfNonEmpty(dVals, 'client_ip', d.client_ip);
+  setJsonIfNonEmpty(dVals, 'hosts_json', d.hosts);
   setJsonIfNonEmpty(dVals, 'host_entries_json', d.host_entries);
   sections.push({ type: 'dns', name: 'main_dns', values: dVals });
 
@@ -744,7 +753,45 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
     });
   });
 
-  return sections;
+  // Deduplicate section names & avoid collisions with reserved singleton section names
+  const RESERVED_NAMES = new Set([
+    'main',
+    'main_dns',
+    'main_routing',
+    'main_observatory',
+    'main_burst_observatory',
+    'main_policy',
+    'main_reverse',
+    'main_browser',
+    'main_tproxy'
+  ]);
+  const usedNames = new Set<string>();
+  const deduped = sections.map((sec) => {
+    const isSingleton = [
+      'general',
+      'dns',
+      'routing',
+      'observatory',
+      'burst_observatory',
+      'policy',
+      'reverse',
+      'browser_forwarder',
+      'transparent_proxy'
+    ].includes(sec.type);
+    let candidate = sec.name;
+    if (!isSingleton && RESERVED_NAMES.has(candidate)) {
+      candidate = `${sec.type}_${candidate}`;
+    }
+    if (usedNames.has(candidate)) {
+      let n = 2;
+      while (usedNames.has(`${candidate}_${n}`)) n++;
+      candidate = `${candidate}_${n}`;
+    }
+    usedNames.add(candidate);
+    return candidate === sec.name ? sec : { ...sec, name: candidate };
+  });
+
+  return deduped;
 }
 
 export function parseUciDump(raw: UciRawDump): AiosConfig {
@@ -753,6 +800,7 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
     (a, b) => asNum(a['.index'], 0) - asNum(b['.index'], 0)
   );
 
+  let hasMain = false;
   const inbounds: InboundConfig[] = [];
   const outbounds: OutboundConfig[] = [];
   const dnsServers: DnsServerConfig[] = [];
@@ -766,6 +814,7 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
     const name = asStr(s['.name']);
 
     if (type === 'general') {
+      hasMain = true;
       def.general = {
         ...def.general,
         enabled: asBool(s.enabled, def.general.enabled),
@@ -793,7 +842,14 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
         conflict_policy: asStr(s.conflict_policy, 'warn') as AiosConfig['general']['conflict_policy'],
         custom_configuration_hook: asStr(s.custom_configuration_hook, ''),
         inline_env: parseJsonField(s.inline_env_json, []),
-        geodata_reload_interval: asStr(s.geodata_reload_interval, ''),
+        geodata_cron: asStr(
+          s.geodata_cron,
+          asStr(s.geodata_reload_interval, '').trim().split(/\s+/).filter(Boolean).length === 5
+            ? asStr(s.geodata_reload_interval, '')
+            : ''
+        ),
+        geodata_outbound: asStr(s.geodata_outbound, ''),
+        geodata_assets_json: asStr(s.geodata_assets_json, ''),
         min_version: asStr(s.min_version, ''),
         max_version: asStr(s.max_version, '')
       };
@@ -913,6 +969,8 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
         wg_remote_dns: asArray(s.wg_remote_dns),
         wg_mtu: asOptNum(s.wg_mtu),
         wg_no_kernel_tun: asBool(s.wg_no_kernel_tun, false),
+        wg_peer_public_key: asStr(s.wg_peer_public_key, ''),
+        wg_endpoint: asStr(s.wg_endpoint, ''),
         wg_peers: parseJsonField(s.wg_peers_json, []),
         masque_remote_dns: asArray(s.masque_remote_dns),
         mux_enabled: asBool(s.mux_enabled, false),
@@ -936,6 +994,7 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
         enable_parallel_query: asBool(s.enable_parallel_query, false),
         use_system_hosts: asBool(s.use_system_hosts, false),
         client_ip: asStr(s.client_ip, ''),
+        hosts: parseJsonField(s.hosts_json, {}),
         host_entries: parseJsonField(s.host_entries_json, [])
       };
     } else if (type === 'dns_server') {
@@ -1106,11 +1165,18 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
     }
   }
 
-  if (inbounds.length > 0) def.inbounds = inbounds;
-  if (outbounds.length > 0) def.outbounds = outbounds;
-  if (dnsServers.length > 0) def.dns_servers = dnsServers;
+  if (hasMain) {
+    def.inbounds = inbounds;
+    def.outbounds = outbounds;
+    def.dns_servers = dnsServers;
+    def.routing_rules = routingRules;
+  } else {
+    if (inbounds.length > 0) def.inbounds = inbounds;
+    if (outbounds.length > 0) def.outbounds = outbounds;
+    if (dnsServers.length > 0) def.dns_servers = dnsServers;
+    if (routingRules.length > 0) def.routing_rules = routingRules;
+  }
   def.fakedns = fakedns;
-  if (routingRules.length > 0) def.routing_rules = routingRules;
   def.balancers = balancers;
   def.lan_hosts = lanHosts;
 

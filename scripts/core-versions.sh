@@ -342,6 +342,12 @@ cmd_install() {
 		repo="v2fly/v2ray-core"
 		asset="v2ray-${arch}.zip"
 	fi
+	if [ -n "$mirror" ]; then
+		case "$mirror" in
+			*/) ;;
+			*) mirror="${mirror}/" ;;
+		esac
+	fi
 	base_url="${mirror}https://github.com/${repo}/releases/download/${tag}"
 
 	_CLEANUP_TMPDIR="$(mktemp -d)"

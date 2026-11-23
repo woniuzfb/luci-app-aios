@@ -16,7 +16,7 @@
 - **构建与验证入口**：
   - 前端测试、类型检查与构建：`cd web && pnpm test && pnpm build`
   - Shell 脚本语法校验：`sh -n packages/luci-app-aios/root/etc/init.d/aios packages/luci-app-aios/root/usr/libexec/rpcd/luci.aios packages/luci-app-aios/root/usr/share/aios/firewall/fw3_ipt.sh`
-  - OpenWrt SDK 打包验证：`./scripts/verify-sdk.sh [x86-64-23.05.5|x86-64-25.12.4]` 及 GitHub Actions `.github/workflows/build.yml`
+  - OpenWrt SDK 打包验证：`./scripts/verify-sdk.sh [x86-64-23.05.5|x86-64-25.12.6]` 及 GitHub Actions `.github/workflows/build.yml`
 
 ---
 
@@ -76,7 +76,10 @@
 - **核心禁令**：AI Agent **绝对禁止**在没有得到用户明确许可的情况下执行任何改变 Git 暂存区或提交历史的命令：
   1. **严禁擅自 Unstage**：禁止执行 `git restore --staged`、`git reset`、`git rm --cached` 触碰用户已暂存文件。
   2. **严禁擅自 Stage / Commit**：禁止未经用户明确授权自动执行 `git add` 或 `git commit`。
-  3. **授权 Commit 时 Message 必须详尽**：用户明确授权提交时，Commit Message 必须包含清晰标题行与分条正文，详述背景、各模块改动点与验证结果。
+  3. **授权 Commit 时 Message 必须详尽（严禁单行敷衍提交）**：用户明确授权提交时，Commit Message **禁止仅写单行标题**，必须严格包含：
+   - 规范标题行（`<type>(<scope>): <简明总结>`）；
+   - 空行后的结构化分条正文，逐项写明：**变更背景/问题根因**、**按模块分条列举的具体改动点**（OpenWrt 后端/防火墙/RPCD/编译器/前端/CI/文档等）与**完整验证命令及结果**；
+   - 严禁使用笼统措辞替代具体改动细节，确保 `git log` 独立可读、可追溯。
 
 ---
 

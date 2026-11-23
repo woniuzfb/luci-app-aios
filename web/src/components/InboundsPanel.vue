@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type { CoreType, InboundConfig } from '@/schema/types';
 import { getCoreCapabilities, type V2RayFormat } from '@/schema/capabilities';
 import ArrayInput from '@/components/ui/ArrayInput.vue';
@@ -18,6 +18,15 @@ const selectedId = ref<string>(props.inbounds[0]?.id || '');
 const subTab = ref<'basic' | 'users' | 'stream' | 'advanced'>('basic');
 
 const selected = computed(() => props.inbounds.find((i) => i.id === selectedId.value) || null);
+
+watch(
+  () => props.inbounds,
+  (list) => {
+    if (!list.some((i) => i.id === selectedId.value)) {
+      selectedId.value = list[0]?.id || '';
+    }
+  }
+);
 
 function addInbound() {
   const id = `in_${Date.now().toString(36)}`;
@@ -294,7 +303,7 @@ function addFallback() {
               <div v-if="selected.protocol === 'socks' || selected.protocol === 'http'" class="field">
                 <label>Username</label><input v-model="u.username" type="text" />
               </div>
-              <div v-if="['socks', 'http', 'trojan', 'shadowsocks'].includes(selected.protocol)" class="field">
+              <div v-if="['socks', 'http', 'trojan', 'shadowsocks', 'masque'].includes(selected.protocol)" class="field">
                 <label>Password</label><input v-model="u.password" type="password" />
               </div>
               <div v-if="selected.protocol === 'hysteria' || selected.protocol === 'hysteria2'" class="field">

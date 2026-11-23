@@ -21,8 +21,9 @@ define Package/$(PKG_NAME)
 		+PACKAGE_AIOS_INCLUDE_FW3:iptables \
 		+PACKAGE_AIOS_INCLUDE_FW3:iptables-mod-tproxy \
 		+PACKAGE_AIOS_INCLUDE_FW3:ipset \
-		+PACKAGE_AIOS_INCLUDE_XRAY:xray-core \
-		+PACKAGE_AIOS_INCLUDE_V2RAY:v2ray-core
+		+PACKAGE_AIOS_INCLUDE_XRAY:aios-xray \
+		+PACKAGE_AIOS_INCLUDE_V2RAY:aios-v2ray \
+		+PACKAGE_AIOS_INCLUDE_GEODATA:aios-geodata
 	PKGARCH:=all
 endef
 
@@ -43,16 +44,16 @@ config PACKAGE_AIOS_INCLUDE_FW3
 	default n
 
 config PACKAGE_AIOS_INCLUDE_XRAY
-	bool "Depend on xray-core"
+	bool "Depend on aios-xray (from openwrt-aios)"
 	default n
 
 config PACKAGE_AIOS_INCLUDE_V2RAY
-	bool "Depend on v2ray-core"
+	bool "Depend on aios-v2ray (from openwrt-aios)"
 	default n
 
-config PACKAGE_AIOS_RLIMIT_NOFILE_LARGE
-	bool "Increase Max Open Files Limit (recommended)"
-	default y
+config PACKAGE_AIOS_INCLUDE_GEODATA
+	bool "Depend on aios-geodata (from openwrt-aios)"
+	default n
 
 endmenu
 endef
@@ -68,11 +69,12 @@ endef
 define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
+	mkdir -p /var/etc/aios
 	if [ -f /etc/uci-defaults/90-luci-aios ]; then
 		( . /etc/uci-defaults/90-luci-aios ) && rm -f /etc/uci-defaults/90-luci-aios
 	fi
 	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache/
-	killall -HUP rpcd 2>/dev/null || true
+	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
 fi
 exit 0
 endef

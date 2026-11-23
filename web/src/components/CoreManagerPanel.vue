@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type {
   AiosApiClient,
   CoreInfo,
@@ -107,6 +107,13 @@ async function refresh() {
   }
 }
 
+watch(
+  () => props.config.general.bins_dir,
+  () => {
+    void refresh();
+  }
+);
+
 async function handleInstall() {
   errorMsg.value = '';
   const tag = installTag.value.trim();
@@ -142,9 +149,10 @@ async function handleSwitch(slot: CoreSlot) {
     // 无 ucode 的旧版 OpenWrt：由前端 TS 编译器按目标内核和目标版本预编译 JSON，传递给路由器做 -test 与原子切换
     if (!props.coreInfo?.has_ucode) {
       const targetVersion = slot.version && slot.version !== 'unknown' ? slot.version : undefined;
+      const savedCfg = await props.api.loadConfig();
       const targetCfg: AiosConfig = {
-        ...props.config,
-        general: { ...props.config.general, core_type: slot.core }
+        ...savedCfg,
+        general: { ...savedCfg.general, core_type: slot.core }
       };
       const compiled = compileConfig(targetCfg, { core: slot.core, version: targetVersion });
       const errDiag = compiled.diagnostics.find((d) => d.level === 'error');

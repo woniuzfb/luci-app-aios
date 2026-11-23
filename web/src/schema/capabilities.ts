@@ -72,7 +72,7 @@ export const CORE_PROFILE_CAPABILITIES: Record<CoreProfileKey, CoreCapability> =
     ],
     securities: ['none', 'tls', 'reality'],
     balancerStrategies: ['random', 'roundRobin', 'leastPing', 'leastLoad'],
-    sniffingDestOverrides: ['http', 'tls', 'quic', 'fakedns', 'fakedns+others'],
+    sniffingDestOverrides: ['http', 'tls', 'quic', 'fakedns'],
     maxMuxConcurrency: 128,
     supportsMetrics: true,
     supportsFinalmask: true,
@@ -126,8 +126,8 @@ export const CORE_PROFILE_CAPABILITIES: Record<CoreProfileKey, CoreCapability> =
       'hysteria2'
     ],
     securities: ['none', 'tls'],
-    balancerStrategies: ['random', 'leastPing'],
-    sniffingDestOverrides: ['http', 'tls', 'fakedns', 'fakedns+others'],
+    balancerStrategies: ['random', 'leastPing', 'leastLoad'],
+    sniffingDestOverrides: ['http', 'tls', 'quic', 'fakedns', 'fakedns+others'],
     maxMuxConcurrency: 1024,
     supportsMetrics: false,
     supportsFinalmask: false,
@@ -221,7 +221,8 @@ export function validateStreamCombination(
   v2rayFormat: V2RayFormat,
   protocol: string,
   transport: string,
-  security: string
+  security: string,
+  direction: 'inbound' | 'outbound' = 'outbound'
 ): StreamComboIssue[] {
   const issues: StreamComboIssue[] = [];
   if (core === 'xray') {
@@ -241,6 +242,12 @@ export function validateStreamCombination(
       issues.push({ level: 'error', message: `Xray REALITY 仅支持与 raw / xhttp / grpc 传输方式组合，当前为 ${transport}。` });
     }
   } else {
+    if (security === 'reality') {
+      issues.push({ level: 'error', message: `V2Ray ${v2rayFormat} 不支持 REALITY 安全层。` });
+    }
+    if (security === 'utls' && direction === 'inbound') {
+      issues.push({ level: 'error', message: 'V2Ray uTLS 仅支持客户端出站（Outbound），不能用于入站（Inbound）。' });
+    }
     if (v2rayFormat === 'jsonv4' && security === 'utls') {
       issues.push({ level: 'error', message: 'V2Ray jsonv4 不支持独立 utls 安全层，请切换 jsonv5 或改用 tls。' });
     }
@@ -249,6 +256,12 @@ export function validateStreamCombination(
     }
     if (v2rayFormat === 'jsonv5' && (transport === 'http' || transport === 'domainsocket')) {
       issues.push({ level: 'error', message: `V2Ray jsonv5 不支持传输方式 "${transport}"。` });
+    }
+    if (['xhttp', 'splithttp', 'masque'].includes(transport)) {
+      issues.push({ level: 'error', message: `V2Ray ${v2rayFormat} 不支持传输方式 "${transport}"。` });
+    }
+    if (v2rayFormat !== 'jsonv5' && transport === 'httpupgrade') {
+      issues.push({ level: 'error', message: 'V2Ray jsonv4 不支持传输方式 "httpupgrade"（请切换 jsonv5）。' });
     }
   }
   return issues;

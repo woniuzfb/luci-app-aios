@@ -41,7 +41,7 @@ function buildXrayFixtures(createDefaultConfig) {
     cfg.general.metrics_enabled = true;
     cfg.general.stats_enabled = true;
     cfg.general.inline_env = [{ key: 'XRAY_TEST_FLAG', value: '1' }];
-    cfg.general.geodata_reload_interval = '6h';
+    cfg.general.geodata_cron = '0 4 * * *';
     cfg.dns.enabled = true;
     cfg.dns.serve_stale = true;
     cfg.dns.serve_expired_ttl = 3600;

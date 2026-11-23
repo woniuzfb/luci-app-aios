@@ -1,2 +1,2 @@
-# Included by firewall4 ruleset-post; loads isolated `table inet aios` when active
-include "/var/etc/aios/fw4_*.nft"
+# Isolated `table inet aios` is managed dynamically by /etc/init.d/aios and never touches `table inet fw4`.
+# Kept comment-only so firewall4 startup/reload never fails when /var/etc/aios does not exist yet or overwrites runtime gateway sets.

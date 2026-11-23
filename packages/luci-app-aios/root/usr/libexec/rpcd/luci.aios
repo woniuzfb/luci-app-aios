@@ -57,13 +57,15 @@ sanitize_id() {
 }
 
 resolve_core_bin() {
-	local bin configured cand cands fallback
-	bin="$(uci_get main.core_bin '')"
-	if [ -n "$bin" ]; then
-		echo "$bin"
-		return 0
+	local pref="${1:-}" bin configured cand cands fallback
+	if [ -z "$pref" ] || [ "$pref" = "auto" ]; then
+		bin="$(uci_get main.core_bin '')"
+		if [ -n "$bin" ]; then
+			echo "$bin"
+			return 0
+		fi
 	fi
-	configured="$(uci_get main.core_type auto)"
+	configured="${pref:-$(uci_get main.core_type auto)}"
 	case "$configured" in
 		v2ray)
 			cands="/usr/bin/aios-v2ray /usr/bin/v2ray /usr/bin/aios-xray /usr/bin/xray"
@@ -219,7 +221,7 @@ rpc_preflight_check() {
 	for line in $fw_list; do
 		[ -n "$line" ] && json_add_string "" "检测到第三方透明代理防火墙规则: ${line}"
 	done
-	if ip rule show 2>/dev/null | grep -q "lookup ${table}\b"; then
+	if ip rule show 2>/dev/null | grep -Eq "lookup ${table}([[:space:]]|$)"; then
 		if [ ! -f "${RUNTIME_DIR}/aios_active" ]; then
 			json_add_string "" "路由表 ${table} 已被其他 ip rule 占用"
 		fi
@@ -306,11 +308,13 @@ rpc_firewall_inspect() {
 }
 
 rpc_firewall_action() {
-	local input action backend mark table
+	local input action backend mark table mode err
+	local route_state="${RUNTIME_DIR}/last_route_state"
 	read -r input
 	json_load "$input"
 	json_get_var action "action"
 	backend="$(detect_fw_backend)"
+	mode="$(uci_get main_tproxy.tproxy_mode tproxy)"
 	mark="$(uci_get main_tproxy.tproxy_mark 0x3a01)"
 	table="$(uci_get main_tproxy.route_table 166)"
 
@@ -318,32 +322,81 @@ rpc_firewall_action() {
 		apply)
 			mkdir -p "$RUNTIME_DIR"
 			if [ "$backend" = "nftables" ] && command -v nft >/dev/null 2>&1; then
+				# Always flush previous policy routing first (including when switching to redirect)
 				ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
 				ip route del local default dev lo table "$table" 2>/dev/null || true
-				ip rule add fwmark "$mark" lookup "$table"
-				ip route add local default dev lo table "$table"
-				/usr/bin/utpl /usr/share/aios/firewall/fw4_nft.ut > "${RUNTIME_DIR}/fw4_01_aios.nft"
+				ip -6 rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+				ip -6 route del local default dev lo table "$table" 2>/dev/null || true
+				if [ -s "$route_state" ]; then
+					local pm pt
+					read -r pm pt < "$route_state" 2>/dev/null || true
+					if [ -n "$pm" ] && [ -n "$pt" ]; then
+						ip rule del fwmark "$pm" lookup "$pt" 2>/dev/null || true
+						ip route del local default dev lo table "$pt" 2>/dev/null || true
+						ip -6 rule del fwmark "$pm" lookup "$pt" 2>/dev/null || true
+						ip -6 route del local default dev lo table "$pt" 2>/dev/null || true
+					fi
+					rm -f "$route_state"
+				fi
+				if [ "$mode" != "redirect" ]; then
+					printf '%s %s\n' "$mark" "$table" > "$route_state"
+					if ! err="$(ip rule add fwmark "$mark" lookup "$table" 2>&1 && ip route add local default dev lo table "$table" 2>&1)"; then
+						json_init; json_add_boolean "ok" 0; json_add_string "error" "IPv4 policy routing failed: ${err}"; json_dump; return
+					fi
+					ip -6 rule add fwmark "$mark" lookup "$table" 2>/dev/null || true
+					ip -6 route add local default dev lo table "$table" 2>/dev/null || true
+				fi
+				if ! err="$(/usr/bin/utpl /usr/share/aios/firewall/fw4_nft.ut 2>&1 > "${RUNTIME_DIR}/fw4_01_aios.nft.tmp")"; then
+					rm -f "${RUNTIME_DIR}/fw4_01_aios.nft.tmp"
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "utpl render failed: ${err}"; json_dump; return
+				fi
+				mv -f "${RUNTIME_DIR}/fw4_01_aios.nft.tmp" "${RUNTIME_DIR}/fw4_01_aios.nft"
 				nft delete table inet aios 2>/dev/null || true
-				nft -f "${RUNTIME_DIR}/fw4_01_aios.nft"
+				if ! err="$(nft -f "${RUNTIME_DIR}/fw4_01_aios.nft" 2>&1)"; then
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "nft apply failed: ${err}"; json_dump; return
+				fi
 				[ -x /usr/share/aios/firewall/gateway.uc ] && /usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1 || true
 			elif [ "$backend" = "iptables" ] && [ -x /usr/share/aios/firewall/fw3_ipt.sh ]; then
-				/usr/share/aios/firewall/fw3_ipt.sh restart
+				if ! err="$(/usr/share/aios/firewall/fw3_ipt.sh restart 2>&1)"; then
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "fw3_ipt.sh failed: ${err}"; json_dump; return
+				fi
 			fi
-			printf '{"ok":true,"action":"apply","backend":"%s"}\n' "$backend"
+			json_init
+			json_add_boolean "ok" 1
+			json_add_string "action" "apply"
+			json_add_string "backend" "$backend"
+			json_dump
 			;;
 		flush)
 			ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
 			ip route del local default dev lo table "$table" 2>/dev/null || true
 			ip -6 rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
 			ip -6 route del local default dev lo table "$table" 2>/dev/null || true
+			if [ -s "$route_state" ]; then
+				local pm pt
+				read -r pm pt < "$route_state" 2>/dev/null || true
+				if [ -n "$pm" ] && [ -n "$pt" ]; then
+					ip rule del fwmark "$pm" lookup "$pt" 2>/dev/null || true
+					ip route del local default dev lo table "$pt" 2>/dev/null || true
+					ip -6 rule del fwmark "$pm" lookup "$pt" 2>/dev/null || true
+					ip -6 route del local default dev lo table "$pt" 2>/dev/null || true
+				fi
+				rm -f "$route_state"
+			fi
 			command -v nft >/dev/null 2>&1 && nft delete table inet aios 2>/dev/null || true
 			[ -x /usr/share/aios/firewall/fw3_ipt.sh ] && /usr/share/aios/firewall/fw3_ipt.sh stop >/dev/null 2>&1 || true
 			rm -f "${RUNTIME_DIR}"/fw4_*.nft
-			printf '{"ok":true,"action":"flush","backend":"%s"}\n' "$backend"
+			json_init
+			json_add_boolean "ok" 1
+			json_add_string "action" "flush"
+			json_add_string "backend" "$backend"
+			json_dump
 			;;
 		refresh_gateway)
 			if command -v ucode >/dev/null 2>&1 && [ -x /usr/share/aios/firewall/gateway.uc ]; then
-				/usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1
+				if ! err="$(/usr/bin/ucode /usr/share/aios/firewall/gateway.uc 2>&1)"; then
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "gateway.uc failed: ${err}"; json_dump; return
+				fi
 			fi
 			echo '{"ok":true,"action":"refresh_gateway"}'
 			;;
@@ -354,13 +407,21 @@ rpc_firewall_action() {
 }
 
 rpc_validate_config() {
-	local input config_json bin core_type fmt asset tmp out code
+	local input config_json req_core_type req_fmt req_bin bin core_type fmt asset tmp out code
 	read -r input
 	json_load "$input"
 	json_get_var config_json "config"
-	bin="$(resolve_core_bin)"
-	core_type="$(detect_core_type "$(uci_get main.core_type auto)" "$bin")"
-	fmt="$(uci_get main.v2ray_format jsonv4)"
+	json_get_var req_core_type "core_type"
+	json_get_var req_fmt "v2ray_format"
+	json_get_var req_bin "core_bin"
+
+	bin=""
+	if [ -n "$req_bin" ] && is_allowed_core_bin "$req_bin" "$(uci_get main.bins_dir '')"; then
+		bin="$req_bin"
+	fi
+	[ -n "$bin" ] || bin="$(resolve_core_bin "$req_core_type")"
+	core_type="$(detect_core_type "${req_core_type:-$(uci_get main.core_type auto)}" "$bin")"
+	fmt="${req_fmt:-$(uci_get main.v2ray_format jsonv4)}"
 	asset="$(resolve_asset_dir)"
 
 	if [ ! -x "$bin" ]; then
@@ -415,7 +476,7 @@ rpc_stats() {
 		if command -v wget >/dev/null 2>&1; then
 			local url="http://${LOOPBACK_ADDR}:${metrics_port}/debug/vars"
 			out="$(wget -qO- -T 2 "$url" 2>/dev/null)"
-			if [ -n "$out" ]; then
+			if [ -n "$out" ] && jshn -r "$out" >/dev/null 2>&1; then
 				printf '{"source":"metrics","core":"xray","data":%s}\n' "$out"
 				return
 			fi
@@ -425,7 +486,17 @@ rpc_stats() {
 	if [ -x "$bin" ]; then
 		out="$("$bin" api statsquery --server="${LOOPBACK_ADDR}:${api_port}" 2>/dev/null)"
 		if [ -n "$out" ]; then
-			printf '{"source":"api","core":"%s","data":%s}\n' "$core_type" "$out"
+			if jshn -r "$out" >/dev/null 2>&1; then
+				printf '{"source":"api","core":"%s","data":%s}\n' "$core_type" "$out"
+			else
+				json_init
+				json_add_string "source" "api"
+				json_add_string "core" "$core_type"
+				json_add_object "data"
+				json_add_string "raw" "$out"
+				json_close_object
+				json_dump
+			fi
 			return
 		fi
 	fi
@@ -460,7 +531,8 @@ rpc_list_presets() {
 	printf '{"presets":['
 	local first=1 f
 	for f in "${PRESETS_DIR}"/*.json; do
-		[ -f "$f" ] || continue
+		[ -s "$f" ] || continue
+		jshn -R "$f" >/dev/null 2>&1 || continue
 		[ "$first" = "0" ] && printf ','
 		first=0
 		cat "$f"
@@ -479,8 +551,13 @@ rpc_save_preset() {
 		echo '{"ok":false,"error":"invalid id or payload"}'
 		return
 	fi
+	if ! jshn -r "$payload" >/dev/null 2>&1; then
+		echo '{"ok":false,"error":"preset payload is not valid JSON"}'
+		return
+	fi
 	mkdir -p "$PRESETS_DIR"
-	printf '%s\n' "$payload" > "${PRESETS_DIR}/${safe_id}.json"
+	printf '%s\n' "$payload" > "${PRESETS_DIR}/${safe_id}.json.tmp"
+	mv -f "${PRESETS_DIR}/${safe_id}.json.tmp" "${PRESETS_DIR}/${safe_id}.json"
 	printf '{"ok":true,"id":"%s"}\n' "$safe_id"
 }
 
@@ -534,19 +611,38 @@ rpc_read_log() {
 }
 
 rpc_service_action() {
-	local input action
+	local input action out code
 	read -r input
 	json_load "$input"
 	json_get_var action "action"
 	case "$action" in
-		start|stop|restart|reload)
-			/etc/init.d/aios "$action" >/dev/null 2>&1
-			printf '{"ok":true,"action":"%s"}\n' "$action"
+		start)
+			out="$(/etc/init.d/aios start_manual 2>&1)"
+			code=$?
+			;;
+		restart|reload)
+			out="$(FORCE_START=1 /etc/init.d/aios "$action" 2>&1)"
+			code=$?
+			;;
+		stop)
+			out="$(/etc/init.d/aios stop 2>&1)"
+			code=$?
 			;;
 		*)
 			echo '{"ok":false,"error":"unsupported action"}'
+			return
 			;;
 	esac
+	json_init
+	if [ "$code" -eq 0 ]; then
+		json_add_boolean "ok" 1
+		json_add_string "action" "$action"
+	else
+		json_add_boolean "ok" 0
+		json_add_string "action" "$action"
+		json_add_string "error" "${out:-service action failed (exit ${code})}"
+	fi
+	json_dump
 }
 
 rpc_list_cores() {
@@ -560,7 +656,10 @@ rpc_list_cores() {
 	avail_kb=0
 	if [ -n "$bins_dir" ]; then
 		local probe_dir="$bins_dir"
-		[ -d "$probe_dir" ] || probe_dir="$(dirname "$probe_dir")"
+		while [ -n "$probe_dir" ] && [ ! -d "$probe_dir" ] && [ "$probe_dir" != "/" ]; do
+			probe_dir="$(dirname "$probe_dir")"
+		done
+		[ -d "$probe_dir" ] || probe_dir="/"
 		avail_kb="$(df -Pk "$probe_dir" 2>/dev/null | awk 'NR>1 {val=$(NF-2)} END {print val+0}')"
 		avail_kb="${avail_kb:-0}"
 	fi
@@ -771,11 +870,12 @@ rpc_remove_core() {
 		echo '{"ok":false,"error":"slot not found"}'
 		return 0
 	fi
-	active_bin="$(uci_get main.core_bin '')"
-	active_real="$active_bin"
-	[ -L "$active_bin" ] && active_real="$(readlink -f "$active_bin" 2>/dev/null || echo "$active_bin")"
+	local real_target_dir
+	real_target_dir="$(readlink -f "$target_dir" 2>/dev/null || echo "$target_dir")"
+	active_bin="$(resolve_core_bin)"
+	active_real="$(readlink -f "$active_bin" 2>/dev/null || echo "$active_bin")"
 	case "$active_real" in
-		"${target_dir}"/*)
+		"${real_target_dir}"/*)
 			echo '{"ok":false,"error":"cannot remove currently active core slot"}'
 			return 0
 			;;
@@ -815,7 +915,7 @@ rpc_stop_conflicting_services() {
 
 case "$1" in
 	list)
-		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"},"listCores":{},"installCore":{"core":"String","tag":"String","mirror":"String"},"installStatus":{},"switchCore":{"path":"String","compiled_json":"String"},"removeCore":{"id":"String"},"stopConflictingServices":{"services":"String"}}'
+		printf '%s\n' '{"coreInfo":{},"serviceStatus":{},"preflightCheck":{},"firewallInspect":{},"firewallAction":{"action":"String"},"validateConfig":{"config":"String","core_type":"String","v2ray_format":"String","core_bin":"String"},"stats":{},"keyGen":{"kind":"String"},"listPresets":{},"savePreset":{"id":"String","payload":"String"},"deletePreset":{"id":"String"},"writeCompiledConfig":{"content":"String"},"readCompiledConfig":{},"readLog":{},"serviceAction":{"action":"String"},"listCores":{},"installCore":{"core":"String","tag":"String","mirror":"String"},"installStatus":{},"switchCore":{"path":"String","compiled_json":"String"},"removeCore":{"id":"String"},"stopConflictingServices":{"services":"String"}}'
 		;;
 	call)
 		case "$2" in

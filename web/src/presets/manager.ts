@@ -127,11 +127,10 @@ export function applyPresetToConfig(
       (o) => !['freedom', 'blackhole', 'dns', 'loopback'].includes(o.protocol)
     );
     const existingTags = new Set(next.outbounds.map((o) => o.tag));
-    for (const ob of userProxyOutbounds) {
-      if (!existingTags.has(ob.tag)) {
-        next.outbounds.unshift(JSON.parse(JSON.stringify(ob)));
-      }
-    }
+    const preserved = userProxyOutbounds
+      .filter((ob) => !existingTags.has(ob.tag))
+      .map((ob) => JSON.parse(JSON.stringify(ob)));
+    next.outbounds = [...preserved, ...next.outbounds];
   }
   return next;
 }

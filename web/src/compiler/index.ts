@@ -105,14 +105,83 @@ function parseSecondsNumber(value: number | string | undefined): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function isValidCron5(raw: string): boolean {
+  const fields = raw.trim().split(/\s+/).filter(Boolean);
+  return fields.length === 5;
+}
+
+function isPrivateIpv4Bytes(a: number, b: number): boolean {
+  if (a === 10 || a === 127 || a === 0) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 169 && b === 254) return true;
+  return false;
+}
+
+function isPublicTargetAddress(addr: string): boolean {
+  const s = addr.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  if (!s) return false;
+  if (s === 'localhost' || s.endsWith('.local') || s.endsWith('.lan') || s.endsWith('.internal')) return false;
+  if (!s.includes(':') && !s.includes('.')) return false;
+  const parts = s.split('.');
+  if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
+    const nums = parts.map(Number);
+    if (nums.some((n) => n > 255)) return false;
+    return !isPrivateIpv4Bytes(nums[0], nums[1]);
+  }
+  if (s.includes(':')) {
+    const mapped = s.match(/^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (mapped) {
+      return !isPrivateIpv4Bytes(Number(mapped[1]), Number(mapped[2]));
+    }
+    const bytes = parseIpv6ToBytes(s);
+    if (bytes) {
+      const allZero = bytes.every((x) => x === 0);
+      const isLoopback = bytes.slice(0, 15).every((x) => x === 0) && bytes[15] === 1;
+      const isUla = (bytes[0] & 0xfe) === 0xfc; // fc00::/7
+      const isLinkLocal = bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80; // fe80::/10
+      return !(allZero || isLoopback || isUla || isLinkLocal);
+    }
+    return true;
+  }
+  return true;
+}
+
+function parseIpv6ToBytes(ip: string): number[] | null {
+  const halves = ip.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  if (halves.length === 1 && missing !== 0) return null;
+  if (halves.length === 2 && missing <= 0) return null;
+  const groups = [...left, ...Array(Math.max(0, missing)).fill('0'), ...right];
+  if (groups.length !== 8) return null;
+  const bytes: number[] = [];
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    const val = Number.parseInt(g, 16);
+    bytes.push((val >> 8) & 0xff, val & 0xff);
+  }
+  return bytes;
+}
+
 function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null {
   const [addr, prefixStr] = cidr.trim().split('/');
   if (!addr) return null;
+  if (addr.includes(':')) {
+    const bytes = parseIpv6ToBytes(addr);
+    const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 128;
+    if (bytes && Number.isFinite(prefix) && prefix >= 0 && prefix <= 128) {
+      return { ip: bytes, prefix };
+    }
+    return null;
+  }
   const parts = addr.split('.');
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
     const bytes = parts.map((p) => Number(p));
-    const prefix = prefixStr !== undefined ? Number(prefixStr) : 32;
-    if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix)) {
+    const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 32;
+    if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix) && prefix >= 0 && prefix <= 32) {
       return { ip: bytes, prefix };
     }
   }
@@ -187,7 +256,7 @@ function buildStreamSettings(
     security = 'tls';
   }
 
-  for (const issue of validateStreamCombination(core, 'jsonv4', protocol, net, security)) {
+  for (const issue of validateStreamCombination(core, 'jsonv4', protocol, net, security, isInbound ? 'inbound' : 'outbound')) {
     diagnostics.push({ level: issue.level, path: `${pathPrefix}.streamSettings`, message: issue.message });
   }
 
@@ -581,6 +650,7 @@ function compileInbound(
 
   let proto = item.protocol || 'socks';
   if (isXray && proto === 'dokodemo-door' && item.use_tunnel) proto = 'tunnel';
+  if (isXray && proto === 'hysteria2') proto = 'hysteria';
   if (!isXray && proto === 'tunnel') proto = 'dokodemo-door';
   if (!isXray && proto === 'hysteria') proto = 'hysteria2';
 
@@ -634,12 +704,18 @@ function compileInbound(
     if (item.dokodemo_port) s.port = item.dokodemo_port;
     obj.settings = s;
   } else if (proto === 'tunnel') {
-    const s: Record<string, unknown> = {
-      allowedNetwork: item.dokodemo_network || 'tcp,udp',
-      followRedirect: !!item.dokodemo_follow_redirect
-    };
-    if (item.dokodemo_address) s.rewriteAddress = item.dokodemo_address;
-    if (item.dokodemo_port) s.rewritePort = item.dokodemo_port;
+    const useRewrite = xrayFeatures?.hasDnsRewriteKeys !== false;
+    const s: Record<string, unknown> = useRewrite
+      ? {
+          allowedNetwork: item.dokodemo_network || 'tcp,udp',
+          followRedirect: !!item.dokodemo_follow_redirect
+        }
+      : {
+          network: item.dokodemo_network || 'tcp,udp',
+          followRedirect: !!item.dokodemo_follow_redirect
+        };
+    if (item.dokodemo_address) s[useRewrite ? 'rewriteAddress' : 'address'] = item.dokodemo_address;
+    if (item.dokodemo_port) s[useRewrite ? 'rewritePort' : 'port'] = item.dokodemo_port;
     const portMap = kvToMap(item.tunnel_port_map);
     if (portMap) s.portMap = portMap;
     if (item.tunnel_user_level !== undefined) s.userLevel = item.tunnel_user_level;
@@ -680,11 +756,29 @@ function compileInbound(
     if (!isXray && item.packet_encoding) s.packetEncoding = item.packet_encoding;
     obj.settings = s;
   } else if (proto === 'shadowsocks') {
+    const ssMethod = item.method || 'aes-256-gcm';
+    if (!isXray && ssMethod.startsWith('2022-blake3-')) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}.method`,
+        message: `V2Ray jsonv4 的 shadowsocks 入站不支持 "${ssMethod}"。`
+      });
+      return null;
+    }
     const s: Record<string, unknown> = {
-      method: item.method || 'aes-256-gcm',
-      password: item.password || '',
+      method: ssMethod,
       network: item.ss_network || 'tcp,udp'
     };
+    if (isXray && userList) {
+      s[useInboundUsers ? 'users' : 'clients'] = userList.map((u) => ({
+        method: ssMethod,
+        password: u.password || '',
+        email: u.email || undefined,
+        level: u.level ?? 0
+      }));
+    } else {
+      s.password = item.password || '';
+    }
     if (!isXray && item.packet_encoding) s.packetEncoding = item.packet_encoding;
     obj.settings = s;
   } else if (proto === 'hysteria' && isXray) {
@@ -699,7 +793,6 @@ function compileInbound(
   } else if (proto === 'wireguard' && isXray) {
     obj.settings = {
       secretKey: item.wg_secret_key || '',
-      address: item.wg_address || [],
       peers: item.wg_peers || [],
       mtu: item.wg_mtu || 1420
     };
@@ -752,13 +845,16 @@ function compileInbound(
   if (item.sniffing_enabled) {
     const sn: Record<string, unknown> = {
       enabled: true,
-      destOverride: item.sniffing_dest_override || ['http', 'tls'],
+      destOverride:
+        item.sniffing_dest_override && item.sniffing_dest_override.length > 0
+          ? item.sniffing_dest_override
+          : ['http', 'tls'],
       metadataOnly: !!item.sniffing_metadata_only
     };
-    if (item.sniffing_domains_excluded && item.sniffing_domains_excluded.length > 0) {
-      sn.domainsExcluded = item.sniffing_domains_excluded;
-    }
     if (isXray) {
+      if (item.sniffing_domains_excluded && item.sniffing_domains_excluded.length > 0) {
+        sn.domainsExcluded = item.sniffing_domains_excluded;
+      }
       sn.routeOnly = !!item.sniffing_route_only;
       if (item.sniffing_ips_excluded && item.sniffing_ips_excluded.length > 0) {
         sn.ipsExcluded = item.sniffing_ips_excluded;
@@ -868,17 +964,28 @@ function compileOutbound(
     obj.settings = { response: { type: item.blackhole_response || 'none' } };
   } else if (proto === 'dns') {
     const s: Record<string, unknown> = {};
-    if (isXray) {
+    if (isXray && xrayFeatures?.hasDnsRewriteKeys !== false) {
       if (item.dns_network) s.rewriteNetwork = item.dns_network;
       if (item.dns_address) s.rewriteAddress = item.dns_address;
       if (item.dns_port) s.rewritePort = item.dns_port;
-      if (item.dns_non_ip_query) s.nonIPQuery = item.dns_non_ip_query;
       const rules = parseJsonArrayChecked(item.dns_rules_json, diagnostics, `outbounds.${item.tag}.dns_rules_json`);
-      if (rules) s.rules = rules;
+      if (rules && rules.length > 0) {
+        s.rules = rules;
+        if (item.dns_non_ip_query) {
+          diagnostics.push({
+            level: 'warning',
+            path: `outbounds.${item.tag}.dns_non_ip_query`,
+            message: 'Xray DNS 出站已配置 rules，已自动忽略互斥的旧字段 nonIPQuery。'
+          });
+        }
+      } else if (item.dns_non_ip_query) {
+        s.nonIPQuery = item.dns_non_ip_query;
+      }
     } else {
       if (item.dns_network) s.network = item.dns_network;
       if (item.dns_address) s.address = item.dns_address;
       if (item.dns_port) s.port = item.dns_port;
+      if (isXray && item.dns_non_ip_query) s.nonIPQuery = item.dns_non_ip_query;
     }
     obj.settings = s;
   } else if (proto === 'loopback') {
@@ -900,6 +1007,19 @@ function compileOutbound(
     }
     obj.settings = s;
   } else if (proto === 'vless') {
+    if (
+      isXray &&
+      xrayFeatures?.requireTlsPublicVlessTrojan &&
+      (!item.security || item.security === 'none') &&
+      (!item.encryption || item.encryption === 'none') &&
+      isPublicTargetAddress(item.address || '')
+    ) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}.security`,
+        message: `Xray ${xrayFeatures.version} 禁止对公网地址 (${item.address}) 使用无 TLS 且无加密的明文 VLESS 出站。`
+      });
+    }
     if (!isXray && item.flow) {
       diagnostics.push({
         level: 'warning',
@@ -968,6 +1088,18 @@ function compileOutbound(
       };
     }
   } else if (proto === 'trojan') {
+    if (
+      isXray &&
+      xrayFeatures?.requireTlsPublicVlessTrojan &&
+      (!item.security || item.security === 'none') &&
+      isPublicTargetAddress(item.address || '')
+    ) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}.security`,
+        message: `Xray ${xrayFeatures.version} 禁止对公网地址 (${item.address}) 使用无 TLS 的 Trojan 出站。`
+      });
+    }
     if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
@@ -988,28 +1120,41 @@ function compileOutbound(
       obj.settings = { servers: [srv] };
     }
   } else if (proto === 'shadowsocks') {
+    const ssMethod = item.method || 'aes-256-gcm';
+    if (!isXray && ssMethod.startsWith('2022-blake3-')) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}.method`,
+        message: `V2Ray jsonv4 的 shadowsocks 协议不支持 "${ssMethod}"，请切换 jsonv5 并使用 shadowsocks2022 协议。`
+      });
+      return null;
+    }
     if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 8388,
-        method: item.method || 'aes-256-gcm',
+        method: ssMethod,
         password: item.password || ''
       };
       if (item.email) s.email = item.email;
       if (item.user_level !== undefined) s.level = item.user_level;
-      if (item.ss_uot) s.uot = true;
-      if (item.ss_uot_version) s.UoTVersion = item.ss_uot_version;
+      if (xrayFeatures?.hasSsUot) {
+        if (item.ss_uot) s.uot = true;
+        if (item.ss_uot_version) s.UoTVersion = item.ss_uot_version;
+      }
       obj.settings = s;
     } else {
       const srv: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 8388,
-        method: item.method || 'aes-256-gcm',
+        method: ssMethod,
         password: item.password || ''
       };
       if (!isXray && item.ss_iv_check) srv.ivCheck = true;
-      if (isXray && item.ss_uot) srv.uot = true;
-      if (isXray && item.ss_uot_version) srv.UoTVersion = item.ss_uot_version;
+      if (isXray && xrayFeatures?.hasSsUot) {
+        if (item.ss_uot) srv.uot = true;
+        if (item.ss_uot_version) srv.UoTVersion = item.ss_uot_version;
+      }
       obj.settings = { servers: [srv] };
     }
   } else if (proto === 'hysteria') {
@@ -1187,8 +1332,27 @@ export function compileConfig(
   if (isXray) {
     const envMap = kvToMap(cfg.general.inline_env);
     if (envMap) doc.env = envMap;
-    if (cfg.general.geodata_reload_interval) {
-      doc.geodata = { reloadInterval: cfg.general.geodata_reload_interval };
+    const rawCron = (cfg.general.geodata_cron || cfg.general.geodata_reload_interval || '').trim();
+    const gdCron = isValidCron5(rawCron) ? rawCron : '';
+    if (rawCron && !gdCron) {
+      diagnostics.push({
+        level: 'warning',
+        path: 'general.geodata_cron',
+        message: `已忽略非 5 段 Cron 格式的 geodata 值 "${rawCron}"（Xray geodata.cron 需 5 段 Cron 表达式，如 "0 4 * * *"）。`
+      });
+    }
+    const gdOut = (cfg.general.geodata_outbound || '').trim();
+    const gdAssets = parseJsonArrayChecked(
+      cfg.general.geodata_assets_json,
+      diagnostics,
+      'general.geodata_assets_json'
+    );
+    if ((gdCron || gdOut || (gdAssets && gdAssets.length > 0)) && xrayFeatures?.hasGeodataCron !== false) {
+      const gd: Record<string, unknown> = {};
+      if (gdCron) gd.cron = gdCron;
+      if (gdOut) gd.outbound = gdOut;
+      if (gdAssets && gdAssets.length > 0) gd.assets = gdAssets;
+      doc.geodata = gd;
     }
     if (cfg.general.min_version || cfg.general.max_version) {
       const ver: Record<string, string> = {};
@@ -1354,22 +1518,13 @@ export function compileConfig(
 
     const balancers = cfg.balancers.map((b) => {
       let strat = b.strategy;
-      if (!isXray) {
-        if (strat === 'roundRobin') {
-          strat = 'random';
-          diagnostics.push({
-            level: 'warning',
-            path: `balancers.${b.tag}`,
-            message: 'V2Ray 不支持 roundRobin，已自动降级为 random。'
-          });
-        } else if (strat === 'leastLoad') {
-          strat = 'leastPing';
-          diagnostics.push({
-            level: 'warning',
-            path: `balancers.${b.tag}`,
-            message: 'V2Ray jsonv4 不支持 leastLoad，已自动降级为 leastPing。'
-          });
-        }
+      if (!isXray && strat === 'roundRobin') {
+        strat = 'random';
+        diagnostics.push({
+          level: 'warning',
+          path: `balancers.${b.tag}`,
+          message: 'V2Ray 不支持 roundRobin，已自动降级为 random。'
+        });
       }
       const strategyObj: Record<string, unknown> = { type: strat };
       if (isXray && strat === 'leastLoad') {
@@ -1387,7 +1542,7 @@ export function compileConfig(
         selector: b.selector,
         strategy: strategyObj
       };
-      if (isXray && b.fallback_tag) out.fallbackTag = b.fallback_tag;
+      if (b.fallback_tag) out.fallbackTag = b.fallback_tag;
       return out;
     });
 

@@ -27,6 +27,9 @@ class ProtoReader {
 
   readBytes(): Uint8Array {
     const len = this.readVarint();
+    if (len < 0 || this.pos + len > this.buf.length) {
+      throw new Error(`Invalid protobuf length ${len} at offset ${this.pos}`);
+    }
     const slice = this.buf.subarray(this.pos, this.pos + len);
     this.pos += len;
     return slice;
@@ -34,9 +37,17 @@ class ProtoReader {
 
   skip(wireType: number): void {
     if (wireType === 0) this.readVarint();
-    else if (wireType === 1) this.pos += 8;
-    else if (wireType === 2) this.readBytes();
-    else if (wireType === 5) this.pos += 4;
+    else if (wireType === 1) {
+      if (this.pos + 8 > this.buf.length) throw new Error('Unexpected EOF skipping 64-bit field');
+      this.pos += 8;
+    } else if (wireType === 2) {
+      this.readBytes();
+    } else if (wireType === 5) {
+      if (this.pos + 4 > this.buf.length) throw new Error('Unexpected EOF skipping 32-bit field');
+      this.pos += 4;
+    } else {
+      throw new Error(`Unsupported protobuf wireType: ${wireType}`);
+    }
   }
 }
 

@@ -34,6 +34,7 @@ const coreInfo = ref<CoreInfo | null>(null);
 const serviceStatus = ref<ServiceStatus | null>(null);
 const preflight = ref<PreflightResult | null>(null);
 const toast = ref('');
+const toastType = ref<'ok' | 'error'>('ok');
 const theme = ref<'dark' | 'light'>(
   (localStorage.getItem('aios_theme') as 'dark' | 'light') || 'dark'
 );
@@ -107,8 +108,9 @@ function toggleTheme() {
   applyTheme(theme.value === 'dark' ? 'light' : 'dark');
 }
 
-function notify(msg: string) {
+function notify(msg: string, isError?: boolean) {
   toast.value = msg;
+  toastType.value = (isError ?? /(失败|错误|阻止|异常|无法)/.test(msg)) ? 'error' : 'ok';
   setTimeout(() => {
     if (toast.value === msg) toast.value = '';
   }, 4000);
@@ -257,10 +259,20 @@ async function handleStopConflictsOnly() {
   }
 }
 
+function closeConflictModal() {
+  if (conflictActionBusy.value) return;
+  showConflictModal.value = false;
+  pendingAction.value = null;
+}
+
 async function handleSavePreset(preset: AiosPreset) {
-  await api.saveUserPreset(preset);
-  userPresets.value = await api.listUserPresets();
-  notify(`已将当前设置保存为预设「${preset.name}」`);
+  try {
+    await api.saveUserPreset(preset);
+    userPresets.value = await api.listUserPresets();
+    notify(`已将当前设置保存为预设「${preset.name}」`);
+  } catch (e) {
+    notify(`保存预设失败: ${String(e)}`);
+  }
 }
 
 async function handleQuickSavePreset() {
@@ -276,9 +288,13 @@ async function handleQuickSavePreset() {
 }
 
 async function handleDeletePreset(id: string) {
-  await api.deleteUserPreset(id);
-  userPresets.value = await api.listUserPresets();
-  notify('已删除自定义预设');
+  try {
+    await api.deleteUserPreset(id);
+    userPresets.value = await api.listUserPresets();
+    notify('已删除自定义预设');
+  } catch (e) {
+    notify(`删除预设失败: ${String(e)}`);
+  }
 }
 
 function handleApplyPreset(nextConfig: AiosConfig, presetName: string) {
@@ -288,9 +304,13 @@ function handleApplyPreset(nextConfig: AiosConfig, presetName: string) {
 
 onMounted(async () => {
   applyTheme(theme.value);
-  config.value = await api.loadConfig();
-  userPresets.value = await api.listUserPresets();
-  await refreshSystem();
+  try {
+    config.value = await api.loadConfig();
+    userPresets.value = await api.listUserPresets();
+    await refreshSystem();
+  } catch (e) {
+    notify(`初始化加载失败: ${String(e)}`);
+  }
 });
 </script>
 
@@ -389,7 +409,24 @@ onMounted(async () => {
 
       <div class="content-scroll">
         <section class="content">
-          <div v-if="toast" class="alert alert-ok">{{ toast }}</div>
+          <div v-if="toast" class="alert" :class="toastType === 'error' ? 'alert-err' : 'alert-ok'">{{ toast }}</div>
+
+          <div v-if="hasPreflightConflicts" class="alert alert-warn" style="margin-bottom: 16px">
+            <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 6px">
+              <strong>检测到外部代理或防火墙冲突风险</strong>
+              <button
+                v-if="preflight?.conflicting_services?.length"
+                class="btn btn-sm btn-danger"
+                :disabled="conflictActionBusy"
+                @click="handleStopConflictsOnly"
+              >
+                {{ conflictActionBusy ? '停止中...' : `停止冲突服务 (${preflight.conflicting_services.join(', ')})` }}
+              </button>
+            </div>
+            <ul style="margin: 0 0 0 18px; padding: 0">
+              <li v-for="(w, idx) in preflight?.warnings || []" :key="idx">{{ w }}</li>
+            </ul>
+          </div>
 
           <!-- General Tab -->
           <div v-if="activeTab === 'general'">
@@ -408,23 +445,6 @@ onMounted(async () => {
                   geoip: {{ coreInfo.has_geoip ? '✓' : '✗' }} · geosite: {{ coreInfo.has_geosite ? '✓' : '✗' }}
                 </div>
               </div>
-            </div>
-
-            <div v-if="hasPreflightConflicts" class="alert alert-warn" style="margin-bottom: 16px">
-              <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 6px">
-                <strong>检测到外部代理或防火墙冲突风险</strong>
-                <button
-                  v-if="preflight?.conflicting_services?.length"
-                  class="btn btn-sm btn-danger"
-                  :disabled="conflictActionBusy"
-                  @click="handleStopConflictsOnly"
-                >
-                  {{ conflictActionBusy ? '停止中...' : `停止冲突服务 (${preflight.conflicting_services.join(', ')})` }}
-                </button>
-              </div>
-              <ul style="margin: 0 0 0 18px; padding: 0">
-                <li v-for="(w, idx) in preflight?.warnings || []" :key="idx">{{ w }}</li>
-              </ul>
             </div>
 
             <div class="card">
@@ -520,8 +540,8 @@ onMounted(async () => {
                 <strong style="font-size: 13px">Xray 顶层扩展 (env / geodata / version)</strong>
                 <div class="grid-3">
                   <div class="field">
-                    <label>GeoData 自动重载间隔 (geodata.reloadInterval)</label>
-                    <input v-model="config.general.geodata_reload_interval" type="text" placeholder="如 1h / 24h" />
+                    <label>GeoData 自动更新计划 (geodata.cron)</label>
+                    <input v-model="config.general.geodata_cron" type="text" placeholder="如 0 4 * * *" />
                   </div>
                   <div class="field">
                     <label>最低内核版本要求 (version.min)</label>
@@ -602,6 +622,9 @@ onMounted(async () => {
             v-else-if="activeTab === 'tools'"
             :compiled="compiled"
             :api="api"
+            :core-type="effectiveCore"
+            :v2ray-format="config.general.v2ray_format"
+            :core-bin="config.general.core_bin"
           />
         </section>
       </div>
@@ -631,11 +654,11 @@ onMounted(async () => {
       </div>
     </div>
     <!-- Conflict Detection & Resolution Modal -->
-    <div v-if="showConflictModal && pendingPreflight" class="modal-backdrop" @click.self="showConflictModal = false">
+    <div v-if="showConflictModal && pendingPreflight" class="modal-backdrop" @click.self="closeConflictModal">
       <div class="modal">
         <div class="modal-header">
           <h3 class="modal-title">检测到系统代理 / 防火墙冲突</h3>
-          <button class="btn btn-sm" :disabled="conflictActionBusy" @click="showConflictModal = false">关闭</button>
+          <button class="btn btn-sm" :disabled="conflictActionBusy" @click="closeConflictModal">关闭</button>
         </div>
         <p class="hint" style="margin-bottom: 12px">
           启动前检测到同机存在其他代理服务、内核进程或第三方透明代理防火墙规则，直接启动可能导致流量黑洞或端口冲突：
@@ -672,7 +695,7 @@ onMounted(async () => {
           </ul>
         </div>
         <div class="row" style="justify-content: flex-end; margin-top: 16px">
-          <button class="btn" :disabled="conflictActionBusy" @click="showConflictModal = false">取消</button>
+          <button class="btn" :disabled="conflictActionBusy" @click="closeConflictModal">取消</button>
           <button class="btn" :disabled="conflictActionBusy" @click="handleConflictResolve('force')">
             忽略并强行启动
           </button>

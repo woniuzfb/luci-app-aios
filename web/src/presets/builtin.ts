@@ -56,8 +56,118 @@ function buildXrayDualStackTproxyPreset(): AiosPreset {
       sniffing_enabled: true,
       sniffing_dest_override: ['fakedns'],
       sniffing_metadata_only: true
-    }
+    },
+    {
+      id: 'tproxy_fakedns_udp4',
+      enabled: true,
+      alias: 'FakeDNS TProxy UDP4',
+      tag: 'tproxy-fakedns-udp4',
+      listen: '0.0.0.0',
+      port: 12357,
+      protocol: 'dokodemo-door',
+      use_tunnel: true,
+      dokodemo_network: 'udp',
+      dokodemo_follow_redirect: true,
+      transport: 'raw',
+      security: 'none',
+      sockopt_tproxy: 'tproxy',
+      sniffing_enabled: true,
+      sniffing_dest_override: ['fakedns'],
+      sniffing_metadata_only: true
+    },
+    {
+      id: 'tproxy_tcp6',
+      enabled: true,
+      alias: 'TProxy TCP IPv6',
+      tag: 'tproxy-tcp6',
+      listen: '::',
+      port: 12346,
+      protocol: 'dokodemo-door',
+      use_tunnel: true,
+      dokodemo_network: 'tcp',
+      dokodemo_follow_redirect: true,
+      transport: 'raw',
+      security: 'none',
+      sockopt_tproxy: 'tproxy',
+      sniffing_enabled: true,
+      sniffing_dest_override: ['http', 'tls']
+    },
+    {
+      id: 'tproxy_udp6',
+      enabled: true,
+      alias: 'TProxy UDP IPv6',
+      tag: 'tproxy-udp6',
+      listen: '::',
+      port: 12348,
+      protocol: 'dokodemo-door',
+      use_tunnel: true,
+      dokodemo_network: 'udp',
+      dokodemo_follow_redirect: true,
+      transport: 'raw',
+      security: 'none',
+      sockopt_tproxy: 'tproxy',
+      sniffing_enabled: true,
+      sniffing_dest_override: ['quic']
+    },
+    {
+      id: 'tproxy_fakedns_tcp6',
+      enabled: true,
+      alias: 'FakeDNS TProxy TCP6',
+      tag: 'tproxy-fakedns-tcp6',
+      listen: '::',
+      port: 12356,
+      protocol: 'dokodemo-door',
+      use_tunnel: true,
+      dokodemo_network: 'tcp',
+      dokodemo_follow_redirect: true,
+      transport: 'raw',
+      security: 'none',
+      sockopt_tproxy: 'tproxy',
+      sniffing_enabled: true,
+      sniffing_dest_override: ['fakedns'],
+      sniffing_metadata_only: true
+    },
+    {
+      id: 'tproxy_fakedns_udp6',
+      enabled: true,
+      alias: 'FakeDNS TProxy UDP6',
+      tag: 'tproxy-fakedns-udp6',
+      listen: '::',
+      port: 12358,
+      protocol: 'dokodemo-door',
+      use_tunnel: true,
+      dokodemo_network: 'udp',
+      dokodemo_follow_redirect: true,
+      transport: 'raw',
+      security: 'none',
+      sockopt_tproxy: 'tproxy',
+      sniffing_enabled: true,
+      sniffing_dest_override: ['fakedns'],
+      sniffing_metadata_only: true
+    },
+    ...[5350, 5351, 5352].map((port) => ({
+      id: `dns_in_${port}`,
+      enabled: true,
+      alias: `Dnsmasq DNS (${port})`,
+      tag: `dns-in-${port}`,
+      listen: '127.0.0.1',
+      port,
+      protocol: 'dokodemo-door' as const,
+      use_tunnel: true,
+      dokodemo_address: '1.1.1.1',
+      dokodemo_port: 53,
+      dokodemo_network: 'tcp,udp',
+      transport: 'raw',
+      security: 'none' as const
+    }))
   );
+  cfg.routing_rules.unshift({
+    id: 'rule_dns_dnsmasq',
+    enabled: true,
+    alias: 'Dnsmasq DNS -> dns-out',
+    inbound_tag: ['dns-in-5350', 'dns-in-5351', 'dns-in-5352'],
+    outbound_tag: 'dns-out'
+  });
   cfg.fakedns = [
     { id: 'fake_v4', ip_pool: '198.18.0.0/15', pool_size: 65535 },
     { id: 'fake_v6', ip_pool: '2001:2::/48', pool_size: 65535 }
@@ -103,6 +213,9 @@ function buildClassicSplitPreset(): AiosPreset {
   cfg.transparent_proxy.enabled = true;
   cfg.transparent_proxy.tproxy_port_tcp_v4 = 12345;
   cfg.transparent_proxy.tproxy_port_udp_v4 = 12345;
+  cfg.transparent_proxy.tproxy_port_tcp_v6 = 0;
+  cfg.transparent_proxy.tproxy_port_udp_v6 = 0;
+  cfg.transparent_proxy.tproxy_ifaces_v6 = [];
   cfg.transparent_proxy.fakedns_enabled = false;
   cfg.transparent_proxy.dynamic_direct_enabled = false;
 

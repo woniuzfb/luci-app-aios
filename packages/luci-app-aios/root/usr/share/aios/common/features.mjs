@@ -92,6 +92,11 @@ export function resolve_core_features(core, format, version) {
 			hasTunInbound: eval_rule(f.tunInbound, effective),
 			hasHysteria: eval_rule(f.hysteria, effective),
 			hasMasque: eval_rule(f.masque, effective),
+			hasDnsRewriteKeys: eval_rule(f.dnsRewriteKeys, effective),
+			hasGeodataCron: eval_rule(f.geodataCron, effective),
+			hasFreedomFinalRules: eval_rule(f.freedomFinalRules, effective),
+			hasSsUot: eval_rule(f.ssUot, effective),
+			requireTlsPublicVlessTrojan: eval_rule(f.requireTlsPublicVlessTrojan, effective),
 			thresholds: f
 		};
 	}

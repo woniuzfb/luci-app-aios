@@ -66,7 +66,11 @@ function build_inbound(item) {
 		if (type(fallbacks) === "array" && length(fallbacks) > 0) obj.settings.fallbacks = fallbacks;
 		if (item.packet_encoding) obj.settings.packetEncoding = item.packet_encoding;
 	} else if (proto === "shadowsocks") {
-		obj.settings = { method: item.method || "aes-256-gcm", password: item.password || "", network: item.ss_network || "tcp,udp" };
+		const ssMethod = item.method || "aes-256-gcm";
+		if (substr(ssMethod, 0, 12) === "2022-blake3-") {
+			die(`V2Ray jsonv4 的 shadowsocks 入站不支持 "${ssMethod}"。`);
+		}
+		obj.settings = { method: ssMethod, password: item.password || "", network: item.ss_network || "tcp,udp" };
 		if (item.packet_encoding) obj.settings.packetEncoding = item.packet_encoding;
 	} else if (proto === "hysteria2") {
 		obj.settings = {};
@@ -75,14 +79,11 @@ function build_inbound(item) {
 
 	if (item.sniffing_enabled === "1") {
 		const destOv = to_array(item.sniffing_dest_override);
-		let sn = {
+		obj.sniffing = {
 			enabled: true,
 			destOverride: length(destOv) > 0 ? destOv : ["http", "tls"],
 			metadataOnly: item.sniffing_metadata_only === "1"
 		};
-		const domEx = to_array(item.sniffing_domains_excluded);
-		if (length(domEx) > 0) sn.domainsExcluded = domEx;
-		obj.sniffing = sn;
 	}
 
 	if (item.allocate_strategy) {
@@ -93,7 +94,7 @@ function build_inbound(item) {
 		};
 	}
 
-	if (item.transport || item.security || item.sockopt_tproxy) {
+	if (item.transport || (item.security && item.security !== "none") || (item.sockopt_tproxy && item.sockopt_tproxy !== "off")) {
 		obj.streamSettings = build_stream_settings(item, "v2ray", true, null, proto);
 	}
 
@@ -124,7 +125,11 @@ function build_outbound(item, default_mark) {
 	} else if (proto === "trojan") {
 		obj.settings = { servers: [{ address: item.address || "", port: int(item.port || 443), password: item.password || "" }] };
 	} else if (proto === "shadowsocks") {
-		let srv = { address: item.address || "", port: int(item.port || 8388), method: item.method || "aes-256-gcm", password: item.password || "" };
+		const ssMethod = item.method || "aes-256-gcm";
+		if (substr(ssMethod, 0, 12) === "2022-blake3-") {
+			die(`V2Ray jsonv4 的 shadowsocks 出站不支持 "${ssMethod}"，请切换 jsonv5 并使用 shadowsocks2022 协议。`);
+		}
+		let srv = { address: item.address || "", port: int(item.port || 8388), method: ssMethod, password: item.password || "" };
 		if (item.ss_iv_check === "1") srv.ivCheck = true;
 		obj.settings = { servers: [srv] };
 	} else if (proto === "hysteria2") {
@@ -146,7 +151,8 @@ function build_outbound(item, default_mark) {
 	obj.streamSettings = build_stream_settings(item, "v2ray", false, mark, proto);
 
 	if (item.mux_enabled === "1") {
-		obj.mux = { enabled: true, concurrency: int(item.mux_concurrency || 8) };
+		const conc = item.mux_concurrency != null && item.mux_concurrency !== "" ? int(item.mux_concurrency) : 8;
+		obj.mux = { enabled: true, concurrency: conc };
 	}
 
 	const custom = parse_json_safe(item.custom_config);
@@ -230,16 +236,20 @@ export function compile_v2ray(cfg, opts) {
 			servers: servers
 		};
 		if (d.client_ip) doc.dns.clientIp = d.client_ip;
+		let hosts = {};
+		const raw_hosts = parse_json_safe(d.hosts_json);
+		if (type(raw_hosts) === "object") {
+			for (let k in raw_hosts) hosts[k] = raw_hosts[k];
+		}
 		const host_entries = parse_json_safe(d.host_entries_json);
 		if (type(host_entries) === "array" && length(host_entries) > 0) {
-			let hosts = {};
 			for (let h in host_entries) {
 				if (h && h.domain && type(h.addresses) === "array" && length(h.addresses) > 0) {
 					hosts[h.domain] = length(h.addresses) === 1 ? h.addresses[0] : h.addresses;
 				}
 			}
-			if (length(keys(hosts)) > 0) doc.dns.hosts = hosts;
 		}
+		if (length(keys(hosts)) > 0) doc.dns.hosts = hosts;
 	}
 
 	if (length(cfg.fakedns) > 0) {
@@ -276,8 +286,9 @@ export function compile_v2ray(cfg, opts) {
 		let balancers = map(cfg.balancers, b => {
 			let strat = b.strategy || "random";
 			if (strat === "roundRobin") strat = "random";
-			if (strat === "leastLoad") strat = "leastPing";
-			return { tag: b.tag, selector: to_array(b.selector), strategy: { type: strat } };
+			let out = { tag: b.tag, selector: to_array(b.selector), strategy: { type: strat } };
+			if (b.fallback_tag) out.fallbackTag = b.fallback_tag;
+			return out;
 		});
 		doc.routing = {
 			domainStrategy: r.domain_strategy || "IPIfNonMatch",
@@ -326,21 +337,56 @@ export function compile_v2ray(cfg, opts) {
 		if (ib.packet_encoding === "Stream" && !features.hasPacketEncodingStream) {
 			die(`V2Ray ${features.version} 不支持 packetEncoding="Stream"（需 >= ${th.packetEncodingStream?.since || "5.53.0"}）。`);
 		}
+		const parse_v4_cidr = (c) => {
+			const parts = split(trim(c || ""), "/");
+			const addr = parts[0] || "";
+			if (index(addr, ":") >= 0) {
+				const halves = split(addr, "::");
+				if (length(halves) > 2) return null;
+				const left = halves[0] ? split(halves[0], ":") : [];
+				const right = length(halves) === 2 && halves[1] ? split(halves[1], ":") : [];
+				const missing = 8 - (length(left) + length(right));
+				if (length(halves) === 1 && missing !== 0) return null;
+				if (length(halves) === 2 && missing <= 0) return null;
+				let groups = [];
+				for (let x in left) push(groups, x);
+				for (let i = 0; i < missing; i++) push(groups, "0");
+				for (let x in right) push(groups, x);
+				if (length(groups) !== 8) return null;
+				let bytes = [];
+				for (let g in groups) {
+					if (!match(g, /^[0-9a-fA-F]{1,4}$/)) return null;
+					const val = hex(g);
+					push(bytes, (val >> 8) & 0xff, val & 0xff);
+				}
+				if (length(parts) > 1 && parts[1] !== "" && !match(parts[1], /^[0-9]+$/)) return null;
+				const prefix = length(parts) > 1 && parts[1] !== "" ? int(parts[1]) : 128;
+				if (prefix < 0 || prefix > 128) return null;
+				return { ip: bytes, prefix: prefix };
+			}
+			const octets = split(addr, ".");
+			if (length(octets) !== 4) return null;
+			let bytes = [];
+			for (let o in octets) {
+				if (!match(o, /^[0-9]+$/)) return null;
+				const n = int(o);
+				if (n < 0 || n > 255) return null;
+				push(bytes, n);
+			}
+			if (length(parts) > 1 && parts[1] !== "" && !match(parts[1], /^[0-9]+$/)) return null;
+			const prefix = length(parts) > 1 && parts[1] !== "" ? int(parts[1]) : 32;
+			if (prefix < 0 || prefix > 32) return null;
+			return { ip: bytes, prefix: prefix };
+		};
 		let ips = [];
 		for (let c in to_array(ib.tun_ips)) {
-			const parts = split(trim(c || ""), "/");
-			const octets = split(parts[0] || "", ".");
-			if (length(octets) === 4) {
-				push(ips, { ip: map(octets, o => int(o)), prefix: length(parts) > 1 ? int(parts[1]) : 32 });
-			}
+			const parsed = parse_v4_cidr(c);
+			if (parsed) push(ips, parsed);
 		}
 		let routes = [];
 		for (let c in to_array(ib.tun_routes)) {
-			const parts = split(trim(c || ""), "/");
-			const octets = split(parts[0] || "", ".");
-			if (length(octets) === 4) {
-				push(routes, { ip: map(octets, o => int(o)), prefix: length(parts) > 1 ? int(parts[1]) : 32 });
-			}
+			const parsed = parse_v4_cidr(c);
+			if (parsed) push(routes, parsed);
 		}
 		let tunSvc = {
 			name: ib.tun_name || "aios0",
@@ -368,21 +414,30 @@ export function compile_v2ray(cfg, opts) {
 	const p = cfg.policy || {};
 	if (p.enabled === "1") {
 		let levels = {};
+		const num_or = (val, def) => (val != null && val !== "" ? int(val) : def);
 		const parsed_levels = parse_json_safe(p.policy_levels_json, "policy_levels_json");
 		if (type(parsed_levels) === "array" && length(parsed_levels) > 0) {
 			for (let lv in parsed_levels) {
-				levels[`${lv.level || "0"}`] = {
-					handshake: int(lv.handshake || 4),
-					connIdle: int(lv.conn_idle || 300),
-					uplinkOnly: int(lv.uplink_only || 2),
-					downlinkOnly: int(lv.downlink_only || 5),
-					bufferSize: int(lv.buffer_size || 4),
+				levels[`${lv.level != null && lv.level !== "" ? lv.level : "0"}`] = {
+					handshake: num_or(lv.handshake, 4),
+					connIdle: num_or(lv.conn_idle, 300),
+					uplinkOnly: num_or(lv.uplink_only, 2),
+					downlinkOnly: num_or(lv.downlink_only, 5),
+					bufferSize: num_or(lv.buffer_size, 4),
 					statsUserUplink: !!lv.stats_user_uplink,
 					statsUserDownlink: !!lv.stats_user_downlink
 				};
 			}
 		} else {
-			levels["0"] = { handshake: int(p.handshake || 4), connIdle: int(p.conn_idle || 300), uplinkOnly: int(p.uplink_only || 2), downlinkOnly: int(p.downlink_only || 5), bufferSize: int(p.buffer_size || 4) };
+			levels["0"] = {
+				handshake: num_or(p.handshake, 4),
+				connIdle: num_or(p.conn_idle, 300),
+				uplinkOnly: num_or(p.uplink_only, 2),
+				downlinkOnly: num_or(p.downlink_only, 5),
+				bufferSize: num_or(p.buffer_size, 4),
+				statsUserUplink: true,
+				statsUserDownlink: true
+			};
 		}
 		doc.policy = {
 			levels: levels,

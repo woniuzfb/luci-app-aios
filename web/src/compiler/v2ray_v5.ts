@@ -50,7 +50,7 @@ function toV5OutboundDomainStrategy(ds?: string): string | undefined {
     case 'AsIs':
       return 'AsIs';
     default:
-      return ds;
+      return 'AsIs';
   }
 }
 
@@ -151,14 +151,41 @@ function isIpLiteral(val: string): boolean {
   return /^(\d{1,3}\.){3}\d{1,3}$/.test(val) || val.includes(':');
 }
 
+function parseIpv6ToBytes(ip: string): number[] | null {
+  const halves = ip.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  if (halves.length === 1 && missing !== 0) return null;
+  if (halves.length === 2 && missing <= 0) return null;
+  const groups = [...left, ...Array(Math.max(0, missing)).fill('0'), ...right];
+  if (groups.length !== 8) return null;
+  const bytes: number[] = [];
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    const val = Number.parseInt(g, 16);
+    bytes.push((val >> 8) & 0xff, val & 0xff);
+  }
+  return bytes;
+}
+
 function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null {
   const [addr, prefixStr] = cidr.trim().split('/');
   if (!addr) return null;
+  if (addr.includes(':')) {
+    const bytes = parseIpv6ToBytes(addr);
+    const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 128;
+    if (bytes && Number.isFinite(prefix) && prefix >= 0 && prefix <= 128) {
+      return { ip: bytes, prefix };
+    }
+    return null;
+  }
   const parts = addr.split('.');
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
     const bytes = parts.map((p) => Number(p));
-    const prefix = prefixStr !== undefined ? Number(prefixStr) : 32;
-    if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix)) {
+    const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 32;
+    if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix) && prefix >= 0 && prefix <= 32) {
       return { ip: bytes, prefix };
     }
   }
@@ -182,8 +209,8 @@ function parseGeoIpEntry(raw: string): Record<string, unknown> {
     if (inverseMatch) obj.inverseMatch = true;
     return obj;
   }
-  if (item.startsWith('ext:')) {
-    const rest = item.slice(4);
+  if (item.startsWith('ext:') || item.startsWith('ext-ip:')) {
+    const rest = item.startsWith('ext-ip:') ? item.slice(7) : item.slice(4);
     const idx = rest.indexOf(':');
     const filePath = idx >= 0 ? rest.slice(0, idx) : 'geoip.dat';
     let code = idx >= 0 ? rest.slice(idx + 1) : rest;
@@ -305,7 +332,14 @@ function buildV5Stream(
     security = 'utls';
   }
 
-  for (const issue of validateStreamCombination('v2ray', 'jsonv5', protocol, transport, security)) {
+  for (const issue of validateStreamCombination(
+    'v2ray',
+    'jsonv5',
+    protocol,
+    transport,
+    security,
+    isInbound ? 'inbound' : 'outbound'
+  )) {
     diagnostics.push({ level: issue.level, path: `${pathPrefix}.streamSettings`, message: issue.message });
   }
 
@@ -383,8 +417,25 @@ function buildV5Stream(
     }
     if (item.tls_ech_config) tls.echConfig = item.tls_ech_config;
     if (isInbound) {
+      const usageMap: Record<string, string> = {
+        encipherment: 'ENCIPHERMENT',
+        verify: 'AUTHORITY_VERIFY',
+        verifyclient: 'AUTHORITY_VERIFY_CLIENT',
+        issue: 'AUTHORITY_ISSUE'
+      };
       if (item.tls_certificates && item.tls_certificates.length > 0) {
-        tls.certificate = item.tls_certificates.filter((c) => c.certificateFile && c.keyFile);
+        tls.certificate = item.tls_certificates
+          .filter((c) => c.certificateFile && c.keyFile)
+          .map((c) => {
+            const out: Record<string, unknown> = {
+              certificateFile: c.certificateFile,
+              keyFile: c.keyFile
+            };
+            if (c.usage) {
+              out.usage = usageMap[c.usage.toLowerCase()] || c.usage.toUpperCase();
+            }
+            return out;
+          });
       } else if (item.tls_cert_file && item.tls_key_file) {
         tls.certificate = [{ certificateFile: item.tls_cert_file, keyFile: item.tls_key_file }];
       }
@@ -480,7 +531,16 @@ function compileV5Inbound(
           : [];
     if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
   } else if (proto === 'shadowsocks') {
-    settings.method = item.method || 'aes-256-gcm';
+    const method = item.method || 'aes-256-gcm';
+    if (method.startsWith('2022-blake3-')) {
+      diagnostics.push({
+        level: 'error',
+        path: `inbounds.${item.tag}.method`,
+        message: `V2Ray jsonv5 的 shadowsocks 入站不支持 "${method}"。`
+      });
+      return null;
+    }
+    settings.method = method;
     settings.password = item.password || '';
     settings.networks = (item.ss_network || 'tcp,udp').toLowerCase();
     if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
@@ -568,10 +628,19 @@ function compileV5Outbound(
       password: item.password || ''
     };
   } else if (proto === 'shadowsocks') {
+    const method = item.method || 'aes-256-gcm';
+    if (method.startsWith('2022-blake3-')) {
+      diagnostics.push({
+        level: 'error',
+        path: `outbounds.${item.tag}.method`,
+        message: `V2Ray jsonv5 的 shadowsocks 协议不支持 "${method}"，请将协议切换为 shadowsocks2022。`
+      });
+      return null;
+    }
     settings = {
       address: item.address || '',
       port: item.port || 8388,
-      method: item.method || 'aes-256-gcm',
+      method,
       password: item.password || ''
     };
   } else if (proto === 'hysteria2') {
@@ -849,17 +918,20 @@ export function compileV2RayV5(
     };
   }
 
-  const hasAccessLog = !!cfg.general.access_log && cfg.general.access_log !== 'none';
+  const hasAccessLog = !!cfg.general.access_log && cfg.general.access_log !== 'none' && cfg.general.access_log !== '/dev/null';
+  const errLogRaw = (cfg.general.error_log || '').trim();
+  const errLogObj =
+    errLogRaw === 'none' || errLogRaw === '/dev/null'
+      ? { type: 'None', level: toV5LogLevel(cfg.general.log_level) }
+      : errLogRaw
+        ? { type: 'File', path: errLogRaw, level: toV5LogLevel(cfg.general.log_level) }
+        : { type: 'Console', level: toV5LogLevel(cfg.general.log_level) };
   const doc: Record<string, unknown> = {
     log: {
       access: hasAccessLog
         ? { type: 'File', path: cfg.general.access_log }
         : { type: 'None' },
-      error: {
-        type: cfg.general.error_log ? 'File' : 'Console',
-        path: cfg.general.error_log || undefined,
-        level: toV5LogLevel(cfg.general.log_level)
-      }
+      error: errLogObj
     },
     dns: dnsObj,
     inbounds,
@@ -884,7 +956,7 @@ export function compileV2RayV5(
                 protocol: r.protocol && r.protocol.length > 0 ? r.protocol.filter((p) => p !== 'quic') : undefined,
                 domainMatcher: cfg.routing.domain_matcher === 'mph' ? 'mph' : 'linear',
                 attributes: r.attrs || undefined,
-                tag: r.outbound_tag || undefined,
+                tag: r.balancer_tag ? undefined : r.outbound_tag || undefined,
                 balancingTag: r.balancer_tag || undefined
               };
               return ruleObj;

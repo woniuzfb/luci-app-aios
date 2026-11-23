@@ -2,17 +2,25 @@
 {%
 	"use strict";
 	import { load_config } from "../common/config.mjs";
+	import { connect as ubus_connect } from "ubus";
+
+	function as_list(v) {
+		if (type(v) === "array") return filter(v, x => x != null && `${x}` !== "");
+		if (v != null && `${v}` !== "") return [`${v}`];
+		return [];
+	}
 
 	const cfg = load_config();
 	const tp = cfg.transparent_proxy || {};
 
+	const tproxy_mode = tp.tproxy_mode || "tproxy";
 	const tproxy_mark = tp.tproxy_mark || "0x3a01";
 	const dd_mark = tp.dynamic_direct_mark || "0x3a02";
 	const out_mark = tp.outbound_mark || "0x3a03";
 	const dns_mark = tp.dns_mark || "0x3a04";
 	const ct_dd_mark = tp.ct_direct_mark || "0x3a0a";
 
-	const prio_raw = int(tp.firewall_priority ?? 10);
+	const prio_raw = (tp.firewall_priority != null && tp.firewall_priority !== "") ? int(tp.firewall_priority) : 10;
 	const prio = prio_raw >= 0 ? `+${prio_raw}` : `${prio_raw}`;
 
 	const tcp4_port = int(tp.tproxy_port_tcp_v4 || 0);
@@ -31,21 +39,72 @@
 	const dd_on = tp.dynamic_direct_enabled === "1";
 	const dd_timeout = int(tp.dynamic_direct_timeout || 1800);
 
-	const ifaces_v4 = tp.tproxy_ifaces_v4 || [];
-	const ifaces_v6 = tp.tproxy_ifaces_v6 || [];
-	const bp_ifaces_v4 = tp.bypass_ifaces_v4 || [];
-	const bp_ifaces_v6 = tp.bypass_ifaces_v6 || [];
+	const ifaces_v4 = as_list(tp.tproxy_ifaces_v4);
+	const ifaces_v6 = as_list(tp.tproxy_ifaces_v6);
+	const bp_ifaces_v4 = as_list(tp.bypass_ifaces_v4);
+	const bp_ifaces_v6 = as_list(tp.bypass_ifaces_v6);
 
-	const wan_bp_v4 = filter(tp.wan_bp_ips || [], v => index(v, ":") === -1);
-	const wan_bp_v6 = filter(tp.wan_bp_ips || [], v => index(v, ":") !== -1);
-	const wan_fw_v4 = filter(tp.wan_fw_ips || [], v => index(v, ":") === -1);
-	const wan_fw_v6 = filter(tp.wan_fw_ips || [], v => index(v, ":") !== -1);
+	const wan_bp_all = as_list(tp.wan_bp_ips);
+	const wan_fw_all = as_list(tp.wan_fw_ips);
+	const wan_bp_v4 = filter(wan_bp_all, v => index(v, ":") === -1);
+	const wan_bp_v6 = filter(wan_bp_all, v => index(v, ":") !== -1);
+	const wan_fw_v4 = filter(wan_fw_all, v => index(v, ":") === -1);
+	const wan_fw_v6 = filter(wan_fw_all, v => index(v, ":") !== -1);
 
 	const lan_hosts = cfg.lan_hosts || [];
 	const mac_bp_v4 = uniq(map(filter(lan_hosts, h => h.strategy_v4 === "bypass" && h.macaddr), h => h.macaddr));
 	const mac_bp_v6 = uniq(map(filter(lan_hosts, h => h.strategy_v6 === "bypass" && h.macaddr), h => h.macaddr));
 	const mac_tp_v4 = uniq(map(filter(lan_hosts, h => h.strategy_v4 === "tproxy" && h.macaddr), h => h.macaddr));
 	const mac_tp_v6 = uniq(map(filter(lan_hosts, h => h.strategy_v6 === "tproxy" && h.macaddr), h => h.macaddr));
+
+	const bypass_uids = as_list(tp.bypass_uids);
+	const bypass_gids = as_list(tp.bypass_gids);
+
+	// Active protocol selectors (never mark protocols with port == 0 to avoid traffic blackholes)
+	const v4_protos = [];
+	if (tcp4_port > 0) push(v4_protos, "tcp");
+	if (udp4_port > 0) push(v4_protos, "udp");
+	const v4_proto_expr = length(v4_protos) === 2 ? "{ tcp, udp }" : (length(v4_protos) === 1 ? v4_protos[0] : "");
+
+	const v6_protos = [];
+	if (tcp6_port > 0) push(v6_protos, "tcp");
+	if (udp6_port > 0) push(v6_protos, "udp");
+	const v6_proto_expr = length(v6_protos) === 2 ? "{ tcp, udp }" : (length(v6_protos) === 1 ? v6_protos[0] : "");
+
+	const fv4_protos = [];
+	if (f_tcp4_port > 0) push(fv4_protos, "tcp");
+	if (f_udp4_port > 0) push(fv4_protos, "udp");
+	const fv4_proto_expr = length(fv4_protos) === 2 ? "{ tcp, udp }" : (length(fv4_protos) === 1 ? fv4_protos[0] : "");
+
+	const fv6_protos = [];
+	if (f_tcp6_port > 0) push(fv6_protos, "tcp");
+	if (f_udp6_port > 0) push(fv6_protos, "udp");
+	const fv6_proto_expr = length(fv6_protos) === 2 ? "{ tcp, udp }" : (length(fv6_protos) === 1 ? fv6_protos[0] : "");
+
+	// Pre-populate dynamic gateway & IPv6 PD sets at render time so fw4 reload never drops them
+	let gw4 = [];
+	let pd6 = [];
+	try {
+		const ubus = ubus_connect();
+		if (ubus) {
+			const dump = ubus.call("network.interface", "dump", {});
+			for (let iface in (dump?.interface || [])) {
+				if (!iface.up) continue;
+				for (let r in (iface.route || [])) {
+					if (r.target === "0.0.0.0" && r.mask === 0 && r.nexthop && r.nexthop !== "0.0.0.0") {
+						push(gw4, r.nexthop);
+					}
+				}
+				for (let p in (iface["ipv6-prefix-assignment"] || [])) {
+					if (p.address && p.mask) {
+						push(pd6, `${p.address}/${p.mask}`);
+					}
+				}
+			}
+			gw4 = uniq(gw4);
+			pd6 = uniq(pd6);
+		}
+	} catch (e) {}
 %}
 # Isolated nftables table managed exclusively by luci-app-aios
 table inet aios {
@@ -71,11 +130,19 @@ table inet aios {
 	set aios_gateway_v4 {
 		type ipv4_addr
 		flags interval
+		auto-merge
+{% if (length(gw4) > 0): %}
+		elements = { {{ join(", ", gw4) }} }
+{% endif %}
 	}
 
 	set aios_gateway_v6 {
 		type ipv6_addr
 		flags interval
+		auto-merge
+{% if (length(pd6) > 0): %}
+		elements = { {{ join(", ", pd6) }} }
+{% endif %}
 	}
 
 {% if (length(wan_bp_v4) > 0): %}
@@ -110,6 +177,20 @@ table inet aios {
 	}
 {% endif %}
 
+{% if (dd_on): %}
+	set aios_dd_v4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout {{ dd_timeout }}s
+	}
+
+	set aios_dd_v6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout {{ dd_timeout }}s
+	}
+{% endif %}
+
 {% if (length(mac_bp_v4) > 0): %}
 	set aios_mac_bp_v4 {
 		type ether_addr
@@ -138,25 +219,83 @@ table inet aios {
 	}
 {% endif %}
 
-{% if (dd_on): %}
-	set aios_dd_v4 {
-		type ipv4_addr
-		size 65536
-		flags dynamic,timeout
-	}
-	set aios_dd_v6 {
-		type ipv6_addr
-		size 65536
-		flags dynamic,timeout
-	}
+{% if (tproxy_mode === "redirect"): %}
+	chain redirect_filter {
+		fib daddr type local return
+{% if (length(wan_fw_v4) > 0 && tcp4_port > 0): %}
+		ip protocol tcp ip daddr @aios_fw_v4 redirect to :{{ tcp4_port }}
 {% endif %}
-
-	chain tproxy_divert {
-		type filter hook prerouting priority filter {{ prio }}; policy accept;
-		meta mark {{ tproxy_mark }} goto tproxy_dispatch
+{% if (length(wan_fw_v6) > 0 && tcp6_port > 0): %}
+		ip6 nexthdr tcp ip6 daddr @aios_fw_v6 redirect to :{{ tcp6_port }}
+{% endif %}
+		ip daddr @aios_gateway_v4 return
+		ip6 daddr @aios_gateway_v6 return
+{% if (length(wan_bp_v4) > 0): %}
+		ip daddr @aios_bp_v4 return
+{% endif %}
+{% if (length(wan_bp_v6) > 0): %}
+		ip6 daddr @aios_bp_v6 return
+{% endif %}
+		ip daddr @aios_reserved_v4 return
+		ip6 daddr @aios_reserved_v6 return
+{% if (fakedns_on && f_tcp4_port > 0): %}
+		ip protocol tcp ip daddr {{ fakedns_v4 }} redirect to :{{ f_tcp4_port }}
+{% endif %}
+{% if (tcp4_port > 0): %}
+		ip protocol tcp redirect to :{{ tcp4_port }}
+{% endif %}
+{% if (fakedns_on && f_tcp6_port > 0): %}
+		ip6 nexthdr tcp ip6 daddr {{ fakedns_v6 }} redirect to :{{ f_tcp6_port }}
+{% endif %}
+{% if (tcp6_port > 0): %}
+		ip6 nexthdr tcp redirect to :{{ tcp6_port }}
+{% endif %}
 	}
 
-	chain tproxy_dispatch {
+	chain nat_prerouting {
+		type nat hook prerouting priority dstnat {{ prio }}; policy accept;
+{% if (length(bp_ifaces_v4) > 0): %}
+		ip protocol tcp iifname { "{{ join('", "', bp_ifaces_v4) }}" } return
+{% endif %}
+{% if (length(bp_ifaces_v6) > 0): %}
+		ip6 nexthdr tcp iifname { "{{ join('", "', bp_ifaces_v6) }}" } return
+{% endif %}
+{% if (length(mac_bp_v4) > 0): %}
+		ip protocol tcp ether saddr @aios_mac_bp_v4 return
+{% endif %}
+{% if (length(mac_bp_v6) > 0): %}
+		ip6 nexthdr tcp ether saddr @aios_mac_bp_v6 return
+{% endif %}
+{% if (length(mac_tp_v4) > 0 && tcp4_port > 0): %}
+		ip protocol tcp ether saddr @aios_mac_tp_v4 jump redirect_filter
+{% endif %}
+{% if (length(mac_tp_v6) > 0 && tcp6_port > 0): %}
+		ip6 nexthdr tcp ether saddr @aios_mac_tp_v6 jump redirect_filter
+{% endif %}
+{% if (length(ifaces_v4) > 0 && tcp4_port > 0): %}
+		ip protocol tcp iifname { "{{ join('", "', ifaces_v4) }}" } jump redirect_filter
+{% endif %}
+{% if (length(ifaces_v6) > 0 && tcp6_port > 0): %}
+		ip6 nexthdr tcp iifname { "{{ join('", "', ifaces_v6) }}" } jump redirect_filter
+{% endif %}
+	}
+
+	chain nat_output {
+		type nat hook output priority -100; policy accept;
+		meta mark { {{ out_mark }}, {{ dns_mark }} } return
+{% if (length(bypass_uids) > 0): %}
+		meta skuid { {{ join(", ", bypass_uids) }} } return
+{% endif %}
+{% if (length(bypass_gids) > 0): %}
+		meta skgid { {{ join(", ", bypass_gids) }} } return
+{% endif %}
+		meta l4proto tcp jump redirect_filter
+	}
+{% else: %}
+	chain tproxy_prerouting {
+		type filter hook prerouting priority filter {{ prio }}; policy accept;
+		meta mark != {{ tproxy_mark }} accept
+		fib daddr type local accept
 {% if (fakedns_on): %}
 {% if (f_tcp4_port > 0): %}
 		ip protocol tcp ip daddr {{ fakedns_v4 }} tproxy ip to :{{ f_tcp4_port }} accept
@@ -188,54 +327,75 @@ table inet aios {
 
 	chain prerouting {
 		type filter hook prerouting priority mangle {{ prio }}; policy accept;
+		fib daddr type local accept
 {% if (dd_on): %}
 		ip protocol { tcp, udp } ct mark {{ ct_dd_mark }} update @aios_dd_v4 { ip daddr timeout {{ dd_timeout }}s } accept
 		ip6 nexthdr { tcp, udp } ct mark {{ ct_dd_mark }} update @aios_dd_v6 { ip6 daddr timeout {{ dd_timeout }}s } accept
 {% endif %}
 		meta mark {{ tproxy_mark }} accept
 {% if (fakedns_on): %}
-		ip protocol { tcp, udp } ip daddr {{ fakedns_v4 }} meta mark set {{ tproxy_mark }} accept
-		ip6 nexthdr { tcp, udp } ip6 daddr {{ fakedns_v6 }} meta mark set {{ tproxy_mark }} accept
+{% if (fv4_proto_expr != ""): %}
+		ip protocol {{ fv4_proto_expr }} ip daddr {{ fakedns_v4 }} meta mark set {{ tproxy_mark }} accept
 {% endif %}
-{% if (length(bp_ifaces_v4) > 0): %}
-		ip protocol { tcp, udp } iifname { "{{ join('", "', bp_ifaces_v4) }}" } accept
+{% if (fv6_proto_expr != ""): %}
+		ip6 nexthdr {{ fv6_proto_expr }} ip6 daddr {{ fakedns_v6 }} meta mark set {{ tproxy_mark }} accept
 {% endif %}
-{% if (length(bp_ifaces_v6) > 0): %}
-		ip6 nexthdr { tcp, udp } iifname { "{{ join('", "', bp_ifaces_v6) }}" } accept
 {% endif %}
-{% if (length(mac_bp_v4) > 0): %}
-		ip protocol { tcp, udp } ether saddr @aios_mac_bp_v4 accept
+{% if (length(bp_ifaces_v4) > 0 && v4_proto_expr != ""): %}
+		ip protocol {{ v4_proto_expr }} iifname { "{{ join('", "', bp_ifaces_v4) }}" } accept
 {% endif %}
-{% if (length(mac_bp_v6) > 0): %}
-		ip6 nexthdr { tcp, udp } ether saddr @aios_mac_bp_v6 accept
+{% if (length(bp_ifaces_v6) > 0 && v6_proto_expr != ""): %}
+		ip6 nexthdr {{ v6_proto_expr }} iifname { "{{ join('", "', bp_ifaces_v6) }}" } accept
 {% endif %}
-{% if (length(mac_tp_v4) > 0): %}
-		ip protocol { tcp, udp } ether saddr @aios_mac_tp_v4 goto lan_filter
+{% if (length(mac_bp_v4) > 0 && v4_proto_expr != ""): %}
+		ip protocol {{ v4_proto_expr }} ether saddr @aios_mac_bp_v4 accept
 {% endif %}
-{% if (length(mac_tp_v6) > 0): %}
-		ip6 nexthdr { tcp, udp } ether saddr @aios_mac_tp_v6 goto lan_filter
+{% if (length(mac_bp_v6) > 0 && v6_proto_expr != ""): %}
+		ip6 nexthdr {{ v6_proto_expr }} ether saddr @aios_mac_bp_v6 accept
 {% endif %}
-{% if (length(ifaces_v4) > 0): %}
-		ip protocol { tcp, udp } iifname { "{{ join('", "', ifaces_v4) }}" } goto lan_filter
+{% if (length(mac_tp_v4) > 0 && v4_proto_expr != ""): %}
+		ip protocol {{ v4_proto_expr }} ether saddr @aios_mac_tp_v4 goto lan_filter
 {% endif %}
-{% if (length(ifaces_v6) > 0): %}
-		ip6 nexthdr { tcp, udp } iifname { "{{ join('", "', ifaces_v6) }}" } goto lan_filter
+{% if (length(mac_tp_v6) > 0 && v6_proto_expr != ""): %}
+		ip6 nexthdr {{ v6_proto_expr }} ether saddr @aios_mac_tp_v6 goto lan_filter
+{% endif %}
+{% if (length(ifaces_v4) > 0 && v4_proto_expr != ""): %}
+		ip protocol {{ v4_proto_expr }} iifname { "{{ join('", "', ifaces_v4) }}" } goto lan_filter
+{% endif %}
+{% if (length(ifaces_v6) > 0 && v6_proto_expr != ""): %}
+		ip6 nexthdr {{ v6_proto_expr }} iifname { "{{ join('", "', ifaces_v6) }}" } goto lan_filter
 {% endif %}
 	}
 
 	chain output {
 		type route hook output priority mangle {{ prio }}; policy accept;
 		ct direction reply accept
+		fib daddr type local accept
+{% if (length(bypass_uids) > 0): %}
+		meta skuid { {{ join(", ", bypass_uids) }} } accept
+{% endif %}
+{% if (length(bypass_gids) > 0): %}
+		meta skgid { {{ join(", ", bypass_gids) }} } accept
+{% endif %}
 {% if (dd_on): %}
 		ip protocol { tcp, udp } meta mark {{ dd_mark }} update @aios_dd_v4 { ip daddr timeout {{ dd_timeout }}s } accept
 		ip6 nexthdr { tcp, udp } meta mark {{ dd_mark }} update @aios_dd_v6 { ip6 daddr timeout {{ dd_timeout }}s } accept
 {% endif %}
 		meta mark { {{ out_mark }}, {{ dns_mark }} } accept
 {% if (fakedns_on): %}
-		ip protocol { tcp, udp } ip daddr {{ fakedns_v4 }} meta mark set {{ tproxy_mark }} accept
-		ip6 nexthdr { tcp, udp } ip6 daddr {{ fakedns_v6 }} meta mark set {{ tproxy_mark }} accept
+{% if (fv4_proto_expr != ""): %}
+		ip protocol {{ fv4_proto_expr }} ip daddr {{ fakedns_v4 }} meta mark set {{ tproxy_mark }} accept
 {% endif %}
-		meta l4proto { tcp, udp } goto lan_filter
+{% if (fv6_proto_expr != ""): %}
+		ip6 nexthdr {{ fv6_proto_expr }} ip6 daddr {{ fakedns_v6 }} meta mark set {{ tproxy_mark }} accept
+{% endif %}
+{% endif %}
+{% if (v4_proto_expr != ""): %}
+		ip protocol {{ v4_proto_expr }} goto lan_filter
+{% endif %}
+{% if (v6_proto_expr != ""): %}
+		ip6 nexthdr {{ v6_proto_expr }} goto lan_filter
+{% endif %}
 	}
 
 	chain lan_filter {
@@ -261,6 +421,7 @@ table inet aios {
 {% endif %}
 		meta mark set {{ tproxy_mark }} accept
 	}
+{% endif %}
 
 {% if (fakedns_on && tp.fakedns_ping_response == "1"): %}
 	chain fakedns_ping_prerouting {

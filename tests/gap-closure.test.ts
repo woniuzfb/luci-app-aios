@@ -12,7 +12,7 @@ describe('Gap-Closure Regression Tests', () => {
     original.general.core_type = 'v2ray';
     original.general.v2ray_format = 'jsonv5';
     original.general.inline_env = [{ key: 'DEMO_FLAG', value: 'true' }];
-    original.general.geodata_reload_interval = '6h';
+    original.general.geodata_cron = '0 4 * * *';
     original.inbounds[0].tcp_request_headers = [{ key: 'Host', value: 'example.com' }];
     original.inbounds[0].httpupgrade_headers = [{ key: 'X-Test', value: '1' }];
     original.inbounds[0].h2_headers = [{ key: 'X-H2', value: 'yes' }];
@@ -51,7 +51,7 @@ describe('Gap-Closure Regression Tests', () => {
 
     const restored = parseUciDump(simulatedDump);
     expect(restored.general.inline_env).toEqual([{ key: 'DEMO_FLAG', value: 'true' }]);
-    expect(restored.general.geodata_reload_interval).toBe('6h');
+    expect(restored.general.geodata_cron).toBe('0 4 * * *');
     expect(restored.inbounds[0].tcp_request_headers).toEqual([{ key: 'Host', value: 'example.com' }]);
     expect(restored.inbounds[0].httpupgrade_headers).toEqual([{ key: 'X-Test', value: '1' }]);
     expect(restored.inbounds[0].h2_headers).toEqual([{ key: 'X-H2', value: 'yes' }]);

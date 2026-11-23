@@ -25,7 +25,7 @@ function to_v5_outbound_ds(ds) {
 	if (ds === "UseIPv6" || ds === "UseIP6" || ds === "ForceIPv6") return "UseIP6";
 	if (ds === "UseIP" || ds === "UseIPv4v6" || ds === "UseIPv6v4" || ds === "ForceIP") return "UseIP";
 	if (ds === "AsIs") return "AsIs";
-	return ds;
+	return "AsIs";
 }
 
 function to_v5_router_ds(ds) {
@@ -48,20 +48,56 @@ function is_ip_literal(val) {
 	if (!val) return false;
 	if (index(val, ":") >= 0) return true;
 	const parts = split(val, ".");
-	return length(parts) === 4;
+	if (length(parts) !== 4) return false;
+	for (let p in parts) {
+		if (!match(p, /^[0-9]+$/)) return false;
+		const n = int(p);
+		if (n < 0 || n > 255) return false;
+	}
+	return true;
 }
 
 function parse_cidr_bytes(cidr) {
 	const parts = split(trim(cidr || ""), "/");
-	const octets = split(parts[0] || "", ".");
+	const addr = parts[0] || "";
+	if (!addr) return null;
+	if (index(addr, ":") >= 0) {
+		const halves = split(addr, "::");
+		if (length(halves) > 2) return null;
+		const left = halves[0] ? split(halves[0], ":") : [];
+		const right = length(halves) === 2 && halves[1] ? split(halves[1], ":") : [];
+		const missing = 8 - (length(left) + length(right));
+		if (length(halves) === 1 && missing !== 0) return null;
+		if (length(halves) === 2 && missing <= 0) return null;
+		let groups = [];
+		for (let x in left) push(groups, x);
+		for (let i = 0; i < missing; i++) push(groups, "0");
+		for (let x in right) push(groups, x);
+		if (length(groups) !== 8) return null;
+		let bytes = [];
+		for (let g in groups) {
+			if (!match(g, /^[0-9a-fA-F]{1,4}$/)) return null;
+			const val = hex(g);
+			push(bytes, (val >> 8) & 0xff, val & 0xff);
+		}
+		if (length(parts) > 1 && parts[1] !== "" && !match(parts[1], /^[0-9]+$/)) return null;
+		const prefix = length(parts) > 1 && parts[1] !== "" ? int(parts[1]) : 128;
+		if (prefix < 0 || prefix > 128) return null;
+		return { ip: bytes, prefix: prefix };
+	}
+	const octets = split(addr, ".");
 	if (length(octets) !== 4) return null;
 	let bytes = [];
 	for (let o in octets) {
+		if (!match(o, /^[0-9]+$/)) return null;
 		const n = int(o);
 		if (n < 0 || n > 255) return null;
 		push(bytes, n);
 	}
-	return { ip: bytes, prefix: length(parts) > 1 ? int(parts[1]) : 32 };
+	if (length(parts) > 1 && parts[1] !== "" && !match(parts[1], /^[0-9]+$/)) return null;
+	const prefix = length(parts) > 1 && parts[1] !== "" ? int(parts[1]) : 32;
+	if (prefix < 0 || prefix > 32) return null;
+	return { ip: bytes, prefix: prefix };
 }
 
 function parse_geoip_entry(raw) {
@@ -81,8 +117,8 @@ function parse_geoip_entry(raw) {
 		if (inv) obj.inverseMatch = true;
 		return obj;
 	}
-	if (substr(item, 0, 4) === "ext:") {
-		const rest = substr(item, 4);
+	if (substr(item, 0, 4) === "ext:" || substr(item, 0, 7) === "ext-ip:") {
+		const rest = substr(item, 0, 7) === "ext-ip:" ? substr(item, 7) : substr(item, 4);
 		const colon = index(rest, ":");
 		const fp = colon >= 0 ? substr(rest, 0, colon) : "geoip.dat";
 		let code = colon >= 0 ? substr(rest, colon + 1) : rest;
@@ -141,7 +177,7 @@ function build_v5_stream(item, is_inbound, default_mark, protocol) {
 	if (transport === "hysteria") transport = "hysteria2";
 
 	let security = item.security || "none";
-	const errs = validate_stream_combination("v2ray", "jsonv5", protocol || item.protocol || "", transport, security);
+	const errs = validate_stream_combination("v2ray", "jsonv5", protocol || item.protocol || "", transport, security, is_inbound ? "inbound" : "outbound");
 	if (length(errs) > 0) {
 		die(`AIOS v5 stream validation error (${item.tag || item[".name"] || "node"}): ${join("; ", errs)}`);
 	}
@@ -216,9 +252,22 @@ function build_v5_stream(item, is_inbound, default_mark, protocol) {
 		}
 		if (item.tls_ech_config) tls.echConfig = item.tls_ech_config;
 		if (is_inbound) {
+			const usage_map = {
+				encipherment: "ENCIPHERMENT",
+				verify: "AUTHORITY_VERIFY",
+				verifyclient: "AUTHORITY_VERIFY_CLIENT",
+				issue: "AUTHORITY_ISSUE"
+			};
 			const certs = parse_json_safe(item.tls_certificates_json, "tls_certificates_json");
 			if (type(certs) === "array" && length(certs) > 0) {
-				tls.certificate = filter(certs, c => c && c.certificateFile && c.keyFile);
+				tls.certificate = map(filter(certs, c => c && c.certificateFile && c.keyFile), c => {
+					let out = { certificateFile: c.certificateFile, keyFile: c.keyFile };
+					if (c.usage) {
+						const k = lc(`${c.usage}`);
+						out.usage = usage_map[k] || uc(`${c.usage}`);
+					}
+					return out;
+				});
 			} else if (item.tls_cert_file && item.tls_key_file) {
 				tls.certificate = [{ certificateFile: item.tls_cert_file, keyFile: item.tls_key_file }];
 			}
@@ -266,6 +315,7 @@ export function compile_v2ray_v5(cfg, opts) {
 	for (let ib in cfg.inbounds) {
 		if (ib.enabled === "0") continue;
 		if (ib.protocol === "tun") {
+			if (services.tun) continue;
 			if (!features.hasV5ServicesTun) {
 				die(`V2Ray ${features.version} 不支持 services.tun（需 >= ${th.v5ServicesTun?.since || "5.9.0"}）。`);
 			}
@@ -332,7 +382,11 @@ export function compile_v2ray_v5(cfg, opts) {
 			settings = { users: has_users ? filter(map(users, u => u.password || ""), x => x !== "") : (ib.password ? [ib.password] : []) };
 			if (ib.packet_encoding) settings.packetEncoding = ib.packet_encoding;
 		} else if (proto === "shadowsocks") {
-			settings = { method: ib.method || "aes-256-gcm", password: ib.password || "", networks: lc(ib.ss_network || "tcp,udp") };
+			const ssMethod = ib.method || "aes-256-gcm";
+			if (substr(ssMethod, 0, 12) === "2022-blake3-") {
+				die(`V2Ray jsonv5 的 shadowsocks 入站不支持 "${ssMethod}"。`);
+			}
+			settings = { method: ssMethod, password: ib.password || "", networks: lc(ib.ss_network || "tcp,udp") };
 			if (ib.packet_encoding) settings.packetEncoding = ib.packet_encoding;
 		} else if (proto === "hysteria2") {
 			if (ib.packet_encoding) settings.packetEncoding = ib.packet_encoding;
@@ -380,7 +434,11 @@ export function compile_v2ray_v5(cfg, opts) {
 		} else if (proto === "trojan") {
 			settings = { address: ob.address || "", port: int(ob.port || 443), password: ob.password || "" };
 		} else if (proto === "shadowsocks") {
-			settings = { address: ob.address || "", port: int(ob.port || 8388), method: ob.method || "aes-256-gcm", password: ob.password || "" };
+			const ssMethod = ob.method || "aes-256-gcm";
+			if (substr(ssMethod, 0, 12) === "2022-blake3-") {
+				die(`V2Ray jsonv5 的 shadowsocks 出站不支持 "${ssMethod}"，请使用 shadowsocks2022 协议。`);
+			}
+			settings = { address: ob.address || "", port: int(ob.port || 8388), method: ssMethod, password: ob.password || "" };
 		} else if (proto === "hysteria2") {
 			settings = { server: [{ address: ob.address || "", port: int(ob.port || 443) }] };
 		} else if (proto === "freedom" || proto === "blackhole" || proto === "dns") {
@@ -395,7 +453,10 @@ export function compile_v2ray_v5(cfg, opts) {
 		const ds = to_v5_outbound_ds(ob.domain_strategy);
 		if (ds) item.domainStrategy = ds;
 		if (ob.dialer_proxy) item.proxySettings = { tag: ob.dialer_proxy, transportLayer: true };
-		if (ob.mux_enabled === "1") item.mux = { enabled: true, concurrency: int(ob.mux_concurrency || 8) };
+		if (ob.mux_enabled === "1") {
+			const conc = ob.mux_concurrency != null && ob.mux_concurrency !== "" ? int(ob.mux_concurrency) : 8;
+			item.mux = { enabled: true, concurrency: conc };
+		}
 		const custom = parse_json_safe(ob.custom_config, "custom_config");
 		push(outbounds, custom ? deep_merge(item, custom) : item);
 	}
@@ -440,16 +501,17 @@ export function compile_v2ray_v5(cfg, opts) {
 	const p = cfg.policy || {};
 	if (p.enabled === "1") {
 		let levelMap = {};
+		const num_or = (val, def) => (val != null && val !== "" ? int(val) : def);
 		const parsed_levels = parse_json_safe(p.policy_levels_json, "policy_levels_json");
 		if (type(parsed_levels) === "array" && length(parsed_levels) > 0) {
 			for (let lv in parsed_levels) {
-				const bufKb = int(lv.buffer_size || 4);
-				levelMap[`${lv.level || "0"}`] = {
+				const bufKb = num_or(lv.buffer_size, 4);
+				levelMap[`${lv.level != null && lv.level !== "" ? lv.level : "0"}`] = {
 					timeout: {
-						handshake: { value: int(lv.handshake || 4) },
-						connectionIdle: { value: int(lv.conn_idle || 300) },
-						uplinkOnly: { value: int(lv.uplink_only || 2) },
-						downlinkOnly: { value: int(lv.downlink_only || 5) }
+						handshake: { value: num_or(lv.handshake, 4) },
+						connectionIdle: { value: num_or(lv.conn_idle, 300) },
+						uplinkOnly: { value: num_or(lv.uplink_only, 2) },
+						downlinkOnly: { value: num_or(lv.downlink_only, 5) }
 					},
 					stats: {
 						userUplink: !!lv.stats_user_uplink,
@@ -461,13 +523,13 @@ export function compile_v2ray_v5(cfg, opts) {
 				};
 			}
 		} else {
-			const bufKb = int(p.buffer_size || 4);
+			const bufKb = num_or(p.buffer_size, 4);
 			levelMap["0"] = {
 				timeout: {
-					handshake: { value: int(p.handshake || 4) },
-					connectionIdle: { value: int(p.conn_idle || 300) },
-					uplinkOnly: { value: int(p.uplink_only || 2) },
-					downlinkOnly: { value: int(p.downlink_only || 5) }
+					handshake: { value: num_or(p.handshake, 4) },
+					connectionIdle: { value: num_or(p.conn_idle, 300) },
+					uplinkOnly: { value: num_or(p.uplink_only, 2) },
+					downlinkOnly: { value: num_or(p.downlink_only, 5) }
 				},
 				stats: { userUplink: true, userDownlink: true },
 				buffer: { connection: bufKb < 0 ? -1 : bufKb * 1024 }
@@ -486,11 +548,14 @@ export function compile_v2ray_v5(cfg, opts) {
 		};
 	}
 
-	const has_access_log = g.access_log && g.access_log !== "none";
+	const has_access_log = g.access_log && g.access_log !== "none" && g.access_log !== "/dev/null";
 	let accessLog = has_access_log ? { type: "File", path: g.access_log } : { type: "None" };
-	let errorLog = g.error_log
-		? { type: "File", path: g.error_log, level: to_v5_log_level(g.log_level) }
-		: { type: "Console", level: to_v5_log_level(g.log_level) };
+	const err_raw = trim(g.error_log || "");
+	let errorLog = (err_raw === "none" || err_raw === "/dev/null")
+		? { type: "None", level: to_v5_log_level(g.log_level) }
+		: (err_raw
+			? { type: "File", path: err_raw, level: to_v5_log_level(g.log_level) }
+			: { type: "Console", level: to_v5_log_level(g.log_level) });
 	let doc = {
 		log: {
 			access: accessLog,
@@ -543,16 +608,24 @@ export function compile_v2ray_v5(cfg, opts) {
 			})
 		};
 		if (d.client_ip) dnsObj.clientIp = d.client_ip;
+		let sh = [];
+		const raw_hosts = parse_json_safe(d.hosts_json, "hosts_json");
+		if (type(raw_hosts) === "object") {
+			for (let k in raw_hosts) {
+				const v = raw_hosts[k];
+				const addrs = type(v) === "array" ? v : (v ? [`${v}`] : []);
+				if (k && length(addrs) > 0) push(sh, build_static_host(k, addrs));
+			}
+		}
 		const host_entries = parse_json_safe(d.host_entries_json, "host_entries_json");
 		if (type(host_entries) === "array" && length(host_entries) > 0) {
-			let sh = [];
 			for (let h in host_entries) {
 				if (h && h.domain && type(h.addresses) === "array" && length(h.addresses) > 0) {
 					push(sh, build_static_host(h.domain, h.addresses));
 				}
 			}
-			if (length(sh) > 0) dnsObj.staticHosts = sh;
 		}
+		if (length(sh) > 0) dnsObj.staticHosts = sh;
 		if (length(cfg.fakedns) > 0) {
 			dnsObj.fakeDns = {
 				pools: map(cfg.fakedns, f => ({ ipPool: f.ip_pool || "198.18.0.0/15", lruSize: int(f.pool_size || 65535) }))
@@ -600,8 +673,8 @@ export function compile_v2ray_v5(cfg, opts) {
 			if (length(protos) > 0) rule.protocol = protos;
 			rule.domainMatcher = r.domain_matcher === "mph" ? "mph" : "linear";
 			if (rr.attrs) rule.attributes = rr.attrs;
-			if (rr.outbound_tag) rule.tag = rr.outbound_tag;
 			if (rr.balancer_tag) rule.balancingTag = rr.balancer_tag;
+			else if (rr.outbound_tag) rule.tag = rr.outbound_tag;
 			push(rules, rule);
 		}
 		let balancers = map(cfg.balancers, b => {

@@ -105,7 +105,10 @@ export interface AiosApiClient {
   preflightCheck(): Promise<PreflightResult>;
   getFirewallStatus(): Promise<FirewallStatus>;
   firewallAction(action: 'apply' | 'flush' | 'refresh_gateway'): Promise<void>;
-  validateConfig(configJson: string): Promise<ValidateResult>;
+  validateConfig(
+    configJson: string,
+    opts?: { core_type?: string; v2ray_format?: string; core_bin?: string }
+  ): Promise<ValidateResult>;
   getStats(): Promise<StatsResponse>;
   keyGen(kind: 'uuid' | 'x25519' | 'mldsa65' | 'vlessenc' | 'wg'): Promise<string>;
   loadConfig(): Promise<AiosConfig>;
@@ -133,9 +136,10 @@ function getSessionFromUrl(): string {
   return localStorage.getItem('aios_ubus_session') || '';
 }
 
-class UbusApiClient implements AiosApiClient {
+export class UbusApiClient implements AiosApiClient {
   mode: 'ubus' = 'ubus';
   private rpcId = 1;
+  private saveInFlight = false;
   constructor(private sessionId: string) {}
 
   private async call<T>(object: string, method: string, params: Record<string, unknown> = {}): Promise<T> {
@@ -149,12 +153,22 @@ class UbusApiClient implements AiosApiClient {
         params: [this.sessionId, object, method, params]
       })
     });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} calling ubus ${object}.${method}`);
+    }
     const body = (await res.json()) as { result?: [number, T]; error?: { message: string } };
     if (body.error) throw new Error(body.error.message);
     if (!body.result || body.result[0] !== 0) {
       throw new Error(`ubus ${object}.${method} failed (code ${body.result?.[0] ?? -1})`);
     }
     return body.result[1];
+  }
+
+  private assertOk(res: unknown, fallback: string) {
+    if (res && typeof res === 'object' && 'ok' in res && (res as { ok?: boolean }).ok === false) {
+      const err = (res as { error?: string }).error;
+      throw new Error(err || fallback);
+    }
   }
 
   getCoreInfo() {
@@ -170,10 +184,16 @@ class UbusApiClient implements AiosApiClient {
     return this.call<FirewallStatus>('luci.aios', 'firewallInspect');
   }
   async firewallAction(action: 'apply' | 'flush' | 'refresh_gateway') {
-    await this.call('luci.aios', 'firewallAction', { action });
+    const res = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'firewallAction', { action });
+    this.assertOk(res, `firewallAction(${action}) failed`);
   }
-  validateConfig(configJson: string) {
-    return this.call<ValidateResult>('luci.aios', 'validateConfig', { config: configJson });
+  validateConfig(configJson: string, opts?: { core_type?: string; v2ray_format?: string; core_bin?: string }) {
+    return this.call<ValidateResult>('luci.aios', 'validateConfig', {
+      config: configJson,
+      core_type: opts?.core_type || '',
+      v2ray_format: opts?.v2ray_format || '',
+      core_bin: opts?.core_bin || ''
+    });
   }
   getStats() {
     return this.call<StatsResponse>('luci.aios', 'stats');
@@ -194,51 +214,68 @@ class UbusApiClient implements AiosApiClient {
 
   /** Full bidirectional sync to /etc/config/aios (all sections) + precompiled JSON fallback */
   async saveConfig(cfg: AiosConfig, compiledJson: string): Promise<void> {
-    const existing = await this.call<{ values?: UciRawDump }>('uci', 'get', { config: 'aios' });
-    const existingNames = Object.keys(existing.values || {});
-    const targetSections = serializeConfigToUci(cfg);
-    const targetNames = new Set(targetSections.map((s) => s.name));
-
-    // 1. Delete removed sections from /etc/config/aios
-    for (const oldName of existingNames) {
-      if (!targetNames.has(oldName)) {
-        await this.call('uci', 'delete', { config: 'aios', section: oldName });
-      }
+    if (this.saveInFlight) {
+      throw new Error('已有保存操作正在进行中，请稍候再试');
     }
+    this.saveInFlight = true;
+    try {
+      const existing = await this.call<{ values?: UciRawDump }>('uci', 'get', { config: 'aios' });
+      const existingNames = Object.keys(existing.values || {});
+      const targetSections = serializeConfigToUci(cfg);
+      const targetNames = new Set(targetSections.map((s) => s.name));
 
-    // 2. Recreate/update all sections with full values
-    for (const sec of targetSections) {
-      if (existingNames.includes(sec.name)) {
-        await this.call('uci', 'delete', { config: 'aios', section: sec.name });
+      // 1. Delete removed sections from /etc/config/aios
+      for (const oldName of existingNames) {
+        if (!targetNames.has(oldName)) {
+          await this.call('uci', 'delete', { config: 'aios', section: oldName });
+        }
       }
-      await this.call('uci', 'add', {
-        config: 'aios',
-        type: sec.type,
-        name: sec.name,
-        values: sec.values
+
+      // 2. Recreate/update all sections with full values
+      for (const sec of targetSections) {
+        if (existingNames.includes(sec.name)) {
+          await this.call('uci', 'delete', { config: 'aios', section: sec.name });
+        }
+        await this.call('uci', 'add', {
+          config: 'aios',
+          type: sec.type,
+          name: sec.name,
+          values: sec.values
+        });
+      }
+
+      // 3. Commit UCI and write precompiled JSON fallback for non-ucode legacy OpenWrt
+      await this.call('uci', 'commit', { config: 'aios' });
+      const wr = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'writeCompiledConfig', {
+        content: compiledJson
       });
+      this.assertOk(wr, 'writeCompiledConfig failed');
+    } catch (e) {
+      await this.call('uci', 'revert', { config: 'aios' }).catch(() => {});
+      throw e;
+    } finally {
+      this.saveInFlight = false;
     }
-
-    // 3. Commit UCI and write precompiled JSON fallback for non-ucode legacy OpenWrt
-    await this.call('uci', 'commit', { config: 'aios' });
-    await this.call('luci.aios', 'writeCompiledConfig', { content: compiledJson });
   }
 
   async serviceAction(action: 'start' | 'stop' | 'restart' | 'reload') {
-    await this.call('luci.aios', 'serviceAction', { action });
+    const res = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'serviceAction', { action });
+    this.assertOk(res, `serviceAction(${action}) failed`);
   }
   async listUserPresets(): Promise<AiosPreset[]> {
     const res = await this.call<{ presets: AiosPreset[] }>('luci.aios', 'listPresets');
     return res.presets || [];
   }
   async saveUserPreset(preset: AiosPreset): Promise<void> {
-    await this.call('luci.aios', 'savePreset', {
+    const res = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'savePreset', {
       id: preset.id,
       payload: JSON.stringify(preset)
     });
+    this.assertOk(res, 'savePreset failed');
   }
   async deleteUserPreset(id: string): Promise<void> {
-    await this.call('luci.aios', 'deletePreset', { id });
+    const res = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'deletePreset', { id });
+    this.assertOk(res, 'deletePreset failed');
   }
   async readLog(): Promise<string> {
     const res = await this.call<{ content: string }>('luci.aios', 'readLog');

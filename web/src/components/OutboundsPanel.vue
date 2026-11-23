@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import type { CoreType, OutboundConfig } from '@/schema/types';
 import { getCoreCapabilities, type V2RayFormat } from '@/schema/capabilities';
 import { parseShareUriList } from '@/importers/uri';
@@ -18,6 +18,15 @@ const cap = computed(() => getCoreCapabilities(props.core, props.v2rayFormat || 
 const selectedId = ref<string>(props.outbounds[0]?.id || '');
 const subTab = ref<'basic' | 'stream' | 'advanced'>('basic');
 const selected = computed(() => props.outbounds.find((o) => o.id === selectedId.value) || null);
+
+watch(
+  () => props.outbounds,
+  (list) => {
+    if (!list.some((o) => o.id === selectedId.value)) {
+      selectedId.value = list[0]?.id || '';
+    }
+  }
+);
 
 const showImport = ref(false);
 const importText = ref('');
@@ -69,12 +78,10 @@ function addWgPeer() {
 function handleImport() {
   const parsed = parseShareUriList(importText.value);
   if (parsed.length === 0) {
-    importResult.value = '未解析到有效节点链接（支持 vless://, vmess://, trojan://, ss://, hy2://）。';
+    importResult.value = '未解析到有效节点链接（支持 vless://, vmess://, trojan://, ss://, hy2://, hysteria://, wireguard://）。';
     return;
   }
-  for (const item of parsed.reverse()) {
-    props.outbounds.unshift(item);
-  }
+  props.outbounds.unshift(...parsed);
   selectedId.value = parsed[0].id;
   importResult.value = `已成功导入 ${parsed.length} 个出站节点。`;
   importText.value = '';
@@ -85,7 +92,7 @@ function handleImport() {
   <div>
     <div v-if="showImport" class="card">
       <div class="card-header">
-        <h3 class="card-title">批量导入分享链接（vless / vmess / trojan / ss / hy2）</h3>
+        <h3 class="card-title">批量导入分享链接（vless / vmess / trojan / ss / hy2 / hysteria / wireguard）</h3>
         <button class="btn btn-sm" @click="showImport = false">收起</button>
       </div>
       <textarea

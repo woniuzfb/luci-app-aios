@@ -4,8 +4,66 @@ import { deep_merge, kv_to_map, parse_json_safe, to_array } from "../common/conf
 import { resolve_core_features } from "../common/features.mjs";
 import { build_stream_settings } from "../common/stream.mjs";
 
+function is_private_v4(a, b) {
+	if (a === 10 || a === 127 || a === 0) return true;
+	if (a === 172 && b >= 16 && b <= 31) return true;
+	if (a === 192 && b === 168) return true;
+	if (a === 169 && b === 254) return true;
+	return false;
+}
+
+function is_public_target_addr(addr) {
+	let s = lc(trim(addr || ""));
+	if (substr(s, 0, 1) === "[" && substr(s, -1) === "]") s = substr(s, 1, length(s) - 2);
+	if (!s) return false;
+	if (s === "localhost" || substr(s, -6) === ".local" || substr(s, -4) === ".lan" || substr(s, -9) === ".internal") return false;
+	if (index(s, ":") < 0 && index(s, ".") < 0) return false;
+	const parts = split(s, ".");
+	if (length(parts) === 4) {
+		let ok = true;
+		for (let p in parts) {
+			if (!match(p, /^[0-9]+$/) || int(p) > 255) { ok = false; break; }
+		}
+		if (ok) return !is_private_v4(int(parts[0]), int(parts[1]));
+	}
+	if (index(s, ":") >= 0) {
+		const m = match(s, /^::ffff:([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+		if (m) return !is_private_v4(int(m[1]), int(m[2]));
+		const halves = split(s, "::");
+		if (length(halves) <= 2) {
+			const left = halves[0] ? split(halves[0], ":") : [];
+			const right = length(halves) === 2 && halves[1] ? split(halves[1], ":") : [];
+			const missing = 8 - (length(left) + length(right));
+			if ((length(halves) === 1 && missing === 0) || (length(halves) === 2 && missing > 0)) {
+				let groups = [];
+				for (let x in left) push(groups, x);
+				for (let i = 0; i < missing; i++) push(groups, "0");
+				for (let x in right) push(groups, x);
+				let bytes = [];
+				let valid = true;
+				for (let g in groups) {
+					if (!match(g, /^[0-9a-f]{1,4}$/)) { valid = false; break; }
+					const val = hex(g);
+					push(bytes, (val >> 8) & 0xff, val & 0xff);
+				}
+				if (valid && length(bytes) === 16) {
+					let zero = true;
+					for (let i = 0; i < 15; i++) if (bytes[i] !== 0) { zero = false; break; }
+					if (zero && (bytes[15] === 0 || bytes[15] === 1)) return false;
+					if ((bytes[0] & 0xfe) === 0xfc) return false;
+					if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return false;
+					return true;
+				}
+			}
+		}
+		return true;
+	}
+	return true;
+}
+
 function build_inbound(item, features) {
-	const proto = item.protocol === "dokodemo-door" && item.use_tunnel === "1" ? "tunnel" : (item.protocol || "socks");
+	let proto = item.protocol === "dokodemo-door" && item.use_tunnel === "1" ? "tunnel" : (item.protocol || "socks");
+	if (proto === "hysteria2") proto = "hysteria";
 	const use_users = !features || features.inboundUsersKey === "users";
 	if (features) {
 		const th = features.thresholds || {};
@@ -49,9 +107,12 @@ function build_inbound(item, features) {
 		if (item.dokodemo_address) obj.settings.address = item.dokodemo_address;
 		if (item.dokodemo_port) obj.settings.port = int(item.dokodemo_port);
 	} else if (proto === "tunnel") {
-		obj.settings = { allowedNetwork: item.dokodemo_network || "tcp,udp", followRedirect: item.dokodemo_follow_redirect === "1" };
-		if (item.dokodemo_address) obj.settings.rewriteAddress = item.dokodemo_address;
-		if (item.dokodemo_port) obj.settings.rewritePort = int(item.dokodemo_port);
+		const use_rw = !features || features.hasDnsRewriteKeys !== false;
+		obj.settings = use_rw
+			? { allowedNetwork: item.dokodemo_network || "tcp,udp", followRedirect: item.dokodemo_follow_redirect === "1" }
+			: { network: item.dokodemo_network || "tcp,udp", followRedirect: item.dokodemo_follow_redirect === "1" };
+		if (item.dokodemo_address) obj.settings[use_rw ? "rewriteAddress" : "address"] = item.dokodemo_address;
+		if (item.dokodemo_port) obj.settings[use_rw ? "rewritePort" : "port"] = int(item.dokodemo_port);
 		const pm = kv_to_map(parse_json_safe(item.tunnel_port_map_json));
 		if (pm) obj.settings.portMap = pm;
 		if (item.tunnel_user_level != null && item.tunnel_user_level !== "") obj.settings.userLevel = int(item.tunnel_user_level);
@@ -88,7 +149,18 @@ function build_inbound(item, features) {
 			: [{ password: item.password || "" }];
 		if (type(fallbacks) === "array" && length(fallbacks) > 0) obj.settings.fallbacks = fallbacks;
 	} else if (proto === "shadowsocks") {
-		obj.settings = { method: item.method || "aes-256-gcm", password: item.password || "", network: item.ss_network || "tcp,udp" };
+		const ssMethod = item.method || "aes-256-gcm";
+		obj.settings = { method: ssMethod, network: item.ss_network || "tcp,udp" };
+		if (has_users) {
+			const uKey = use_users ? "users" : "clients";
+			obj.settings[uKey] = map(users, u => {
+				let x = { method: ssMethod, password: u.password || "", level: int(u.level || 0) };
+				if (u.email) x.email = u.email;
+				return x;
+			});
+		} else {
+			obj.settings.password = item.password || "";
+		}
 	} else if (proto === "hysteria") {
 		obj.settings = {
 			version: 2,
@@ -103,7 +175,6 @@ function build_inbound(item, features) {
 	} else if (proto === "wireguard") {
 		obj.settings = {
 			secretKey: item.wg_secret_key || "",
-			address: to_array(item.wg_address),
 			peers: parse_json_safe(item.wg_peers_json) || [],
 			mtu: int(item.wg_mtu || 1420)
 		};
@@ -159,7 +230,7 @@ function build_inbound(item, features) {
 		};
 	}
 
-	if (proto !== "tun" && proto !== "wireguard" && (item.transport || item.security || item.sockopt_tproxy)) {
+	if (proto !== "tun" && proto !== "wireguard" && (item.transport || (item.security && item.security !== "none") || (item.sockopt_tproxy && item.sockopt_tproxy !== "off"))) {
 		obj.streamSettings = build_stream_settings(item, "xray", true, null, proto, features);
 	}
 
@@ -192,18 +263,27 @@ function build_outbound(item, default_mark, features) {
 	} else if (proto === "blackhole") {
 		obj.settings.response = { type: item.blackhole_response || "none" };
 	} else if (proto === "dns") {
-		if (item.dns_network) obj.settings.rewriteNetwork = item.dns_network;
-		if (item.dns_address) obj.settings.rewriteAddress = item.dns_address;
-		if (item.dns_port) obj.settings.rewritePort = int(item.dns_port);
-		if (item.dns_non_ip_query) obj.settings.nonIPQuery = item.dns_non_ip_query;
-		const rules = parse_json_safe(item.dns_rules_json);
-		if (type(rules) === "array") obj.settings.rules = rules;
+		const use_rw = !features || features.hasDnsRewriteKeys !== false;
+		if (use_rw) {
+			if (item.dns_network) obj.settings.rewriteNetwork = item.dns_network;
+			if (item.dns_address) obj.settings.rewriteAddress = item.dns_address;
+			if (item.dns_port) obj.settings.rewritePort = int(item.dns_port);
+			const rules = parse_json_safe(item.dns_rules_json);
+			if (type(rules) === "array" && length(rules) > 0) obj.settings.rules = rules;
+			else if (item.dns_non_ip_query) obj.settings.nonIPQuery = item.dns_non_ip_query;
+		} else {
+			if (item.dns_network) obj.settings.network = item.dns_network;
+			if (item.dns_address) obj.settings.address = item.dns_address;
+			if (item.dns_port) obj.settings.port = int(item.dns_port);
+			if (item.dns_non_ip_query) obj.settings.nonIPQuery = item.dns_non_ip_query;
+		}
 	} else if (proto === "loopback") {
 		obj.settings.inboundTag = item.loopback_inbound_tag || "";
 		if (item.loopback_sniffing_enabled === "1") {
+			const lDestOv = to_array(item.loopback_sniffing_dest_override);
 			let sn = {
 				enabled: true,
-				destOverride: to_array(item.loopback_sniffing_dest_override),
+				destOverride: length(lDestOv) > 0 ? lDestOv : ["http", "tls"],
 				metadataOnly: item.loopback_sniffing_metadata_only === "1",
 				routeOnly: item.loopback_sniffing_route_only === "1"
 			};
@@ -214,6 +294,9 @@ function build_outbound(item, default_mark, features) {
 			obj.settings.sniffing = sn;
 		}
 	} else if (proto === "vless") {
+		if (features && features.requireTlsPublicVlessTrojan && (!item.security || item.security === "none") && (!item.encryption || item.encryption === "none") && is_public_target_addr(item.address || "")) {
+			die(`Xray ${features.version} 禁止对公网地址 (${item.address}) 使用无 TLS 且无加密的明文 VLESS 出站。`);
+		}
 		if (use_flat) {
 			obj.settings = {
 				address: item.address || "",
@@ -247,6 +330,9 @@ function build_outbound(item, default_mark, features) {
 			obj.settings = { vnext: [{ address: item.address || "", port: int(item.port || 443), users: [u] }] };
 		}
 	} else if (proto === "trojan") {
+		if (features && features.requireTlsPublicVlessTrojan && (!item.security || item.security === "none") && is_public_target_addr(item.address || "")) {
+			die(`Xray ${features.version} 禁止对公网地址 (${item.address}) 使用无 TLS 的 Trojan 出站。`);
+		}
 		if (use_flat) {
 			obj.settings = { address: item.address || "", port: int(item.port || 443), password: item.password || "" };
 			if (item.email) obj.settings.email = item.email;
@@ -267,12 +353,16 @@ function build_outbound(item, default_mark, features) {
 			};
 			if (item.email) obj.settings.email = item.email;
 			if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
-			if (item.ss_uot === "1") obj.settings.uot = true;
-			if (item.ss_uot_version) obj.settings.UoTVersion = int(item.ss_uot_version);
+			if (features && features.hasSsUot) {
+				if (item.ss_uot === "1") obj.settings.uot = true;
+				if (item.ss_uot_version) obj.settings.UoTVersion = int(item.ss_uot_version);
+			}
 		} else {
 			let srv = { address: item.address || "", port: int(item.port || 8388), method: item.method || "aes-256-gcm", password: item.password || "" };
-			if (item.ss_uot === "1") srv.uot = true;
-			if (item.ss_uot_version) srv.UoTVersion = int(item.ss_uot_version);
+			if (features && features.hasSsUot) {
+				if (item.ss_uot === "1") srv.uot = true;
+				if (item.ss_uot_version) srv.UoTVersion = int(item.ss_uot_version);
+			}
 			obj.settings = { servers: [srv] };
 		}
 	} else if (proto === "hysteria") {
@@ -367,7 +457,18 @@ export function compile_xray(cfg, opts) {
 
 	const env_map = kv_to_map(parse_json_safe(g.inline_env_json));
 	if (env_map) doc.env = env_map;
-	if (g.geodata_reload_interval) doc.geodata = { reloadInterval: g.geodata_reload_interval };
+	const raw_cron = trim(g.geodata_cron || g.geodata_reload_interval || "");
+	const cron_parts = filter(split(raw_cron, /[ \t]+/), x => x !== "");
+	const gd_cron = length(cron_parts) === 5 ? raw_cron : "";
+	const gd_out = trim(g.geodata_outbound || "");
+	const gd_assets = parse_json_safe(g.geodata_assets_json);
+	if ((gd_cron || gd_out || (type(gd_assets) === "array" && length(gd_assets) > 0)) && features.hasGeodataCron !== false) {
+		let gd = {};
+		if (gd_cron) gd.cron = gd_cron;
+		if (gd_out) gd.outbound = gd_out;
+		if (type(gd_assets) === "array" && length(gd_assets) > 0) gd.assets = gd_assets;
+		doc.geodata = gd;
+	}
 	if (g.min_version || g.max_version) {
 		doc.version = {};
 		if (g.min_version) doc.version.min = g.min_version;
@@ -431,16 +532,20 @@ export function compile_xray(cfg, opts) {
 		if (d.serve_expired_ttl) doc.dns.serveExpiredTTL = int(d.serve_expired_ttl);
 		if (d.use_system_hosts === "1") doc.dns.useSystemHosts = true;
 		if (d.client_ip) doc.dns.clientIp = d.client_ip;
+		let hosts = {};
+		const raw_hosts = parse_json_safe(d.hosts_json);
+		if (type(raw_hosts) === "object") {
+			for (let k in raw_hosts) hosts[k] = raw_hosts[k];
+		}
 		const host_entries = parse_json_safe(d.host_entries_json);
 		if (type(host_entries) === "array" && length(host_entries) > 0) {
-			let hosts = {};
 			for (let h in host_entries) {
 				if (h && h.domain && type(h.addresses) === "array" && length(h.addresses) > 0) {
 					hosts[h.domain] = length(h.addresses) === 1 ? h.addresses[0] : h.addresses;
 				}
 			}
-			if (length(keys(hosts)) > 0) doc.dns.hosts = hosts;
 		}
+		if (length(keys(hosts)) > 0) doc.dns.hosts = hosts;
 	}
 
 	if (length(cfg.fakedns) > 0) {
@@ -538,20 +643,29 @@ export function compile_xray(cfg, opts) {
 	if (p.enabled === "1") {
 		let levels = {};
 		const parsed_levels = parse_json_safe(p.policy_levels_json);
+		const num_or = (val, def) => (val != null && val !== "" ? int(val) : def);
 		if (type(parsed_levels) === "array" && length(parsed_levels) > 0) {
 			for (let lv in parsed_levels) {
-				levels[`${lv.level || "0"}`] = {
-					handshake: int(lv.handshake || 4),
-					connIdle: int(lv.conn_idle || 300),
-					uplinkOnly: int(lv.uplink_only || 2),
-					downlinkOnly: int(lv.downlink_only || 5),
-					bufferSize: int(lv.buffer_size || 4),
+				levels[`${lv.level != null && lv.level !== "" ? lv.level : "0"}`] = {
+					handshake: num_or(lv.handshake, 4),
+					connIdle: num_or(lv.conn_idle, 300),
+					uplinkOnly: num_or(lv.uplink_only, 2),
+					downlinkOnly: num_or(lv.downlink_only, 5),
+					bufferSize: num_or(lv.buffer_size, 4),
 					statsUserUplink: !!lv.stats_user_uplink,
 					statsUserDownlink: !!lv.stats_user_downlink
 				};
 			}
 		} else {
-			levels["0"] = { handshake: int(p.handshake || 4), connIdle: int(p.conn_idle || 300), uplinkOnly: int(p.uplink_only || 2), downlinkOnly: int(p.downlink_only || 5), bufferSize: int(p.buffer_size || 4) };
+			levels["0"] = {
+				handshake: num_or(p.handshake, 4),
+				connIdle: num_or(p.conn_idle, 300),
+				uplinkOnly: num_or(p.uplink_only, 2),
+				downlinkOnly: num_or(p.downlink_only, 5),
+				bufferSize: num_or(p.buffer_size, 4),
+				statsUserUplink: true,
+				statsUserDownlink: true
+			};
 		}
 		doc.policy = {
 			levels: levels,

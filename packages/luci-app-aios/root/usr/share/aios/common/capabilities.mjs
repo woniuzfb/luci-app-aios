@@ -19,7 +19,7 @@ export const CAPABILITIES = {
 		outboundProtocols: ["vmess", "vless", "trojan", "shadowsocks", "hysteria2", "freedom", "blackhole", "dns", "socks", "http", "loopback"],
 		transports: ["tcp", "ws", "grpc", "http", "h2", "kcp", "mkcp", "quic", "domainsocket", "hysteria2"],
 		securities: ["none", "tls"],
-		balancerStrategies: ["random", "leastPing"],
+		balancerStrategies: ["random", "leastPing", "leastLoad"],
 		maxMuxConcurrency: 1024,
 		supportsMetrics: false,
 		supportsFinalmask: false,
@@ -52,7 +52,7 @@ export function supports_feature(core, key, format) {
 	return !!cap[key];
 }
 
-export function validate_stream_combination(core, format, protocol, transport, security) {
+export function validate_stream_combination(core, format, protocol, transport, security, direction) {
 	let errors = [];
 	if (core === "xray") {
 		if (protocol === "hysteria" && transport !== "hysteria") {
@@ -73,6 +73,9 @@ export function validate_stream_combination(core, format, protocol, transport, s
 	} else {
 		if (security === "reality") {
 			push(errors, `V2Ray ${format || "jsonv4"} 不支持 REALITY 安全层。`);
+		}
+		if (security === "utls" && direction === "inbound") {
+			push(errors, "V2Ray uTLS 仅支持客户端出站（Outbound），不能用于入站（Inbound）。");
 		}
 		if (format !== "jsonv5" && security === "utls") {
 			push(errors, "V2Ray jsonv4 不支持独立 utls 安全层，请切换 jsonv5 或改用 tls。");

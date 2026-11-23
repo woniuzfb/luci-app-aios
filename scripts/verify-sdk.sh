@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Local OpenWrt SDK packaging verification helper (uses official OpenWrt SDK Docker image)
-# Usage: ./scripts/verify-sdk.sh [x86-64-23.05.5|x86-64-25.12.4]
+# Usage: ./scripts/verify-sdk.sh [x86-64-23.05.5|x86-64-25.12.6]
 
 SDK_TAG="${1:-x86-64-23.05.5}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

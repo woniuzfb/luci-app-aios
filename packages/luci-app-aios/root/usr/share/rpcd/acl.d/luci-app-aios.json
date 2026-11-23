@@ -8,11 +8,9 @@
 					"serviceStatus",
 					"preflightCheck",
 					"firewallInspect",
-					"validateConfig",
 					"stats",
 					"keyGen",
 					"listPresets",
-					"readPreset",
 					"readLog",
 					"readCompiledConfig",
 					"listCores",
@@ -35,6 +33,7 @@
 		"write": {
 			"ubus": {
 				"luci.aios": [
+					"validateConfig",
 					"savePreset",
 					"deletePreset",
 					"writeCompiledConfig",

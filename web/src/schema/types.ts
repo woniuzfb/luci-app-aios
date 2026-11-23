@@ -35,6 +35,10 @@ export interface GeneralConfig {
   custom_configuration_hook: string;
   // Xray top-level extensions
   inline_env?: KeyValuePair[];
+  geodata_cron?: string;
+  geodata_outbound?: string;
+  geodata_assets_json?: string;
+  /** @deprecated Legacy alias; prefer geodata_cron */
   geodata_reload_interval?: string;
   min_version?: string;
   max_version?: string;

@@ -1,5 +1,7 @@
 #!/bin/sh
-set -eu
+set -e
+
+. /usr/share/libubox/jshn.sh
 
 NAME=aios
 RUNTIME_DIR=/var/etc/aios
@@ -16,20 +18,27 @@ uci_get() {
 	echo "${ret:-$2}"
 }
 
-json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g' | tr '\n' ' '
+emit_error() {
+	local msg="$1"
+	local rolled_back="${2:-0}"
+	json_init
+	json_add_boolean "ok" 0
+	[ "$rolled_back" = "1" ] && json_add_boolean "rolled_back" 1
+	json_add_string "error" "$msg"
+	json_dump
 }
 
 write_status() {
 	local job_id="$1" state="$2" core="$3" tag="$4" progress="$5" msg="$6"
-	printf '{"job_id":"%s","state":"%s","core":"%s","tag":"%s","progress":%s,"message":"%s","updated_at":%s}\n' \
-		"$(json_escape "$job_id")" \
-		"$(json_escape "$state")" \
-		"$(json_escape "$core")" \
-		"$(json_escape "$tag")" \
-		"$progress" \
-		"$(json_escape "$msg")" \
-		"$(date +%s)" > "${STATUS_FILE}.tmp"
+	json_init
+	json_add_string "job_id" "$job_id"
+	json_add_string "state" "$state"
+	json_add_string "core" "$core"
+	json_add_string "tag" "$tag"
+	json_add_int "progress" "$progress"
+	json_add_string "message" "$msg"
+	json_add_int "updated_at" "$(date +%s)"
+	json_dump > "${STATUS_FILE}.tmp"
 	mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE"
 }
 
@@ -40,6 +49,23 @@ validate_tag() {
 }
 
 detect_linux_arch() {
+	# Prefer OpenWrt DISTRIB_ARCH to distinguish mips/mipsel and soft-float accurately
+	local dist_arch=""
+	if [ -r /etc/openwrt_release ]; then
+		dist_arch="$(sed -nE "s/^DISTRIB_ARCH=['\"]?([^'\"]+)['\"]?.*/\1/p" /etc/openwrt_release | head -n 1 || true)"
+	fi
+	case "$dist_arch" in
+		x86_64) echo "linux-64"; return 0 ;;
+		aarch64_*) echo "linux-arm64-v8a"; return 0 ;;
+		arm_cortex-a*) echo "linux-arm32-v7a"; return 0 ;;
+		arm_arm1176jzf-s_vfp|arm_*) echo "linux-arm32-v6"; return 0 ;;
+		mipsel_*) echo "linux-mips32le"; return 0 ;;
+		mips_*) echo "linux-mips32"; return 0 ;;
+		mips64el_*) echo "linux-mips64le"; return 0 ;;
+		mips64_*) echo "linux-mips64"; return 0 ;;
+		riscv64_*) echo "linux-riscv64"; return 0 ;;
+		i386_*) echo "linux-32"; return 0 ;;
+	esac
 	case "$(uname -m)" in
 		x86_64|amd64) echo "linux-64" ;;
 		aarch64|arm64) echo "linux-arm64-v8a" ;;
@@ -57,7 +83,10 @@ detect_linux_arch() {
 
 avail_kb() {
 	local dir="$1"
-	[ -d "$dir" ] || dir="$(dirname "$dir")"
+	while [ -n "$dir" ] && [ ! -d "$dir" ] && [ "$dir" != "/" ]; do
+		dir="$(dirname "$dir")"
+	done
+	[ -d "$dir" ] || dir="/"
 	df -Pk "$dir" 2>/dev/null | awk 'NR>1 {val=$(NF-2)} END {print val+0}' || echo 0
 }
 
@@ -152,7 +181,7 @@ cmd_install() {
 		fi
 	fi
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-		write_status "$job_id" "error" "$core" "$tag" 0 "Another install job is already running"
+		# Do NOT overwrite the active job's status file on lock contention
 		exit 1
 	fi
 	echo "$$" > "${LOCK_DIR}/pid"
@@ -236,11 +265,11 @@ cmd_install() {
 			exit 1
 		fi
 	else
-		if ! wget -q -O "${_WORK_TMP}/${asset}" "${base_url}/${asset}"; then
+		if ! wget -q -T 120 -O "${_WORK_TMP}/${asset}" "${base_url}/${asset}"; then
 			write_status "$job_id" "error" "$core" "$tag" 15 "Failed to download ${asset}"
 			exit 1
 		fi
-		if ! wget -q -O "${_WORK_TMP}/${asset}.dgst" "${base_url}/${asset}.dgst"; then
+		if ! wget -q -T 60 -O "${_WORK_TMP}/${asset}.dgst" "${base_url}/${asset}.dgst"; then
 			write_status "$job_id" "error" "$core" "$tag" 35 "Failed to download ${asset}.dgst"
 			exit 1
 		fi
@@ -279,7 +308,7 @@ cmd_switch() {
 	cfg_bins_dir="$(uci_get main.bins_dir '')"
 
 	if ! is_allowed_core_bin "$target_bin" "$cfg_bins_dir"; then
-		echo '{"ok":false,"error":"Target binary path is not in allowed whitelist or not executable"}'
+		emit_error "Target binary path is not in allowed whitelist or not executable"
 		exit 0
 	fi
 
@@ -296,17 +325,17 @@ cmd_switch() {
 		if [ -n "$target_ver" ]; then
 			if ! /usr/bin/ucode /usr/share/aios/gen_config.uc --target-core "$target_core" --target-version "$target_ver" > "$test_cfg" 2>"${test_cfg}.err"; then
 				local err_msg
-				err_msg="$(cat "${test_cfg}.err" 2>/dev/null | head -n 3)"
+				err_msg="$(head -n 3 "${test_cfg}.err" 2>/dev/null || true)"
 				rm -f "$test_cfg" "${test_cfg}.err"
-				printf '{"ok":false,"error":"ucode compile failed: %s"}\n' "$(json_escape "$err_msg")"
+				emit_error "ucode compile failed: ${err_msg}"
 				exit 0
 			fi
 		else
 			if ! /usr/bin/ucode /usr/share/aios/gen_config.uc --target-core "$target_core" > "$test_cfg" 2>"${test_cfg}.err"; then
 				local err_msg
-				err_msg="$(cat "${test_cfg}.err" 2>/dev/null | head -n 3)"
+				err_msg="$(head -n 3 "${test_cfg}.err" 2>/dev/null || true)"
 				rm -f "$test_cfg" "${test_cfg}.err"
-				printf '{"ok":false,"error":"ucode compile failed: %s"}\n' "$(json_escape "$err_msg")"
+				emit_error "ucode compile failed: ${err_msg}"
 				exit 0
 			fi
 		fi
@@ -316,7 +345,7 @@ cmd_switch() {
 	elif [ -s "${PERSIST_DIR}/compiled.json" ]; then
 		cp -f "${PERSIST_DIR}/compiled.json" "$test_cfg"
 	else
-		echo '{"ok":false,"error":"No ucode available and no precompiled JSON supplied"}'
+		emit_error "No ucode available and no precompiled JSON supplied"
 		exit 0
 	fi
 
@@ -340,28 +369,38 @@ cmd_switch() {
 
 	if [ "$test_ok" != "1" ]; then
 		rm -f "$test_cfg"
-		printf '{"ok":false,"error":"Core -test failed: %s"}\n' "$(json_escape "$test_out")"
+		emit_error "Core -test failed: ${test_out}"
 		exit 0
 	fi
 
 	# 3. Backup current state for automatic rollback
-	local prev_bin prev_core_type bins_dir prev_link="" enabled
+	local prev_bin prev_core_type prev_target_ver bins_dir prev_link="" had_compiled=0 enabled prev_pid=""
 	prev_bin="$(uci_get main.core_bin '')"
 	prev_core_type="$(uci_get main.core_type auto)"
+	prev_target_ver="$(uci_get main.target_version auto)"
 	bins_dir="$(uci_get main.bins_dir '')"
 	enabled="$(uci_get main.enabled 0)"
+	[ -s "$PID_FILE" ] && prev_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
 	if [ -n "$bins_dir" ] && [ -L "${bins_dir}/current" ]; then
 		prev_link="$(readlink "${bins_dir}/current" 2>/dev/null || true)"
 	fi
-	[ -s "${PERSIST_DIR}/compiled.json" ] && cp -f "${PERSIST_DIR}/compiled.json" "${PERSIST_DIR}/compiled.json.bak"
+	if [ -s "${PERSIST_DIR}/compiled.json" ]; then
+		had_compiled=1
+		cp -f "${PERSIST_DIR}/compiled.json" "${PERSIST_DIR}/compiled.json.bak"
+	fi
 
-	# 4. Atomic switch (symlink if inside bins_dir, plus UCI core_bin & core_type sync)
+	# 4. Atomic switch (canonicalized symlink check inside bins_dir, plus UCI sync)
 	local next_bin="$target_bin"
-	if [ -n "$bins_dir" ]; then
-		case "$target_bin" in
-			"${bins_dir}"/*)
-				ln -sfn "$target_bin" "${bins_dir}/current"
+	local created_link=0
+	if [ -n "$bins_dir" ] && [ -d "$bins_dir" ]; then
+		local real_bins real_target
+		real_bins="$(readlink -f "$bins_dir" 2>/dev/null || echo "$bins_dir")"
+		real_target="$(readlink -f "$target_bin" 2>/dev/null || echo "$target_bin")"
+		case "$real_target" in
+			"${real_bins}/"*)
+				ln -sfn "$real_target" "${bins_dir}/current"
 				next_bin="${bins_dir}/current"
+				created_link=1
 				;;
 		esac
 	fi
@@ -374,42 +413,68 @@ cmd_switch() {
 	if [ "$prev_core_type" != "auto" ] && [ "$prev_core_type" != "$target_core" ]; then
 		uci set "${NAME}.main.core_type=${target_core}"
 	fi
+	# Keep target_version consistent with the newly tested target binary
+	if [ "$prev_target_ver" != "auto" ] && [ -n "$target_ver" ] && [ "$prev_target_ver" != "$target_ver" ]; then
+		uci set "${NAME}.main.target_version=auto"
+	fi
 	uci commit "$NAME"
 	rm -f "$test_cfg"
 
 	# 5. Restart & short watchdog with automatic rollback
-	if [ "$enabled" = "1" ]; then
-		/etc/init.d/aios restart >/dev/null 2>&1 || true
+	local was_running=0
+	[ -n "$prev_pid" ] && [ -d "/proc/${prev_pid}" ] && was_running=1
+	if [ "$enabled" = "1" ] || [ "$was_running" = "1" ]; then
+		/etc/init.d/aios stop >/dev/null 2>&1 || true
+		FORCE_START=1 /etc/init.d/aios start >/dev/null 2>&1 || true
 		sleep 2
-		local alive=0 pid=""
+		local alive=0 pid="" expected_exe="" actual_exe=""
+		expected_exe="$(readlink -f "$target_bin" 2>/dev/null || echo "$target_bin")"
 		if [ -s "$PID_FILE" ]; then
 			pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-			[ -n "$pid" ] && [ -d "/proc/${pid}" ] && alive=1
+			if [ -n "$pid" ] && [ "$pid" != "$prev_pid" ] && [ -d "/proc/${pid}" ]; then
+				actual_exe="$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)"
+				if [ -z "$actual_exe" ] || [ "$actual_exe" = "$expected_exe" ]; then
+					alive=1
+				fi
+			fi
 		fi
 		if [ "$alive" != "1" ]; then
 			# Automatic rollback
-			if [ -n "$bins_dir" ] && [ -n "$prev_link" ]; then
-				ln -sfn "$prev_link" "${bins_dir}/current"
+			if [ -n "$bins_dir" ]; then
+				if [ -n "$prev_link" ]; then
+					ln -sfn "$prev_link" "${bins_dir}/current"
+				elif [ "$created_link" = "1" ]; then
+					rm -f "${bins_dir}/current"
+				fi
 			fi
-			[ -s "${PERSIST_DIR}/compiled.json.bak" ] && mv -f "${PERSIST_DIR}/compiled.json.bak" "${PERSIST_DIR}/compiled.json"
+			if [ "$had_compiled" = "1" ] && [ -s "${PERSIST_DIR}/compiled.json.bak" ]; then
+				mv -f "${PERSIST_DIR}/compiled.json.bak" "${PERSIST_DIR}/compiled.json"
+			elif [ "$had_compiled" = "0" ]; then
+				rm -f "${PERSIST_DIR}/compiled.json"
+			fi
 			if [ -n "$prev_bin" ]; then
 				uci set "${NAME}.main.core_bin=${prev_bin}"
 			else
 				uci delete "${NAME}.main.core_bin" 2>/dev/null || true
 			fi
 			uci set "${NAME}.main.core_type=${prev_core_type}"
+			uci set "${NAME}.main.target_version=${prev_target_ver}"
 			uci commit "$NAME"
-			/etc/init.d/aios restart >/dev/null 2>&1 || true
-			echo '{"ok":false,"rolled_back":true,"error":"New core failed watchdog after restart; automatically rolled back"}'
+			if [ "$enabled" = "1" ] || [ "$was_running" = "1" ]; then
+				FORCE_START=1 /etc/init.d/aios start >/dev/null 2>&1 || true
+			fi
+			emit_error "New core failed watchdog after restart; automatically rolled back" 1
 			exit 0
 		fi
 	fi
 
 	rm -f "${PERSIST_DIR}/compiled.json.bak"
-	printf '{"ok":true,"core":"%s","version":"%s","core_bin":"%s"}\n' \
-		"$(json_escape "$target_core")" \
-		"$(json_escape "${target_ver:-unknown}")" \
-		"$(json_escape "$next_bin")"
+	json_init
+	json_add_boolean "ok" 1
+	json_add_string "core" "$target_core"
+	json_add_string "version" "${target_ver:-unknown}"
+	json_add_string "core_bin" "$next_bin"
+	json_dump
 }
 
 cmd="${1:-}"

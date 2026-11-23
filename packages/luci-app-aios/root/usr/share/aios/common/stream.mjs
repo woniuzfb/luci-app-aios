@@ -25,7 +25,7 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 	if (!is_xray && net === "hysteria") net = "hysteria2";
 
 	let security = item.security || "none";
-	const errs = validate_stream_combination(core, "jsonv4", protocol || item.protocol || "", net, security);
+	const errs = validate_stream_combination(core, "jsonv4", protocol || item.protocol || "", net, security, is_inbound ? "inbound" : "outbound");
 	if (length(errs) > 0) {
 		die(`AIOS stream validation error (${item.tag || item[".name"] || "node"}): ${join("; ", errs)}`);
 	}

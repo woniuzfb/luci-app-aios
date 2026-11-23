@@ -30,7 +30,14 @@ const importError = ref('');
 
 const previewPreset = ref<AiosPreset | null>(null);
 const previewDiffs = computed<PresetDiffEntry[]>(() =>
-  previewPreset.value ? computePresetDiff(props.config, previewPreset.value.config) : []
+  previewPreset.value
+    ? computePresetDiff(
+        props.config,
+        applyPresetToConfig(props.config, previewPreset.value, {
+          preserveOutbounds: preserveOutbounds.value
+        })
+      )
+    : []
 );
 
 function handleSaveCurrent() {

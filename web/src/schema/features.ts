@@ -24,6 +24,11 @@ export interface ResolvedXrayFeatures {
   hasTunInbound: boolean;
   hasHysteria: boolean;
   hasMasque: boolean;
+  hasDnsRewriteKeys: boolean;
+  hasGeodataCron: boolean;
+  hasFreedomFinalRules: boolean;
+  hasSsUot: boolean;
+  requireTlsPublicVlessTrojan: boolean;
 }
 
 export interface ResolvedV2RayFeatures {
@@ -102,7 +107,12 @@ export function resolveCoreFeatures(
       hasLegacyReverse: evalRule(f.legacyReverse, effective),
       hasTunInbound: evalRule(f.tunInbound, effective),
       hasHysteria: evalRule(f.hysteria, effective),
-      hasMasque: evalRule(f.masque, effective)
+      hasMasque: evalRule(f.masque, effective),
+      hasDnsRewriteKeys: evalRule(f.dnsRewriteKeys, effective),
+      hasGeodataCron: evalRule(f.geodataCron, effective),
+      hasFreedomFinalRules: evalRule(f.freedomFinalRules, effective),
+      hasSsUot: evalRule(f.ssUot, effective),
+      requireTlsPublicVlessTrojan: evalRule(f.requireTlsPublicVlessTrojan, effective)
     };
   }
 

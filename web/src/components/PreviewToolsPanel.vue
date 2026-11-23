@@ -7,6 +7,9 @@ import { parseGeoDatIndex, type GeoCategorySummary } from '@/geodata/parser';
 const props = defineProps<{
   compiled: CompileResult;
   api: AiosApiClient;
+  coreType?: string;
+  v2rayFormat?: string;
+  coreBin?: string;
 }>();
 
 const validateRes = ref<ValidateResult | null>(null);
@@ -14,30 +17,72 @@ const keyOutput = ref('');
 const logContent = ref('');
 const statsData = ref<StatsResponse | null>(null);
 const geoCategories = ref<GeoCategorySummary[]>([]);
+const geoError = ref('');
 const geoSearch = ref('');
+const busy = ref(false);
 
 async function runValidate() {
-  validateRes.value = await props.api.validateConfig(JSON.stringify(props.compiled.json, null, 2));
+  busy.value = true;
+  try {
+    validateRes.value = await props.api.validateConfig(JSON.stringify(props.compiled.json, null, 2), {
+      core_type: props.coreType,
+      v2ray_format: props.v2rayFormat,
+      core_bin: props.coreBin
+    });
+  } catch (e) {
+    validateRes.value = { ok: false, output: `校验请求失败: ${String(e)}` };
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function runKeyGen(kind: 'uuid' | 'x25519' | 'mldsa65' | 'vlessenc' | 'wg') {
-  keyOutput.value = await props.api.keyGen(kind);
+  busy.value = true;
+  try {
+    keyOutput.value = await props.api.keyGen(kind);
+  } catch (e) {
+    keyOutput.value = `生成失败: ${String(e)}`;
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function refreshLog() {
-  logContent.value = await props.api.readLog();
+  busy.value = true;
+  try {
+    logContent.value = await props.api.readLog();
+  } catch (e) {
+    logContent.value = `读取日志失败: ${String(e)}`;
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function refreshStats() {
-  statsData.value = await props.api.getStats();
+  busy.value = true;
+  try {
+    statsData.value = await props.api.getStats();
+  } catch (e) {
+    statsData.value = { source: 'none', core: props.coreType || 'xray', data: { error: String(e) } };
+  } finally {
+    busy.value = false;
+  }
 }
 
 async function handleGeoUpload(event: Event) {
   const input = event.target as HTMLInputElement;
   const file = input.files?.[0];
   if (!file) return;
-  const buf = await file.arrayBuffer();
-  geoCategories.value = parseGeoDatIndex(buf);
+  geoError.value = '';
+  try {
+    const buf = await file.arrayBuffer();
+    geoCategories.value = parseGeoDatIndex(buf);
+  } catch (e) {
+    geoCategories.value = [];
+    geoError.value = `解析 GeoData 文件失败：${String(e)}`;
+  } finally {
+    input.value = '';
+  }
 }
 </script>
 
@@ -47,7 +92,7 @@ async function handleGeoUpload(event: Event) {
     <div class="card">
       <div class="card-header">
         <h3 class="card-title">实时编译配置预览（目标内核：{{ compiled.core.toUpperCase() }}）</h3>
-        <button class="btn btn-primary" @click="runValidate">调用内核校验 (-test)</button>
+        <button class="btn btn-primary" :disabled="busy" @click="runValidate">调用内核校验 (-test)</button>
       </div>
 
       <div v-if="compiled.diagnostics.length > 0" class="alert alert-warn">
@@ -73,11 +118,11 @@ async function handleGeoUpload(event: Event) {
           <h3 class="card-title">密钥与工具箱</h3>
         </div>
         <div class="row" style="margin-bottom: 10px">
-          <button class="btn" @click="runKeyGen('uuid')">生成 UUID</button>
-          <button class="btn" @click="runKeyGen('x25519')">X25519 (REALITY)</button>
-          <button class="btn" @click="runKeyGen('mldsa65')">ML-DSA-65</button>
-          <button class="btn" @click="runKeyGen('vlessenc')">VLESS Enc</button>
-          <button class="btn" @click="runKeyGen('wg')">WireGuard Key</button>
+          <button class="btn" :disabled="busy" @click="runKeyGen('uuid')">生成 UUID</button>
+          <button class="btn" :disabled="busy" @click="runKeyGen('x25519')">X25519 (REALITY)</button>
+          <button class="btn" :disabled="busy" @click="runKeyGen('mldsa65')">ML-DSA-65</button>
+          <button class="btn" :disabled="busy" @click="runKeyGen('vlessenc')">VLESS Enc</button>
+          <button class="btn" :disabled="busy" @click="runKeyGen('wg')">WireGuard Key</button>
         </div>
         <pre v-if="keyOutput" class="code-block" style="max-height: 180px">{{ keyOutput }}</pre>
       </div>
@@ -90,6 +135,7 @@ async function handleGeoUpload(event: Event) {
             <input type="file" accept=".dat" style="display: none" @change="handleGeoUpload" />
           </label>
         </div>
+        <div v-if="geoError" class="alert alert-err" style="margin-bottom: 8px">{{ geoError }}</div>
         <input v-if="geoCategories.length > 0" v-model="geoSearch" type="text" placeholder="搜索分类代码，如 cn / google / ads" />
         <div v-if="geoCategories.length > 0" style="max-height: 180px; overflow: auto; margin-top: 8px">
           <table class="table">
@@ -115,7 +161,7 @@ async function handleGeoUpload(event: Event) {
       <div class="card">
         <div class="card-header">
           <h3 class="card-title">运行统计 (Metrics / API)</h3>
-          <button class="btn" @click="refreshStats">刷新统计</button>
+          <button class="btn" :disabled="busy" @click="refreshStats">刷新统计</button>
         </div>
         <pre v-if="statsData" class="code-block" style="max-height: 220px">{{ JSON.stringify(statsData, null, 2) }}</pre>
         <div v-else style="color: var(--muted); font-size: 12.5px">点击刷新拉取 Xray Metrics (/debug/vars) 或 V2Ray StatsService。</div>
@@ -123,7 +169,7 @@ async function handleGeoUpload(event: Event) {
       <div class="card">
         <div class="card-header">
           <h3 class="card-title">错误日志</h3>
-          <button class="btn" @click="refreshLog">读取日志</button>
+          <button class="btn" :disabled="busy" @click="refreshLog">读取日志</button>
         </div>
         <pre v-if="logContent" class="code-block" style="max-height: 220px">{{ logContent }}</pre>
         <div v-else style="color: var(--muted); font-size: 12.5px">点击读取日志查看最新 200 行内核日志。</div>

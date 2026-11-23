@@ -37,6 +37,8 @@ jobs:
           sh -n packages/luci-app-aios/root/usr/share/aios/core_manager.sh
           sh -n packages/luci-app-aios/root/etc/hotplug.d/iface/90-aios-gateway
           sh -n packages/luci-app-aios/root/etc/uci-defaults/90-luci-aios
+          bash -n scripts/core-versions.sh scripts/verify-sdk.sh scripts/release.sh
+          node --check scripts/verify-core-matrix.mjs
       - name: Upload compiled web assets
         uses: actions/upload-artifact@v7
         with:
@@ -53,9 +55,9 @@ jobs:
           - name: openwrt-23.05.5
             sdk_url_path: https://downloads.openwrt.org/releases/23.05.5/targets/x86/64
             sdk_name: -sdk-23.05.5-x86-64_
-          - name: openwrt-25.12.4
-            sdk_url_path: https://downloads.openwrt.org/releases/25.12.4/targets/x86/64
-            sdk_name: -sdk-25.12.4-x86-64_
+          - name: openwrt-25.12.6
+            sdk_url_path: https://downloads.openwrt.org/releases/25.12.6/targets/x86/64
+            sdk_name: -sdk-25.12.6-x86-64_
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8

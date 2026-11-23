@@ -32,13 +32,15 @@ function addTokens(raw: string) {
     .filter(Boolean);
   if (parts.length === 0) return;
 
-  const next = [...items.value];
+  const toAdd: string[] = [];
   for (const p of parts) {
-    if (props.allowDuplicates || !next.includes(p)) {
-      next.push(p);
+    if (props.allowDuplicates || (!items.value.includes(p) && !toAdd.includes(p))) {
+      toAdd.push(p);
     }
   }
-  emit('update:modelValue', next);
+  if (toAdd.length > 0) {
+    emit('update:modelValue', [...toAdd, ...items.value]);
+  }
   draft.value = '';
 }
 

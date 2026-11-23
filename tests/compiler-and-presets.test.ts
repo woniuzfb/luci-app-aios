@@ -89,7 +89,7 @@ describe('Dual-Core Compiler (Xray vs V2Ray jsonv4 & jsonv5)', () => {
     };
     expect(routing.rules.some((r) => Array.isArray(r.domains))).toBe(true);
     expect(routing.balancers[0].strategy.type).toBe('random');
-    expect(routing.balancers[0].fallbackTag).toBeUndefined();
+    expect(routing.balancers[0].fallbackTag).toBe('direct');
 
     const outbounds = res.json.outbounds as Array<Record<string, unknown>>;
     expect(outbounds[0].protocol).toBe('hysteria2');
