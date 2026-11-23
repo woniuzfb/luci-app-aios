@@ -56,6 +56,43 @@ sanitize_id() {
 	echo "$1" | tr -cd 'a-zA-Z0-9_-' | cut -c1-64
 }
 
+is_service_running() {
+	local svc="$1"
+	[ -x "/etc/init.d/${svc}" ] || return 1
+	if command -v ubus >/dev/null 2>&1; then
+		ubus call service list "{\"name\":\"${svc}\"}" 2>/dev/null | grep -q '"running"[[:space:]]*:[[:space:]]*true'
+		return $?
+	fi
+	return 1
+}
+
+validate_json_file() {
+	local file="$1" first_ch
+	[ -s "$file" ] || return 1
+	first_ch="$(tr -d ' \t\r\n' < "$file" 2>/dev/null | head -c 1)"
+	case "$first_ch" in
+		'{'|'[') ;;
+		*) return 1 ;;
+	esac
+	if command -v jsonfilter >/dev/null 2>&1; then
+		jsonfilter -i "$file" -e '@' >/dev/null 2>&1
+		return $?
+	fi
+	jshn -R "$file" >/dev/null 2>&1
+}
+
+load_rpc_json_input() {
+	mkdir -p "$RUNTIME_DIR"
+	local req_tmp="${RUNTIME_DIR}/rpc_in.$$.json"
+	cat > "$req_tmp"
+	if type json_load_file >/dev/null 2>&1; then
+		json_load_file "$req_tmp"
+	else
+		json_load "$(cat "$req_tmp")"
+	fi
+	rm -f "$req_tmp"
+}
+
 resolve_core_bin() {
 	local pref="${1:-}" bin configured cand cands fallback
 	if [ -z "$pref" ] || [ "$pref" = "auto" ]; then
@@ -163,7 +200,7 @@ rpc_preflight_check() {
 	[ -s "$PID_FILE" ] && aios_pid="$(cat "$PID_FILE" 2>/dev/null)"
 
 	for svc in xray xray_core v2ray passwall passwall2 openclash homeproxy shadowsocksr sing-box v2raya; do
-		if [ -x "/etc/init.d/${svc}" ] && /etc/init.d/"${svc}" running >/dev/null 2>&1; then
+		if is_service_running "$svc"; then
 			svc_list="${svc_list}${svc}
 "
 		fi
@@ -431,9 +468,8 @@ rpc_firewall_action() {
 }
 
 rpc_validate_config() {
-	local input config_json req_core_type req_fmt req_bin bin core_type fmt asset tmp out code
-	read -r input
-	json_load "$input"
+	local config_json req_core_type req_fmt req_bin bin core_type fmt asset tmp out code
+	load_rpc_json_input
 	json_get_var config_json "config"
 	json_get_var req_core_type "core_type"
 	json_get_var req_fmt "v2ray_format"
@@ -556,7 +592,7 @@ rpc_list_presets() {
 	local first=1 f
 	for f in "${PRESETS_DIR}"/*.json; do
 		[ -s "$f" ] || continue
-		jshn -R "$f" >/dev/null 2>&1 || continue
+		validate_json_file "$f" || continue
 		[ "$first" = "0" ] && printf ','
 		first=0
 		cat "$f"
@@ -565,9 +601,8 @@ rpc_list_presets() {
 }
 
 rpc_save_preset() {
-	local input id payload safe_id tmp_file
-	read -r input
-	json_load "$input"
+	local id payload safe_id tmp_file
+	load_rpc_json_input
 	json_get_var id "id"
 	json_get_var payload "payload"
 	safe_id="$(sanitize_id "$id")"
@@ -578,7 +613,7 @@ rpc_save_preset() {
 	mkdir -p "$PRESETS_DIR"
 	tmp_file="${PRESETS_DIR}/${safe_id}.json.tmp.$$"
 	printf '%s\n' "$payload" > "$tmp_file"
-	if ! jshn -R "$tmp_file" >/dev/null 2>&1; then
+	if ! validate_json_file "$tmp_file"; then
 		rm -f "$tmp_file"
 		echo '{"ok":false,"error":"preset payload is not valid JSON"}'
 		return
@@ -599,15 +634,14 @@ rpc_delete_preset() {
 }
 
 rpc_write_compiled_config() {
-	local input content tmp_file
-	read -r input
-	json_load "$input"
+	local content tmp_file
+	load_rpc_json_input
 	json_get_var content "content"
 	[ -z "$content" ] && { echo '{"ok":false,"error":"empty content"}'; return; }
 	mkdir -p "$PERSIST_DIR"
 	tmp_file="${PERSIST_DIR}/compiled.json.tmp.$$"
 	printf '%s\n' "$content" > "$tmp_file"
-	if ! jshn -R "$tmp_file" >/dev/null 2>&1; then
+	if ! validate_json_file "$tmp_file"; then
 		rm -f "$tmp_file"
 		echo '{"ok":false,"error":"compiled config is not valid JSON"}'
 		return
@@ -877,9 +911,8 @@ rpc_install_status() {
 }
 
 rpc_switch_core() {
-	local input target_bin compiled_json bins_dir tmp_json=""
-	read -r input
-	json_load "$input"
+	local target_bin compiled_json bins_dir tmp_json=""
+	load_rpc_json_input
 	json_get_var target_bin "path"
 	json_get_var compiled_json "compiled_json"
 	bins_dir="$(uci_get main.bins_dir '')"

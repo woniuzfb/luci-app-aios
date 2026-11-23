@@ -271,11 +271,11 @@ cmd_install() {
 		fi
 	else
 		if ! wget -q -T 120 -O "${_WORK_TMP}/${asset}" "${base_url}/${asset}"; then
-			write_status "$job_id" "error" "$core" "$tag" 15 "Failed to download ${asset}"
+			write_status "$job_id" "error" "$core" "$tag" 15 "Failed to download ${asset} (check network/TLS support or install curl)"
 			exit 1
 		fi
 		if ! wget -q -T 60 -O "${_WORK_TMP}/${asset}.dgst" "${base_url}/${asset}.dgst"; then
-			write_status "$job_id" "error" "$core" "$tag" 35 "Failed to download ${asset}.dgst"
+			write_status "$job_id" "error" "$core" "$tag" 35 "Failed to download ${asset}.dgst (check network/TLS support or install curl)"
 			exit 1
 		fi
 	fi

@@ -1,8 +1,15 @@
 #!/bin/sh
 # Refresh AIOS dynamic default gateway & IPv6 PD bypass sets on interface events
 
+case "$ACTION" in
+	ifup|ifupdate|ifdown) ;;
+	*) exit 0 ;;
+esac
+
 [ -f /var/etc/aios/aios_active ] || exit 0
 
-if command -v ucode >/dev/null 2>&1 && [ -x /usr/share/aios/firewall/gateway.uc ]; then
-	/usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1
+if command -v nft >/dev/null 2>&1 && nft list table inet aios >/dev/null 2>&1; then
+	if command -v ucode >/dev/null 2>&1 && [ -x /usr/share/aios/firewall/gateway.uc ]; then
+		/usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1
+	fi
 fi

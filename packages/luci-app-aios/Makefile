@@ -20,6 +20,7 @@ define Package/$(PKG_NAME)
 		+PACKAGE_AIOS_INCLUDE_FW4:kmod-nft-tproxy \
 		+PACKAGE_AIOS_INCLUDE_FW3:iptables \
 		+PACKAGE_AIOS_INCLUDE_FW3:iptables-mod-tproxy \
+		+PACKAGE_AIOS_INCLUDE_FW3:iptables-mod-extra \
 		+PACKAGE_AIOS_INCLUDE_FW3:ipset \
 		+PACKAGE_AIOS_INCLUDE_XRAY:aios-xray \
 		+PACKAGE_AIOS_INCLUDE_V2RAY:aios-v2ray \
@@ -40,7 +41,7 @@ config PACKAGE_AIOS_INCLUDE_FW4
 	default n
 
 config PACKAGE_AIOS_INCLUDE_FW3
-	bool "Depend on iptables + ipset + iptables-mod-tproxy (OpenWrt 19.07/21.02)"
+	bool "Depend on iptables + ipset + iptables-mod-tproxy + iptables-mod-extra (OpenWrt 19.07/21.02)"
 	default n
 
 config PACKAGE_AIOS_INCLUDE_XRAY
@@ -75,14 +76,26 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	fi
 	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache/
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
-	if [ -f /var/etc/aios/.restart_after_upgrade ]; then
-		rm -f /var/etc/aios/.restart_after_upgrade
-		if [ -x /etc/init.d/aios ]; then
-			/etc/init.d/aios start_manual >/dev/null 2>&1 || true
-		fi
-	elif [ -x /etc/init.d/aios ]; then
-		if /etc/init.d/aios running >/dev/null 2>&1 || [ -f /var/etc/aios/aios_active ]; then
-			/etc/init.d/aios reload >/dev/null 2>&1 || true
+	if [ -x /etc/init.d/aios ]; then
+		aios_enabled="$$(uci -q get aios.main.enabled 2>/dev/null || echo 0)"
+		if [ -f /var/etc/aios/.restart_after_upgrade ]; then
+			rm -f /var/etc/aios/.restart_after_upgrade
+			if [ "$${aios_enabled}" != "1" ] || ! /etc/init.d/aios enabled >/dev/null 2>&1; then
+				/etc/init.d/aios start_manual >/dev/null 2>&1 || true
+			fi
+		elif [ "$${PKG_UPGRADE:-0}" = "1" ]; then
+			aios_pid="$$(tr -cd '0-9' < /var/run/aios.main.pid 2>/dev/null || true)"
+			aios_live=0
+			if [ -n "$${aios_pid}" ] && [ -d "/proc/$${aios_pid}" ]; then
+				aios_live=1
+			elif [ -f /var/etc/aios/aios_active ]; then
+				aios_live=1
+			fi
+			if [ "$${aios_live}" = "1" ]; then
+				if [ "$${aios_enabled}" != "1" ] || ! /etc/init.d/aios enabled >/dev/null 2>&1; then
+					/etc/init.d/aios reload >/dev/null 2>&1 || true
+				fi
+			fi
 		fi
 	fi
 fi
@@ -96,7 +109,8 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 		if [ "$${PKG_UPGRADE:-0}" = "1" ] || [ "$${1:-}" = "upgrade" ]; then
 			mkdir -p /var/etc/aios
 			aios_pid="$$(tr -cd '0-9' < /var/run/aios.main.pid 2>/dev/null || true)"
-			if /etc/init.d/aios running >/dev/null 2>&1 || { [ -n "$${aios_pid}" ] && [ -d "/proc/$${aios_pid}" ]; }; then
+			if { [ -n "$${aios_pid}" ] && [ -d "/proc/$${aios_pid}" ]; } || \
+				{ command -v ubus >/dev/null 2>&1 && ubus call service list '{"name":"aios"}' 2>/dev/null | grep -q '"running"[[:space:]]*:[[:space:]]*true'; }; then
 				touch /var/etc/aios/.restart_after_upgrade
 			fi
 		fi

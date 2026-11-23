@@ -112,19 +112,51 @@ flush_route_pair() {
 	ip -6 route del local default dev lo table "$table" 2>/dev/null || true
 }
 
+probe_addrtype_v4() {
+	iptables -t mangle -N AIOS_PROBE_AT 2>/dev/null || iptables -t mangle -F AIOS_PROBE_AT 2>/dev/null || return 1
+	local ok=1
+	iptables -t mangle -A AIOS_PROBE_AT -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null && ok=0
+	iptables -t mangle -F AIOS_PROBE_AT 2>/dev/null || true
+	iptables -t mangle -X AIOS_PROBE_AT 2>/dev/null || true
+	return $ok
+}
+
+probe_addrtype_v6() {
+	ip6tables -t mangle -N AIOS_PROBE_AT 2>/dev/null || ip6tables -t mangle -F AIOS_PROBE_AT 2>/dev/null || return 1
+	local ok=1
+	ip6tables -t mangle -A AIOS_PROBE_AT -m addrtype --dst-type LOCAL -j RETURN 2>/dev/null && ok=0
+	ip6tables -t mangle -F AIOS_PROBE_AT 2>/dev/null || true
+	ip6tables -t mangle -X AIOS_PROBE_AT 2>/dev/null || true
+	return $ok
+}
+
 start_fw3_apply() {
 	create_ipsets || return 1
 	mkdir -p "$RUNTIME_DIR" || return 1
 
-	local iface ipv6_active=0
+	local iface ipv6_active=0 has_addrtype_v4=0 has_addrtype_v6=0
 	if [ -d /proc/sys/net/ipv6 ] && command -v ip6tables >/dev/null 2>&1 && ip6tables -t mangle -L -n >/dev/null 2>&1 && { [ "$TCP6_PORT" -gt 0 ] || [ "$UDP6_PORT" -gt 0 ]; }; then
 		ipv6_active=1
+	fi
+	if probe_addrtype_v4; then
+		has_addrtype_v4=1
+	else
+		echo "fw3_ipt.sh: warning: iptables -m addrtype unavailable (install iptables-mod-extra for complete local-address bypass)" >&2
+	fi
+	if [ "$ipv6_active" = "1" ]; then
+		if probe_addrtype_v6; then
+			has_addrtype_v6=1
+		else
+			echo "fw3_ipt.sh: warning: ip6tables -m addrtype unavailable (install iptables-mod-extra for complete IPv6 local-address bypass)" >&2
+		fi
 	fi
 
 	if [ "$MODE" = "redirect" ]; then
 		iptables -t nat -N AIOS_REDIRECT 2>/dev/null || true
 		run_cmd iptables -t nat -F AIOS_REDIRECT || return 1
-		run_cmd iptables -t nat -A AIOS_REDIRECT -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v4" = "1" ]; then
+			run_cmd iptables -t nat -A AIOS_REDIRECT -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		run_cmd iptables -t nat -A AIOS_REDIRECT -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
 		run_cmd iptables -t nat -A AIOS_REDIRECT -m mark --mark "$DNS_MARK" -j RETURN || return 1
 		if [ "$TCP4_PORT" -gt 0 ]; then
@@ -170,7 +202,9 @@ start_fw3_apply() {
 	if [ "$TCP4_PORT" -gt 0 ] || [ "$UDP4_PORT" -gt 0 ]; then
 		iptables -t mangle -N AIOS_PREROUTING_LOCAL 2>/dev/null || true
 		run_cmd iptables -t mangle -F AIOS_PREROUTING_LOCAL || return 1
-		run_cmd iptables -t mangle -A AIOS_PREROUTING_LOCAL -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v4" = "1" ]; then
+			run_cmd iptables -t mangle -A AIOS_PREROUTING_LOCAL -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		if [ "$TCP4_PORT" -gt 0 ]; then
 			run_cmd iptables -t mangle -A AIOS_PREROUTING_LOCAL -p tcp -j TPROXY --on-port "$TCP4_PORT" --tproxy-mark "$TPROXY_MARK" || return 1
 		fi
@@ -180,7 +214,9 @@ start_fw3_apply() {
 
 		iptables -t mangle -N AIOS_PREROUTING 2>/dev/null || true
 		run_cmd iptables -t mangle -F AIOS_PREROUTING || return 1
-		run_cmd iptables -t mangle -A AIOS_PREROUTING -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v4" = "1" ]; then
+			run_cmd iptables -t mangle -A AIOS_PREROUTING -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		for iface in $BP_IFACES_V4; do
 			run_cmd iptables -t mangle -A AIOS_PREROUTING -i "$iface" -j RETURN || return 1
 		done
@@ -204,7 +240,9 @@ start_fw3_apply() {
 		if ! iptables -t mangle -A AIOS_OUTPUT -m conntrack --ctdir REPLY -j RETURN 2>/dev/null; then
 			echo "fw3_ipt.sh: warning: iptables conntrack --ctdir REPLY unavailable (install kmod-ipt-conntrack to prevent local reply loops)" >&2
 		fi
-		run_cmd iptables -t mangle -A AIOS_OUTPUT -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v4" = "1" ]; then
+			run_cmd iptables -t mangle -A AIOS_OUTPUT -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		run_cmd iptables -t mangle -A AIOS_OUTPUT -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
 		run_cmd iptables -t mangle -A AIOS_OUTPUT -m mark --mark "$DNS_MARK" -j RETURN || return 1
 		if [ "$TCP4_PORT" -gt 0 ]; then
@@ -237,7 +275,9 @@ start_fw3_apply() {
 	if [ "$ipv6_active" = "1" ]; then
 		ip6tables -t mangle -N AIOS_PREROUTING_LOCAL 2>/dev/null || true
 		run_cmd ip6tables -t mangle -F AIOS_PREROUTING_LOCAL || return 1
-		run_cmd ip6tables -t mangle -A AIOS_PREROUTING_LOCAL -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v6" = "1" ]; then
+			run_cmd ip6tables -t mangle -A AIOS_PREROUTING_LOCAL -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		if [ "$TCP6_PORT" -gt 0 ]; then
 			run_cmd ip6tables -t mangle -A AIOS_PREROUTING_LOCAL -p tcp -j TPROXY --on-port "$TCP6_PORT" --tproxy-mark "$TPROXY_MARK" || return 1
 		fi
@@ -247,7 +287,9 @@ start_fw3_apply() {
 
 		ip6tables -t mangle -N AIOS_PREROUTING 2>/dev/null || true
 		run_cmd ip6tables -t mangle -F AIOS_PREROUTING || return 1
-		run_cmd ip6tables -t mangle -A AIOS_PREROUTING -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v6" = "1" ]; then
+			run_cmd ip6tables -t mangle -A AIOS_PREROUTING -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		for iface in $BP_IFACES_V6; do
 			run_cmd ip6tables -t mangle -A AIOS_PREROUTING -i "$iface" -j RETURN || return 1
 		done
@@ -271,7 +313,9 @@ start_fw3_apply() {
 		if ! ip6tables -t mangle -A AIOS_OUTPUT -m conntrack --ctdir REPLY -j RETURN 2>/dev/null; then
 			echo "fw3_ipt.sh: warning: ip6tables conntrack --ctdir REPLY unavailable (install kmod-ipt-conntrack to prevent IPv6 LAN reply loops)" >&2
 		fi
-		run_cmd ip6tables -t mangle -A AIOS_OUTPUT -m addrtype --dst-type LOCAL -j RETURN || return 1
+		if [ "$has_addrtype_v6" = "1" ]; then
+			run_cmd ip6tables -t mangle -A AIOS_OUTPUT -m addrtype --dst-type LOCAL -j RETURN || return 1
+		fi
 		run_cmd ip6tables -t mangle -A AIOS_OUTPUT -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
 		run_cmd ip6tables -t mangle -A AIOS_OUTPUT -m mark --mark "$DNS_MARK" -j RETURN || return 1
 		if [ "$TCP6_PORT" -gt 0 ]; then
@@ -326,6 +370,8 @@ stop_fw3() {
 	iptables -t mangle -X AIOS_PREROUTING 2>/dev/null || true
 	iptables -t mangle -F AIOS_OUTPUT 2>/dev/null || true
 	iptables -t mangle -X AIOS_OUTPUT 2>/dev/null || true
+	iptables -t mangle -F AIOS_PROBE_AT 2>/dev/null || true
+	iptables -t mangle -X AIOS_PROBE_AT 2>/dev/null || true
 
 	if command -v ip6tables >/dev/null 2>&1; then
 		ip6tables-save -t mangle 2>/dev/null | grep -E '^-A (PREROUTING|OUTPUT) .*-j AIOS_(PREROUTING(_LOCAL)?|OUTPUT)' | sed 's/^-A /ip6tables -t mangle -D /' | sh 2>/dev/null || true
@@ -335,6 +381,8 @@ stop_fw3() {
 		ip6tables -t mangle -X AIOS_PREROUTING 2>/dev/null || true
 		ip6tables -t mangle -F AIOS_OUTPUT 2>/dev/null || true
 		ip6tables -t mangle -X AIOS_OUTPUT 2>/dev/null || true
+		ip6tables -t mangle -F AIOS_PROBE_AT 2>/dev/null || true
+		ip6tables -t mangle -X AIOS_PROBE_AT 2>/dev/null || true
 	fi
 
 	flush_route_pair "$TPROXY_MARK" "$ROUTE_TABLE"
