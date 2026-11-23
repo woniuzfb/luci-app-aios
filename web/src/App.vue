@@ -47,6 +47,7 @@ const quickPresetDesc = ref('');
 // Pre-start conflict detection & resolution modal
 const showConflictModal = ref(false);
 const conflictActionBusy = ref(false);
+const actionBusy = ref(false);
 const pendingAction = ref<'start' | 'restart' | 'save_and_apply' | null>(null);
 const pendingPreflight = ref<PreflightResult | null>(null);
 
@@ -133,6 +134,9 @@ async function refreshSystem() {
 
 async function handleCoreSwitched() {
   await refreshSystem();
+  if (config.value.general.target_version && config.value.general.target_version !== 'auto') {
+    config.value.general.target_version = 'auto';
+  }
   try {
     const latest = await api.loadConfig();
     config.value.general.core_bin = latest.general.core_bin;
@@ -157,27 +161,33 @@ async function executeSaveAndApply() {
 }
 
 async function handleSaveAndApply() {
+  if (actionBusy.value) return;
   const errors = compiled.value.diagnostics.filter((d) => d.level === 'error');
   if (errors.length > 0) {
     notify(`存在 ${errors.length} 个配置错误，已阻止保存与重启：${errors[0].path} — ${errors[0].message}`);
     activeTab.value = 'tools';
     return;
   }
-  if (config.value.general.enabled) {
-    try {
-      const pf = await api.preflightCheck();
-      preflight.value = pf;
-      if (isPreflightConflicting(pf)) {
-        pendingPreflight.value = pf;
-        pendingAction.value = 'save_and_apply';
-        showConflictModal.value = true;
-        return;
+  actionBusy.value = true;
+  try {
+    if (config.value.general.enabled) {
+      try {
+        const pf = await api.preflightCheck();
+        preflight.value = pf;
+        if (isPreflightConflicting(pf)) {
+          pendingPreflight.value = pf;
+          pendingAction.value = 'save_and_apply';
+          showConflictModal.value = true;
+          return;
+        }
+      } catch {
+        // fallback to direct save if preflight fails
       }
-    } catch {
-      // fallback to direct save if preflight fails
     }
+    await executeSaveAndApply();
+  } finally {
+    actionBusy.value = false;
   }
-  await executeSaveAndApply();
 }
 
 async function executeServiceAction(action: 'start' | 'stop' | 'restart') {
@@ -205,27 +215,34 @@ async function executeServiceAction(action: 'start' | 'stop' | 'restart') {
 }
 
 async function handleServiceAction(action: 'start' | 'stop' | 'restart') {
-  if (action === 'start' || action === 'restart') {
-    try {
-      const pf = await api.preflightCheck();
-      preflight.value = pf;
-      if (isPreflightConflicting(pf)) {
-        pendingPreflight.value = pf;
-        pendingAction.value = action;
-        showConflictModal.value = true;
-        return;
+  if (actionBusy.value) return;
+  actionBusy.value = true;
+  try {
+    if (action === 'start' || action === 'restart') {
+      try {
+        const pf = await api.preflightCheck();
+        preflight.value = pf;
+        if (isPreflightConflicting(pf)) {
+          pendingPreflight.value = pf;
+          pendingAction.value = action;
+          showConflictModal.value = true;
+          return;
+        }
+      } catch {
+        // continue directly if preflightCheck is unavailable
       }
-    } catch {
-      // continue directly if preflightCheck is unavailable
     }
+    await executeServiceAction(action);
+  } finally {
+    actionBusy.value = false;
   }
-  await executeServiceAction(action);
 }
 
 async function handleConflictResolve(mode: 'force' | 'stop_and_start') {
   const action = pendingAction.value;
-  if (!action) return;
+  if (!action || actionBusy.value) return;
   conflictActionBusy.value = true;
+  actionBusy.value = true;
   try {
     if (mode === 'stop_and_start' && pendingPreflight.value?.conflicting_services?.length) {
       await api.stopConflictingServices(pendingPreflight.value.conflicting_services);
@@ -241,13 +258,15 @@ async function handleConflictResolve(mode: 'force' | 'stop_and_start') {
     notify(`处理冲突失败: ${String(e)}`);
   } finally {
     conflictActionBusy.value = false;
+    actionBusy.value = false;
   }
 }
 
 async function handleStopConflictsOnly() {
   const svcs = preflight.value?.conflicting_services;
-  if (!svcs?.length) return;
+  if (!svcs?.length || actionBusy.value) return;
   conflictActionBusy.value = true;
+  actionBusy.value = true;
   try {
     const res = await api.stopConflictingServices(svcs);
     await refreshSystem();
@@ -256,6 +275,7 @@ async function handleStopConflictsOnly() {
     notify(`停止冲突服务失败: ${String(e)}`);
   } finally {
     conflictActionBusy.value = false;
+    actionBusy.value = false;
   }
 }
 
@@ -385,6 +405,7 @@ onMounted(async () => {
           <button
             v-if="serviceStatus?.running"
             class="btn btn-sm"
+            :disabled="actionBusy"
             @click="handleServiceAction('restart')"
           >
             重启
@@ -392,6 +413,7 @@ onMounted(async () => {
           <button
             v-if="serviceStatus?.running"
             class="btn btn-sm btn-danger"
+            :disabled="actionBusy"
             @click="handleServiceAction('stop')"
           >
             停止
@@ -399,11 +421,12 @@ onMounted(async () => {
           <button
             v-else
             class="btn btn-sm btn-success"
+            :disabled="actionBusy"
             @click="handleServiceAction('start')"
           >
             启动
           </button>
-          <button class="btn btn-sm btn-primary" @click="handleSaveAndApply">保存并应用</button>
+          <button class="btn btn-sm btn-primary" :disabled="actionBusy" @click="handleSaveAndApply">保存并应用</button>
         </div>
       </header>
 
@@ -411,13 +434,13 @@ onMounted(async () => {
         <section class="content">
           <div v-if="toast" class="alert" :class="toastType === 'error' ? 'alert-err' : 'alert-ok'">{{ toast }}</div>
 
-          <div v-if="hasPreflightConflicts" class="alert alert-warn" style="margin-bottom: 16px">
+          <div v-if="hasPreflightConflicts || (preflight?.warnings?.length ?? 0) > 0" class="alert alert-warn" style="margin-bottom: 16px">
             <div class="row" style="justify-content: space-between; align-items: center; margin-bottom: 6px">
               <strong>检测到外部代理或防火墙冲突风险</strong>
               <button
                 v-if="preflight?.conflicting_services?.length"
                 class="btn btn-sm btn-danger"
-                :disabled="conflictActionBusy"
+                :disabled="conflictActionBusy || actionBusy"
                 @click="handleStopConflictsOnly"
               >
                 {{ conflictActionBusy ? '停止中...' : `停止冲突服务 (${preflight.conflicting_services.join(', ')})` }}
@@ -603,7 +626,6 @@ onMounted(async () => {
           <TproxyPanel
             v-else-if="activeTab === 'tproxy'"
             :config="config"
-            :preflight="preflight"
             :detected-firewall="coreInfo?.detected_firewall || 'auto'"
             @run-preflight="refreshSystem"
           />
@@ -612,7 +634,6 @@ onMounted(async () => {
             v-else-if="activeTab === 'firewall'"
             :config="config"
             :api="api"
-            :preflight="preflight"
             :detected-firewall="coreInfo?.detected_firewall || 'nftables'"
             @notify="notify"
             @refresh-preflight="refreshSystem"

@@ -218,6 +218,7 @@ export class UbusApiClient implements AiosApiClient {
       throw new Error('已有保存操作正在进行中，请稍候再试');
     }
     this.saveInFlight = true;
+    let uciCommitted = false;
     try {
       const existing = await this.call<{ values?: UciRawDump }>('uci', 'get', { config: 'aios' });
       const existingNames = Object.keys(existing.values || {});
@@ -246,12 +247,21 @@ export class UbusApiClient implements AiosApiClient {
 
       // 3. Commit UCI and write precompiled JSON fallback for non-ucode legacy OpenWrt
       await this.call('uci', 'commit', { config: 'aios' });
-      const wr = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'writeCompiledConfig', {
-        content: compiledJson
-      });
-      this.assertOk(wr, 'writeCompiledConfig failed');
+      uciCommitted = true;
+      try {
+        const wr = await this.call<{ ok?: boolean; error?: string }>('luci.aios', 'writeCompiledConfig', {
+          content: compiledJson
+        });
+        this.assertOk(wr, 'writeCompiledConfig failed');
+      } catch (e) {
+        throw new Error(
+          `UCI 配置已提交，但写入预编译配置失败（请重试保存）：${e instanceof Error ? e.message : String(e)}`
+        );
+      }
     } catch (e) {
-      await this.call('uci', 'revert', { config: 'aios' }).catch(() => {});
+      if (!uciCommitted) {
+        await this.call('uci', 'revert', { config: 'aios' }).catch(() => {});
+      }
       throw e;
     } finally {
       this.saveInFlight = false;
@@ -317,11 +327,15 @@ class LocalMockApiClient implements AiosApiClient {
   private fwLiveRules = '';
 
   async getCoreInfo(): Promise<CoreInfo> {
+    const activeSlot = this.mockSlots.find((s) => s.path === this.mockActivePath) || this.mockSlots[0];
+    const coreType = activeSlot?.core || 'xray';
+    const coreVersion = activeSlot?.version || '26.11.9';
     return {
-      core_bin: '/usr/bin/aios-xray',
+      core_bin: activeSlot?.path || '/usr/bin/aios-xray',
       binary_exists: true,
-      core_type: 'xray',
-      version: 'Xray 26.9.8 (local preview mode)',
+      core_type: coreType,
+      version: `${coreType === 'v2ray' ? 'V2Ray' : 'Xray'} ${coreVersion} (local preview mode)`,
+      core_version: coreVersion,
       asset_location: '/usr/share/aios/geodata',
       has_geoip: true,
       has_geosite: true,

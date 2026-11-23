@@ -237,7 +237,6 @@ function addFallback() {
             <div class="field"><label>服务端私钥 (secretKey)</label><input v-model="selected.wg_secret_key" type="password" /></div>
             <div class="field"><label>MTU</label><input v-model.number="selected.wg_mtu" type="number" placeholder="1420" /></div>
           </div>
-          <ArrayInput v-model="selected.wg_address" label="服务端隧道地址 (address[])" placeholder="回车添加，如 10.0.0.1/24" />
           <div class="row-nowrap" style="justify-content: space-between">
             <strong style="font-size: 12.5px">允许接入的 Peers 列表 (peers[])</strong>
             <button class="btn btn-sm" @click="addWgPeer">+ 添加 Peer</button>

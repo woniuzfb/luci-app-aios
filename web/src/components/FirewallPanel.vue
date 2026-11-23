@@ -1,13 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import type { AiosConfig } from '@/schema/types';
-import type { AiosApiClient, FirewallStatus, PreflightResult } from '@/api/client';
+import type { AiosApiClient, FirewallStatus } from '@/api/client';
 import { computeLineDiff, renderExpectedFirewallRules } from '@/firewall/preview';
 
 const props = defineProps<{
   config: AiosConfig;
   api: AiosApiClient;
-  preflight: PreflightResult | null;
   detectedFirewall: 'nftables' | 'iptables' | 'none';
 }>();
 
@@ -98,13 +97,6 @@ onMounted(() => {
           IPv4: {{ status?.dynamic_direct_v4_count ?? 0 }} · IPv6: {{ status?.dynamic_direct_v6_count ?? 0 }}
         </div>
       </div>
-    </div>
-
-    <div v-if="preflight && preflight.warnings.length > 0" class="alert alert-warn">
-      <strong>共存插件与路由冲突提醒：</strong>
-      <ul style="margin: 6px 0 0 18px; padding: 0">
-        <li v-for="w in preflight.warnings" :key="w">{{ w }}</li>
-      </ul>
     </div>
 
     <!-- Action Bar -->

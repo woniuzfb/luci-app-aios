@@ -4,22 +4,38 @@ import { deep_merge, parse_duration_ns, parse_json_safe, to_array } from "../com
 import { resolve_core_features } from "../common/features.mjs";
 import { build_stream_settings } from "../common/stream.mjs";
 
+const V2RAY_SS_ALLOWED_METHODS = {
+	"aes-128-gcm": true, "aes_128_gcm": true, "aead_aes_128_gcm": true,
+	"aes-256-gcm": true, "aes_256_gcm": true, "aead_aes_256_gcm": true,
+	"chacha20-poly1305": true, "chacha20_poly1305": true, "aead_chacha20_poly1305": true, "chacha20-ietf-poly1305": true,
+	"none": true, "plain": true
+};
+
+function bool_or(v, def_val) {
+	if (v == null || v === "") return def_val;
+	return v === "1" || v === true || lc(`${v}`) === "true";
+}
+
+function num_or(val, def) {
+	return val != null && val !== "" ? int(val) : def;
+}
+
 function build_inbound(item) {
 	const proto = item.protocol === "tunnel" ? "dokodemo-door" : (item.protocol === "hysteria" ? "hysteria2" : (item.protocol || "socks"));
 	let obj = {
 		tag: item.tag || item[".name"],
 		listen: item.listen || "0.0.0.0",
-		port: int(item.port || 1080),
+		port: num_or(item.port, 1080),
 		protocol: proto,
 		settings: {}
 	};
 
-	const users = parse_json_safe(item.users_json);
+	const users = parse_json_safe(item.users_json, "users_json");
 	const has_users = type(users) === "array" && length(users) > 0;
-	const fallbacks = parse_json_safe(item.fallbacks_json);
+	const fallbacks = parse_json_safe(item.fallbacks_json, "fallbacks_json");
 
 	if (proto === "socks") {
-		obj.settings = { auth: item.socks_auth || "noauth", udp: item.socks_udp === "1" };
+		obj.settings = { auth: item.socks_auth || "noauth", udp: bool_or(item.socks_udp, true) };
 		if (item.socks_ip) obj.settings.ip = item.socks_ip;
 		if (item.packet_encoding) obj.settings.packetEncoding = item.packet_encoding;
 		if (item.socks_auth === "password") {
@@ -67,7 +83,8 @@ function build_inbound(item) {
 		if (item.packet_encoding) obj.settings.packetEncoding = item.packet_encoding;
 	} else if (proto === "shadowsocks") {
 		const ssMethod = item.method || "aes-256-gcm";
-		if (substr(ssMethod, 0, 12) === "2022-blake3-") {
+		const ssMethodLower = lc(ssMethod);
+		if (!V2RAY_SS_ALLOWED_METHODS[ssMethodLower]) {
 			die(`V2Ray jsonv4 的 shadowsocks 入站不支持 "${ssMethod}"。`);
 		}
 		obj.settings = { method: ssMethod, password: item.password || "", network: item.ss_network || "tcp,udp" };
@@ -98,7 +115,8 @@ function build_inbound(item) {
 		obj.streamSettings = build_stream_settings(item, "v2ray", true, null, proto);
 	}
 
-	const custom = parse_json_safe(item.custom_config);
+	const custom = parse_json_safe(item.custom_config, "custom_config");
+	if (custom != null && type(custom) !== "object") die(`custom_config 必须为 JSON 对象 (${item.tag || item[".name"] || "inbound"})。`);
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
@@ -126,8 +144,9 @@ function build_outbound(item, default_mark) {
 		obj.settings = { servers: [{ address: item.address || "", port: int(item.port || 443), password: item.password || "" }] };
 	} else if (proto === "shadowsocks") {
 		const ssMethod = item.method || "aes-256-gcm";
-		if (substr(ssMethod, 0, 12) === "2022-blake3-") {
-			die(`V2Ray jsonv4 的 shadowsocks 出站不支持 "${ssMethod}"，请切换 jsonv5 并使用 shadowsocks2022 协议。`);
+		const ssMethodLower = lc(ssMethod);
+		if (!V2RAY_SS_ALLOWED_METHODS[ssMethodLower]) {
+			die(`V2Ray jsonv4 的 shadowsocks 出站不支持 "${ssMethod}"。`);
 		}
 		let srv = { address: item.address || "", port: int(item.port || 8388), method: ssMethod, password: item.password || "" };
 		if (item.ss_iv_check === "1") srv.ivCheck = true;
@@ -155,7 +174,8 @@ function build_outbound(item, default_mark) {
 		obj.mux = { enabled: true, concurrency: conc };
 	}
 
-	const custom = parse_json_safe(item.custom_config);
+	const custom = parse_json_safe(item.custom_config, "custom_config");
+	if (custom != null && type(custom) !== "object") die(`custom_config 必须为 JSON 对象 (${item.tag || item[".name"] || "outbound"})。`);
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
@@ -173,13 +193,13 @@ export function compile_v2ray(cfg, opts) {
 		outbounds: []
 	};
 
-	if (g.stats_enabled === "1") doc.stats = {};
+	if (bool_or(g.stats_enabled, true)) doc.stats = {};
 
 	let extra_api_rule = null;
-	if (g.api_enabled === "1") {
+	if (bool_or(g.api_enabled, true)) {
 		const api_port = int(g.api_port || 18080);
 		let api_services = ["HandlerService", "LoggerService"];
-		if (g.stats_enabled === "1") push(api_services, "StatsService");
+		if (bool_or(g.stats_enabled, true)) push(api_services, "StatsService");
 		if ((cfg.observatory || {}).enabled === "1") push(api_services, "ObservatoryService");
 		doc.api = { tag: "api", services: api_services };
 		push(doc.inbounds, { tag: "api-in", listen: "127.0.0.1", port: api_port, protocol: "dokodemo-door", settings: { address: "127.0.0.1" } });
@@ -211,7 +231,7 @@ export function compile_v2ray(cfg, opts) {
 	}
 
 	const d = cfg.dns || {};
-	if (d.enabled === "1") {
+	if (bool_or(d.enabled, true)) {
 		let servers = [];
 		for (let s in cfg.dns_servers) {
 			if (s.enabled === "0") continue;
@@ -237,15 +257,34 @@ export function compile_v2ray(cfg, opts) {
 		};
 		if (d.client_ip) doc.dns.clientIp = d.client_ip;
 		let hosts = {};
-		const raw_hosts = parse_json_safe(d.hosts_json);
+		const raw_hosts = parse_json_safe(d.hosts_json, "hosts_json");
 		if (type(raw_hosts) === "object") {
-			for (let k in raw_hosts) hosts[k] = raw_hosts[k];
+			for (let k in raw_hosts) {
+				const dom = trim(`${k || ""}`);
+				const raw_vals = type(raw_hosts[k]) === "array" ? raw_hosts[k] : [raw_hosts[k]];
+				let cleaned = [];
+				for (let v in raw_vals) {
+					const t = trim(`${v || ""}`);
+					if (t !== "") push(cleaned, t);
+				}
+				if (dom && length(cleaned) > 0) {
+					hosts[dom] = length(cleaned) === 1 ? cleaned[0] : cleaned;
+				}
+			}
 		}
-		const host_entries = parse_json_safe(d.host_entries_json);
+		const host_entries = parse_json_safe(d.host_entries_json, "host_entries_json");
 		if (type(host_entries) === "array" && length(host_entries) > 0) {
 			for (let h in host_entries) {
-				if (h && h.domain && type(h.addresses) === "array" && length(h.addresses) > 0) {
-					hosts[h.domain] = length(h.addresses) === 1 ? h.addresses[0] : h.addresses;
+				const dom = h && h.domain ? trim(`${h.domain}`) : "";
+				let cleaned = [];
+				if (h && type(h.addresses) === "array") {
+					for (let v in h.addresses) {
+						const t = trim(`${v || ""}`);
+						if (t !== "") push(cleaned, t);
+					}
+				}
+				if (dom && length(cleaned) > 0) {
+					hosts[dom] = length(cleaned) === 1 ? cleaned[0] : cleaned;
 				}
 			}
 		}
@@ -257,7 +296,7 @@ export function compile_v2ray(cfg, opts) {
 	}
 
 	const r = cfg.routing || {};
-	if (r.enabled === "1" || extra_api_rule) {
+	if (bool_or(r.enabled, true) || extra_api_rule) {
 		let rules = [];
 		if (extra_api_rule) push(rules, extra_api_rule);
 		for (let rr in cfg.routing_rules) {
@@ -276,7 +315,7 @@ export function compile_v2ray(cfg, opts) {
 			if (length(us) > 0) rule.user = us;
 			const ibs = to_array(rr.inbound_tag);
 			if (length(ibs) > 0) rule.inboundTag = ibs;
-			const protos = filter(to_array(rr.protocol), p => p !== "quic");
+			const protos = to_array(rr.protocol);
 			if (length(protos) > 0) rule.protocol = protos;
 			if (rr.attrs) rule.attrs = rr.attrs;
 			if (rr.balancer_tag) rule.balancerTag = rr.balancer_tag;
@@ -412,9 +451,8 @@ export function compile_v2ray(cfg, opts) {
 	if (length(keys(v4_services)) > 0) doc.services = v4_services;
 
 	const p = cfg.policy || {};
-	if (p.enabled === "1") {
+	if (bool_or(p.enabled, true)) {
 		let levels = {};
-		const num_or = (val, def) => (val != null && val !== "" ? int(val) : def);
 		const parsed_levels = parse_json_safe(p.policy_levels_json, "policy_levels_json");
 		if (type(parsed_levels) === "array" && length(parsed_levels) > 0) {
 			for (let lv in parsed_levels) {
@@ -442,10 +480,10 @@ export function compile_v2ray(cfg, opts) {
 		doc.policy = {
 			levels: levels,
 			system: {
-				statsInboundUplink: p.stats_inbound_uplink === "1",
-				statsInboundDownlink: p.stats_inbound_downlink === "1",
-				statsOutboundUplink: p.stats_outbound_uplink === "1",
-				statsOutboundDownlink: p.stats_outbound_downlink === "1"
+				statsInboundUplink: bool_or(p.stats_inbound_uplink, true),
+				statsInboundDownlink: bool_or(p.stats_inbound_downlink, true),
+				statsOutboundUplink: bool_or(p.stats_outbound_uplink, true),
+				statsOutboundDownlink: bool_or(p.stats_outbound_downlink, true)
 			}
 		};
 	}
@@ -455,12 +493,20 @@ export function compile_v2ray(cfg, opts) {
 		let bridges = [];
 		for (let b in to_array(rev.bridges)) {
 			const parts = split(b, "|");
-			if (length(parts) === 2) push(bridges, { tag: parts[0], domain: parts[1] });
+			if (length(parts) === 2) {
+				const t = trim(parts[0]);
+				const dom = trim(parts[1]);
+				if (t && dom) push(bridges, { tag: t, domain: dom });
+			}
 		}
 		let portals = [];
 		for (let pt in to_array(rev.portals)) {
 			const parts = split(pt, "|");
-			if (length(parts) === 2) push(portals, { tag: parts[0], domain: parts[1] });
+			if (length(parts) === 2) {
+				const t = trim(parts[0]);
+				const dom = trim(parts[1]);
+				if (t && dom) push(portals, { tag: t, domain: dom });
+			}
 		}
 		doc.reverse = { bridges: bridges, portals: portals };
 	}

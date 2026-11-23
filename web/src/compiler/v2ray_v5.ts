@@ -147,8 +147,33 @@ function deepMerge(
   return out;
 }
 
+const V2RAY_V5_SS_ALLOWED_METHODS = new Set([
+  'aes-128-gcm',
+  'aes_128_gcm',
+  'aead_aes_128_gcm',
+  'aes-256-gcm',
+  'aes_256_gcm',
+  'aead_aes_256_gcm',
+  'chacha20-poly1305',
+  'chacha20_poly1305',
+  'aead_chacha20_poly1305',
+  'chacha20-ietf-poly1305',
+  'none',
+  'plain'
+]);
+
 function isIpLiteral(val: string): boolean {
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(val) || val.includes(':');
+  if (!val) return false;
+  if (val.includes(':')) return parseIpv6ToBytes(val) !== null;
+  const parts = val.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
+function isValidBase64Pin(val: string): boolean {
+  const s = val.trim();
+  if (s.length < 4 || s.length % 4 !== 0) return false;
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(s);
 }
 
 function parseIpv6ToBytes(ip: string): number[] | null {
@@ -175,6 +200,7 @@ function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null
   if (!addr) return null;
   if (addr.includes(':')) {
     const bytes = parseIpv6ToBytes(addr);
+    if (prefixStr !== undefined && prefixStr !== '' && !/^\d+$/.test(prefixStr)) return null;
     const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 128;
     if (bytes && Number.isFinite(prefix) && prefix >= 0 && prefix <= 128) {
       return { ip: bytes, prefix };
@@ -184,6 +210,7 @@ function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null
   const parts = addr.split('.');
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
     const bytes = parts.map((p) => Number(p));
+    if (prefixStr !== undefined && prefixStr !== '' && !/^\d+$/.test(prefixStr)) return null;
     const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 32;
     if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix) && prefix >= 0 && prefix <= 32) {
       return { ip: bytes, prefix };
@@ -252,8 +279,8 @@ function parseRouterDomains(rawList: string[]): {
     if (!s) continue;
     if (s.startsWith('geosite:')) {
       geoDomains.push({ filePath: 'geosite.dat', code: s.slice('geosite:'.length) });
-    } else if (s.startsWith('ext:')) {
-      const rest = s.slice(4);
+    } else if (s.startsWith('ext:') || s.startsWith('ext-domain:')) {
+      const rest = s.startsWith('ext-domain:') ? s.slice(11) : s.slice(4);
       const idx = rest.indexOf(':');
       geoDomains.push({
         filePath: idx >= 0 ? rest.slice(0, idx) : 'geosite.dat',
@@ -274,8 +301,9 @@ function parseRouterDomains(rawList: string[]): {
   return { domains, geoDomains };
 }
 
-function buildStaticHostEntry(domainRaw: string, targets: string[]): Record<string, unknown> {
+function buildStaticHostEntry(domainRaw: string, targets: string[]): Record<string, unknown> | null {
   const s = domainRaw.trim();
+  if (!s) return null;
   let type = 'Full';
   let domain = s;
   if (s.startsWith('full:')) {
@@ -291,11 +319,14 @@ function buildStaticHostEntry(domainRaw: string, targets: string[]): Record<stri
     type = 'Keyword';
     domain = s.slice(8);
   }
-  const ips = targets.filter((t) => isIpLiteral(t.trim()));
-  const proxied = targets.find((t) => !isIpLiteral(t.trim()));
+  const cleaned = targets.map((t) => t.trim()).filter(Boolean);
+  if (cleaned.length === 0) return null;
+  const ips = cleaned.filter((t) => isIpLiteral(t));
+  const proxied = cleaned.find((t) => !isIpLiteral(t));
   if (proxied) {
-    return { type, domain, proxiedDomain: proxied.trim() };
+    return { type, domain, proxiedDomain: proxied };
   }
+  if (ips.length === 0) return null;
   return { type, domain, ip: ips };
 }
 
@@ -329,7 +360,7 @@ function buildV5Stream(
       path: `${pathPrefix}.security`,
       message: 'V2Ray jsonv5 不支持 REALITY 安全层，请改用 tls 或 utls。'
     });
-    security = 'utls';
+    security = 'none';
   }
 
   for (const issue of validateStreamCombination(
@@ -412,10 +443,37 @@ function buildV5Stream(
     if (item.tls_disable_system_root) tls.disableSystemRoot = true;
     const pinned = (item.tls_pinned_sha256 || []).filter(Boolean);
     if (pinned.length > 0) {
-      tls.pinnedPeerCertificateChainSha256 = pinned;
-      if (item.tls_allow_insecure) tls.allowInsecureIfPinnedPeerCertificate = true;
+      const validPins: string[] = [];
+      for (const p of pinned) {
+        const s = p.trim();
+        if (!s) continue;
+        if (!isValidBase64Pin(s)) {
+          diagnostics.push({
+            level: 'error',
+            path: `${pathPrefix}.tls_pinned_sha256`,
+            message: `V2Ray jsonv5 tls_pinned_sha256 必须为合法 Base64 编码，已跳过无效条目: "${s}"。`
+          });
+          continue;
+        }
+        validPins.push(s);
+      }
+      if (validPins.length > 0) {
+        tls.pinnedPeerCertificateChainSha256 = validPins;
+        if (item.tls_allow_insecure) tls.allowInsecureIfPinnedPeerCertificate = true;
+      }
     }
-    if (item.tls_ech_config) tls.echConfig = item.tls_ech_config;
+    if (item.tls_ech_config && item.tls_ech_config.trim()) {
+      const ech = item.tls_ech_config.trim();
+      if (!isValidBase64Pin(ech)) {
+        diagnostics.push({
+          level: 'error',
+          path: `${pathPrefix}.tls_ech_config`,
+          message: `V2Ray jsonv5 tls_ech_config 必须为合法标准 Base64 编码，已跳过无效配置。`
+        });
+      } else {
+        tls.echConfig = ech;
+      }
+    }
     if (isInbound) {
       const usageMap: Record<string, string> = {
         encipherment: 'ENCIPHERMENT',
@@ -532,7 +590,8 @@ function compileV5Inbound(
     if (item.packet_encoding) settings.packetEncoding = item.packet_encoding;
   } else if (proto === 'shadowsocks') {
     const method = item.method || 'aes-256-gcm';
-    if (method.startsWith('2022-blake3-')) {
+    const methodLower = method.toLowerCase();
+    if (!V2RAY_V5_SS_ALLOWED_METHODS.has(methodLower)) {
       diagnostics.push({
         level: 'error',
         path: `inbounds.${item.tag}.method`,
@@ -629,11 +688,12 @@ function compileV5Outbound(
     };
   } else if (proto === 'shadowsocks') {
     const method = item.method || 'aes-256-gcm';
-    if (method.startsWith('2022-blake3-')) {
+    const methodLower = method.toLowerCase();
+    if (!V2RAY_V5_SS_ALLOWED_METHODS.has(methodLower)) {
       diagnostics.push({
         level: 'error',
         path: `outbounds.${item.tag}.method`,
-        message: `V2Ray jsonv5 的 shadowsocks 协议不支持 "${method}"，请将协议切换为 shadowsocks2022。`
+        message: `V2Ray jsonv5 的 shadowsocks 协议不支持 "${method}"。`
       });
       return null;
     }
@@ -709,7 +769,7 @@ export function compileV2RayV5(
   if (cfg.observatory.enabled) {
     services.backgroundObservatory = {
       subjectSelector: cfg.observatory.subject_selector,
-      probeUrl: cfg.observatory.probe_url,
+      probeUrl: cfg.observatory.probe_url || 'https://www.google.com/generate_204',
       probeInterval: parseDurationToNs(cfg.observatory.probe_interval, 60e9)
     };
   }
@@ -847,16 +907,27 @@ export function compileV2RayV5(
 
   let dnsObj: Record<string, unknown> | undefined;
   if (cfg.dns.enabled || cfg.fakedns.length > 0) {
-    const staticHosts: Record<string, unknown>[] = [];
+    const hostsMap = new Map<string, string[]>();
     for (const [domain, addrs] of Object.entries(cfg.dns.hosts || {})) {
-      if (domain.trim() && addrs.length > 0) {
-        staticHosts.push(buildStaticHostEntry(domain, addrs));
+      const key = domain.trim();
+      const cleaned = (Array.isArray(addrs) ? addrs : [String(addrs)])
+        .map((x) => String(x).trim())
+        .filter(Boolean);
+      if (key && cleaned.length > 0) {
+        hostsMap.set(key, cleaned);
       }
     }
     for (const h of cfg.dns.host_entries || []) {
-      if (h.domain.trim() && h.addresses.length > 0) {
-        staticHosts.push(buildStaticHostEntry(h.domain, h.addresses));
+      const key = h.domain.trim();
+      const cleaned = (h.addresses || []).map((x) => String(x).trim()).filter(Boolean);
+      if (key && cleaned.length > 0) {
+        hostsMap.set(key, cleaned);
       }
+    }
+    const staticHosts: Record<string, unknown>[] = [];
+    for (const [domain, targets] of hostsMap.entries()) {
+      const entry = buildStaticHostEntry(domain, targets);
+      if (entry) staticHosts.push(entry);
     }
     dnsObj = {
       tag: cfg.dns.tag || 'dns-in',
@@ -873,7 +944,10 @@ export function compileV2RayV5(
       fakeDns:
         cfg.fakedns.length > 0
           ? {
-              pools: cfg.fakedns.map((f) => ({ ipPool: f.ip_pool, lruSize: f.pool_size }))
+              pools: cfg.fakedns.map((f) => ({
+                ipPool: f.ip_pool || '198.18.0.0/15',
+                lruSize: f.pool_size || 65535
+              }))
             }
           : undefined,
       nameServer: cfg.dns_servers
@@ -892,8 +966,8 @@ export function compileV2RayV5(
               if (!trimmed) continue;
               if (trimmed.startsWith('geosite:')) {
                 gDomains.push({ filePath: 'geosite.dat', code: trimmed.slice(8) });
-              } else if (trimmed.startsWith('ext:')) {
-                const rest = trimmed.slice(4);
+              } else if (trimmed.startsWith('ext:') || trimmed.startsWith('ext-domain:')) {
+                const rest = trimmed.startsWith('ext-domain:') ? trimmed.slice(11) : trimmed.slice(4);
                 const colon = rest.indexOf(':');
                 gDomains.push({
                   filePath: colon >= 0 ? rest.slice(0, colon) : 'geosite.dat',
@@ -953,7 +1027,7 @@ export function compileV2RayV5(
                 sourceGeoip: r.source && r.source.length > 0 ? r.source.map(parseGeoIpEntry) : undefined,
                 userEmail: r.user && r.user.length > 0 ? r.user : undefined,
                 inboundTag: r.inbound_tag && r.inbound_tag.length > 0 ? r.inbound_tag : undefined,
-                protocol: r.protocol && r.protocol.length > 0 ? r.protocol.filter((p) => p !== 'quic') : undefined,
+                protocol: r.protocol && r.protocol.length > 0 ? r.protocol : undefined,
                 domainMatcher: cfg.routing.domain_matcher === 'mph' ? 'mph' : 'linear',
                 attributes: r.attrs || undefined,
                 tag: r.balancer_tag ? undefined : r.outbound_tag || undefined,

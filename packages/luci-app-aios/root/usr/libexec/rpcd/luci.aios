@@ -221,7 +221,7 @@ rpc_preflight_check() {
 	for line in $fw_list; do
 		[ -n "$line" ] && json_add_string "" "检测到第三方透明代理防火墙规则: ${line}"
 	done
-	if ip rule show 2>/dev/null | grep -Eq "lookup ${table}([[:space:]]|$)"; then
+	if { ip rule show 2>/dev/null; ip -6 rule show 2>/dev/null; } | grep -Eq "lookup ${table}([[:space:]]|$)"; then
 		if [ ! -f "${RUNTIME_DIR}/aios_active" ]; then
 			json_add_string "" "路由表 ${table} 已被其他 ip rule 占用"
 		fi
@@ -321,7 +321,10 @@ rpc_firewall_action() {
 	case "$action" in
 		apply)
 			mkdir -p "$RUNTIME_DIR"
-			if [ "$backend" = "nftables" ] && command -v nft >/dev/null 2>&1; then
+			if [ "$backend" = "nftables" ]; then
+				if ! command -v nft >/dev/null 2>&1; then
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "nft command not found (nftables backend unavailable)"; json_dump; return
+				fi
 				# Always flush previous policy routing first (including when switching to redirect)
 				ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
 				ip route del local default dev lo table "$table" 2>/dev/null || true
@@ -341,22 +344,42 @@ rpc_firewall_action() {
 				if [ "$mode" != "redirect" ]; then
 					printf '%s %s\n' "$mark" "$table" > "$route_state"
 					if ! err="$(ip rule add fwmark "$mark" lookup "$table" 2>&1 && ip route add local default dev lo table "$table" 2>&1)"; then
+						ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+						ip route del local default dev lo table "$table" 2>/dev/null || true
+						rm -f "$route_state"
 						json_init; json_add_boolean "ok" 0; json_add_string "error" "IPv4 policy routing failed: ${err}"; json_dump; return
 					fi
 					ip -6 rule add fwmark "$mark" lookup "$table" 2>/dev/null || true
 					ip -6 route add local default dev lo table "$table" 2>/dev/null || true
 				fi
-				if ! err="$(/usr/bin/utpl /usr/share/aios/firewall/fw4_nft.ut 2>&1 > "${RUNTIME_DIR}/fw4_01_aios.nft.tmp")"; then
+				if ! err="$(/usr/bin/utpl /usr/share/aios/firewall/fw4_nft.ut 2>&1 > "${RUNTIME_DIR}/fw4_01_aios.nft.tmp")" || [ ! -s "${RUNTIME_DIR}/fw4_01_aios.nft.tmp" ] || ! grep -q 'table inet aios' "${RUNTIME_DIR}/fw4_01_aios.nft.tmp"; then
 					rm -f "${RUNTIME_DIR}/fw4_01_aios.nft.tmp"
-					json_init; json_add_boolean "ok" 0; json_add_string "error" "utpl render failed: ${err}"; json_dump; return
+					if [ "$mode" != "redirect" ]; then
+						ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+						ip route del local default dev lo table "$table" 2>/dev/null || true
+						ip -6 rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+						ip -6 route del local default dev lo table "$table" 2>/dev/null || true
+						rm -f "$route_state"
+					fi
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "utpl render failed or missing table inet aios: ${err}"; json_dump; return
 				fi
 				mv -f "${RUNTIME_DIR}/fw4_01_aios.nft.tmp" "${RUNTIME_DIR}/fw4_01_aios.nft"
 				nft delete table inet aios 2>/dev/null || true
 				if ! err="$(nft -f "${RUNTIME_DIR}/fw4_01_aios.nft" 2>&1)"; then
+					if [ "$mode" != "redirect" ]; then
+						ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+						ip route del local default dev lo table "$table" 2>/dev/null || true
+						ip -6 rule del fwmark "$mark" lookup "$table" 2>/dev/null || true
+						ip -6 route del local default dev lo table "$table" 2>/dev/null || true
+						rm -f "$route_state"
+					fi
 					json_init; json_add_boolean "ok" 0; json_add_string "error" "nft apply failed: ${err}"; json_dump; return
 				fi
 				[ -x /usr/share/aios/firewall/gateway.uc ] && /usr/bin/ucode /usr/share/aios/firewall/gateway.uc >/dev/null 2>&1 || true
-			elif [ "$backend" = "iptables" ] && [ -x /usr/share/aios/firewall/fw3_ipt.sh ]; then
+			elif [ "$backend" = "iptables" ]; then
+				if [ ! -x /usr/share/aios/firewall/fw3_ipt.sh ]; then
+					json_init; json_add_boolean "ok" 0; json_add_string "error" "/usr/share/aios/firewall/fw3_ipt.sh not found or not executable"; json_dump; return
+				fi
 				if ! err="$(/usr/share/aios/firewall/fw3_ipt.sh restart 2>&1)"; then
 					json_init; json_add_boolean "ok" 0; json_add_string "error" "fw3_ipt.sh failed: ${err}"; json_dump; return
 				fi
@@ -393,10 +416,11 @@ rpc_firewall_action() {
 			json_dump
 			;;
 		refresh_gateway)
-			if command -v ucode >/dev/null 2>&1 && [ -x /usr/share/aios/firewall/gateway.uc ]; then
-				if ! err="$(/usr/bin/ucode /usr/share/aios/firewall/gateway.uc 2>&1)"; then
-					json_init; json_add_boolean "ok" 0; json_add_string "error" "gateway.uc failed: ${err}"; json_dump; return
-				fi
+			if ! command -v ucode >/dev/null 2>&1 || [ ! -x /usr/share/aios/firewall/gateway.uc ]; then
+				json_init; json_add_boolean "ok" 0; json_add_string "error" "ucode or /usr/share/aios/firewall/gateway.uc is not available"; json_dump; return
+			fi
+			if ! err="$(/usr/bin/ucode /usr/share/aios/firewall/gateway.uc 2>&1)"; then
+				json_init; json_add_boolean "ok" 0; json_add_string "error" "gateway.uc failed: ${err}"; json_dump; return
 			fi
 			echo '{"ok":true,"action":"refresh_gateway"}'
 			;;
@@ -541,7 +565,7 @@ rpc_list_presets() {
 }
 
 rpc_save_preset() {
-	local input id payload safe_id
+	local input id payload safe_id tmp_file
 	read -r input
 	json_load "$input"
 	json_get_var id "id"
@@ -551,13 +575,15 @@ rpc_save_preset() {
 		echo '{"ok":false,"error":"invalid id or payload"}'
 		return
 	fi
-	if ! jshn -r "$payload" >/dev/null 2>&1; then
+	mkdir -p "$PRESETS_DIR"
+	tmp_file="${PRESETS_DIR}/${safe_id}.json.tmp.$$"
+	printf '%s\n' "$payload" > "$tmp_file"
+	if ! jshn -R "$tmp_file" >/dev/null 2>&1; then
+		rm -f "$tmp_file"
 		echo '{"ok":false,"error":"preset payload is not valid JSON"}'
 		return
 	fi
-	mkdir -p "$PRESETS_DIR"
-	printf '%s\n' "$payload" > "${PRESETS_DIR}/${safe_id}.json.tmp"
-	mv -f "${PRESETS_DIR}/${safe_id}.json.tmp" "${PRESETS_DIR}/${safe_id}.json"
+	mv -f "$tmp_file" "${PRESETS_DIR}/${safe_id}.json"
 	printf '{"ok":true,"id":"%s"}\n' "$safe_id"
 }
 
@@ -573,13 +599,20 @@ rpc_delete_preset() {
 }
 
 rpc_write_compiled_config() {
-	local input content
+	local input content tmp_file
 	read -r input
 	json_load "$input"
 	json_get_var content "content"
 	[ -z "$content" ] && { echo '{"ok":false,"error":"empty content"}'; return; }
 	mkdir -p "$PERSIST_DIR"
-	printf '%s\n' "$content" > "${PERSIST_DIR}/compiled.json"
+	tmp_file="${PERSIST_DIR}/compiled.json.tmp.$$"
+	printf '%s\n' "$content" > "$tmp_file"
+	if ! jshn -R "$tmp_file" >/dev/null 2>&1; then
+		rm -f "$tmp_file"
+		echo '{"ok":false,"error":"compiled config is not valid JSON"}'
+		return
+	fi
+	mv -f "$tmp_file" "${PERSIST_DIR}/compiled.json"
 	echo '{"ok":true}'
 }
 
@@ -598,10 +631,24 @@ rpc_read_compiled_config() {
 }
 
 rpc_read_log() {
-	local log_file out
+	local log_file real_log out
 	log_file="$(uci_get main.error_log /var/log/aios-error.log)"
-	if [ -r "$log_file" ] && [ "$log_file" != "none" ] && [ "$log_file" != "/dev/null" ]; then
-		out="$(tail -n 200 "$log_file" 2>/dev/null)"
+	out=""
+	if [ "$log_file" != "none" ] && [ "$log_file" != "/dev/null" ] && [ -f "$log_file" ] && [ -r "$log_file" ]; then
+		real_log="$(readlink -f "$log_file" 2>/dev/null || echo "")"
+		case "$real_log" in
+			/var/log/*|/tmp/log/*|/var/etc/aios/*|/tmp/etc/aios/*|/tmp/aios*.log)
+				out="$(tail -n 200 "$real_log" 2>/dev/null)"
+				;;
+			*)
+				json_init
+				json_add_boolean "ok" 0
+				json_add_string "error" "Log file path is outside allowed directories (/var/log/, /tmp/log/, /var/etc/aios/, /tmp/aios*.log)"
+				json_add_string "content" ""
+				json_dump
+				return
+				;;
+		esac
 	else
 		out="$(logread -e aios 2>/dev/null | tail -n 200)"
 	fi
@@ -806,7 +853,7 @@ rpc_install_core() {
 		if [ -s /var/lock/aios-install.lock/pid ]; then
 			local lock_pid
 			lock_pid="$(cat /var/lock/aios-install.lock/pid 2>/dev/null || true)"
-			if [ -n "$lock_pid" ] && [ ! -d "/proc/${lock_pid}" ]; then
+			if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null && [ ! -d "/proc/${lock_pid}" ]; then
 				rm -rf /var/lock/aios-install.lock 2>/dev/null || true
 			fi
 		fi
@@ -817,8 +864,6 @@ rpc_install_core() {
 	fi
 	job_id="$(date +%s)-$$"
 	mkdir -p "$RUNTIME_DIR"
-	printf '{"job_id":"%s","state":"queued","core":"%s","tag":"%s","progress":5,"message":"Queued install","updated_at":%s}\n' \
-		"$job_id" "$core" "$tag" "$(date +%s)" > "${RUNTIME_DIR}/install.status"
 	/usr/share/aios/core_manager.sh install "$core" "$tag" "$bins_dir" "${mirror:-}" "$job_id" </dev/null >/dev/null 2>&1 &
 	printf '{"ok":true,"job_id":"%s"}\n' "$job_id"
 }
@@ -844,11 +889,13 @@ rpc_switch_core() {
 	fi
 	mkdir -p "$RUNTIME_DIR"
 	if [ -n "$compiled_json" ]; then
-		tmp_json="${RUNTIME_DIR}/switch_precompiled.json"
+		tmp_json="${RUNTIME_DIR}/switch_precompiled.$$.json"
+		trap 'rm -f "$tmp_json"' EXIT INT TERM
 		printf '%s' "$compiled_json" > "$tmp_json"
 	fi
 	/usr/share/aios/core_manager.sh switch "$target_bin" "$tmp_json"
 	[ -n "$tmp_json" ] && rm -f "$tmp_json"
+	trap - EXIT INT TERM
 }
 
 rpc_remove_core() {
@@ -894,6 +941,7 @@ rpc_stop_conflicting_services() {
 	json_add_boolean "ok" 1
 	json_add_array "stopped"
 	old_ifs="$IFS"
+	set -f
 	IFS=','
 	for svc in $services_csv; do
 		IFS="$old_ifs"
@@ -901,14 +949,16 @@ rpc_stop_conflicting_services() {
 		case "$svc" in
 			xray|xray_core|v2ray|passwall|passwall2|openclash|homeproxy|shadowsocksr|sing-box|v2raya)
 				if [ -x "/etc/init.d/${svc}" ]; then
-					/etc/init.d/"${svc}" stop >/dev/null 2>&1 || true
-					json_add_string "" "$svc"
+					if /etc/init.d/"${svc}" stop >/dev/null 2>&1; then
+						json_add_string "" "$svc"
+					fi
 				fi
 				;;
 		esac
 		IFS=','
 	done
 	IFS="$old_ifs"
+	set +f
 	json_close_array
 	json_dump
 }

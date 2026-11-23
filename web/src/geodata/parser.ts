@@ -16,17 +16,41 @@ class ProtoReader {
   readVarint(): number {
     let result = 0;
     let shift = 0;
+    let bytesRead = 0;
     while (this.pos < this.buf.length) {
       const b = this.buf[this.pos++];
+      bytesRead++;
+      if (bytesRead > 10 || shift >= 64) {
+        throw new Error(`Malformed protobuf varint (>10 bytes) at offset ${this.pos}`);
+      }
+      if (shift < 32) {
+        result |= (b & 0x7f) << shift;
+      }
+      if ((b & 0x80) === 0) return result >>> 0;
+      shift += 7;
+    }
+    throw new Error(`Unexpected EOF while reading protobuf varint at offset ${this.pos}`);
+  }
+
+  readVarint32(): number {
+    let result = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (this.pos < this.buf.length) {
+      const b = this.buf[this.pos++];
+      bytesRead++;
+      if (bytesRead > 5 || (bytesRead === 5 && (b & 0xf0) !== 0)) {
+        throw new Error(`Protobuf varint32 overflow at offset ${this.pos}`);
+      }
       result |= (b & 0x7f) << shift;
       if ((b & 0x80) === 0) return result >>> 0;
       shift += 7;
     }
-    return result >>> 0;
+    throw new Error(`Unexpected EOF while reading protobuf varint32 at offset ${this.pos}`);
   }
 
   readBytes(): Uint8Array {
-    const len = this.readVarint();
+    const len = this.readVarint32();
     if (len < 0 || this.pos + len > this.buf.length) {
       throw new Error(`Invalid protobuf length ${len} at offset ${this.pos}`);
     }
@@ -60,6 +84,9 @@ export function parseGeoDatIndex(buffer: ArrayBuffer): GeoCategorySummary[] {
     const tag = root.readVarint();
     const field = tag >>> 3;
     const wire = tag & 7;
+    if (field === 0) {
+      throw new Error('Invalid protobuf field number 0');
+    }
     if (field === 1 && wire === 2) {
       const entryReader = new ProtoReader(root.readBytes());
       let code = '';
@@ -68,6 +95,9 @@ export function parseGeoDatIndex(buffer: ArrayBuffer): GeoCategorySummary[] {
         const etag = entryReader.readVarint();
         const efield = etag >>> 3;
         const ewire = etag & 7;
+        if (efield === 0) {
+          throw new Error('Invalid protobuf field number 0');
+        }
         if (efield === 1 && ewire === 2) {
           code = decoder.decode(entryReader.readBytes()).toLowerCase();
         } else if (efield === 2 && ewire === 2) {

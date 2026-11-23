@@ -11,6 +11,12 @@ function parse_seconds_num(val) {
 	return n > 0 ? n : null;
 }
 
+function is_valid_base64_pin(val) {
+	const s = trim(`${val || ""}`);
+	if (length(s) < 4 || length(s) % 4 !== 0) return false;
+	return !!match(s, /^[A-Za-z0-9+\/]+={0,2}$/);
+}
+
 export function build_stream_settings(item, core, is_inbound, default_mark, protocol, features) {
 	const is_xray = core === "xray";
 	let net = item.transport || (is_xray ? "raw" : "tcp");
@@ -61,7 +67,25 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 			const curves = to_array(item.tls_curve_preferences);
 			if (length(curves) > 0) tls.curvePreferences = curves;
 		} else {
-			if (length(pinned) > 0) tls.pinnedPeerCertificateChainSha256 = pinned;
+			if (length(pinned) > 0) {
+				let valid_pins = [];
+				for (let p in pinned) {
+					const s = trim(`${p || ""}`);
+					if (!s) continue;
+					if (!is_valid_base64_pin(s)) {
+						die(`V2Ray tls_pinned_sha256 必须为合法 Base64 编码 (${item.tag || item[".name"] || "node"}): "${s}"。`);
+					}
+					push(valid_pins, s);
+				}
+				if (length(valid_pins) > 0) tls.pinnedPeerCertificateChainSha256 = valid_pins;
+			}
+			if (item.tls_ech_config && trim(`${item.tls_ech_config}`) !== "") {
+				const ech = trim(`${item.tls_ech_config}`);
+				if (!is_valid_base64_pin(ech)) {
+					die(`V2Ray tls_ech_config 必须为合法标准 Base64 编码 (${item.tag || item[".name"] || "node"})。`);
+				}
+				tls.echConfig = ech;
+			}
 			if (item.tls_verify_client === "1") tls.verifyClientCertificate = true;
 			if (item.tls_disable_system_root === "1") tls.disableSystemRoot = true;
 		}
@@ -146,8 +170,11 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 	} else if (net === "xhttp" && is_xray) {
 		let xhttp = { path: item.xhttp_path || "/", mode: item.xhttp_mode || "auto" };
 		if (item.xhttp_host) xhttp.host = item.xhttp_host;
-		const extra = parse_json_safe(item.xhttp_extra);
-		if (extra) xhttp.extra = extra;
+		const extra = parse_json_safe(item.xhttp_extra, "xhttp_extra");
+		if (extra != null) {
+			if (type(extra) !== "object") die(`xhttp_extra 必须为 JSON 对象 (${item.tag || item[".name"] || "node"})。`);
+			xhttp.extra = extra;
+		}
 		ss.xhttpSettings = xhttp;
 	} else if (net === "httpupgrade" && is_xray) {
 		let hu = { path: item.httpupgrade_path || "/" };
@@ -248,7 +275,10 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 
 	// Xray FinalMask
 	if (is_xray) {
-		let fm = parse_json_safe(item.finalmask_json);
+		let fm = parse_json_safe(item.finalmask_json, "finalmask_json");
+		if (fm != null && type(fm) !== "object") {
+			die(`finalmask_json 必须为 JSON 对象 (${item.tag || item[".name"] || "node"})。`);
+		}
 		if (!fm && net === "hysteria" && (item.hysteria_up_mbps || item.hysteria_down_mbps || item.hysteria_udphop_port || item.hysteria_obfs_password)) {
 			fm = {};
 			if (item.hysteria_obfs_password) {
@@ -286,7 +316,7 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 		if (item.sockopt_tcp_max_seg) sockopt.tcpMaxSeg = int(item.sockopt_tcp_max_seg);
 		if (item.sockopt_tcp_keepalive_idle) sockopt.tcpKeepAliveIdle = int(item.sockopt_tcp_keepalive_idle);
 		if (item.sockopt_tcp_user_timeout) sockopt.tcpUserTimeout = int(item.sockopt_tcp_user_timeout);
-		if (item.sockopt_tcp_congestion) sockopt.tcpcongestion = item.sockopt_tcp_congestion;
+		if (item.sockopt_tcp_congestion) sockopt.tcpCongestion = item.sockopt_tcp_congestion;
 		if (item.sockopt_v6_only === "1") sockopt.V6Only = true;
 		if (item.sockopt_tcp_window_clamp) sockopt.tcpWindowClamp = int(item.sockopt_tcp_window_clamp);
 		if (item.sockopt_address_port_strategy) sockopt.addressPortStrategy = item.sockopt_address_port_strategy;
@@ -294,12 +324,15 @@ export function build_stream_settings(item, core, is_inbound, default_mark, prot
 		if (length(xff) > 0) sockopt.trustedXForwardedFor = xff;
 		const cs = parse_json_safe(item.sockopt_custom_json);
 		if (type(cs) === "array") sockopt.customSockopt = cs;
-		if (item.sockopt_happy_eyeballs_try_delay_ms || item.sockopt_happy_eyeballs_prioritize_ipv6 === "1" || item.sockopt_happy_eyeballs_interleave || item.sockopt_happy_eyeballs_max_concurrent_try) {
+		const has_he_delay = item.sockopt_happy_eyeballs_try_delay_ms != null && item.sockopt_happy_eyeballs_try_delay_ms !== "";
+		const has_he_interleave = item.sockopt_happy_eyeballs_interleave != null && item.sockopt_happy_eyeballs_interleave !== "";
+		const has_he_max = item.sockopt_happy_eyeballs_max_concurrent_try != null && item.sockopt_happy_eyeballs_max_concurrent_try !== "";
+		if (has_he_delay || item.sockopt_happy_eyeballs_prioritize_ipv6 === "1" || has_he_interleave || has_he_max) {
 			let he = {};
-			if (item.sockopt_happy_eyeballs_try_delay_ms) he.tryDelayMs = int(item.sockopt_happy_eyeballs_try_delay_ms);
+			if (has_he_delay) he.tryDelayMs = int(item.sockopt_happy_eyeballs_try_delay_ms);
 			if (item.sockopt_happy_eyeballs_prioritize_ipv6 === "1") he.prioritizeIPv6 = true;
-			if (item.sockopt_happy_eyeballs_interleave) he.interleave = int(item.sockopt_happy_eyeballs_interleave);
-			if (item.sockopt_happy_eyeballs_max_concurrent_try) he.maxConcurrentTry = int(item.sockopt_happy_eyeballs_max_concurrent_try);
+			if (has_he_interleave) he.interleave = int(item.sockopt_happy_eyeballs_interleave);
+			if (has_he_max) he.maxConcurrentTry = int(item.sockopt_happy_eyeballs_max_concurrent_try);
 			sockopt.happyEyeballs = he;
 		}
 		if (item.domain_strategy) sockopt.domainStrategy = item.domain_strategy;

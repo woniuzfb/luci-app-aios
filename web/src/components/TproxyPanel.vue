@@ -1,12 +1,10 @@
 <script setup lang="ts">
 import type { AiosConfig } from '@/schema/types';
-import type { PreflightResult } from '@/api/client';
 import ArrayInput from '@/components/ui/ArrayInput.vue';
 import ToggleSwitch from '@/components/ui/ToggleSwitch.vue';
 
 const props = defineProps<{
   config: AiosConfig;
-  preflight: PreflightResult | null;
   detectedFirewall: string;
 }>();
 
@@ -37,13 +35,6 @@ function addLanHost() {
         </div>
       </div>
 
-      <div v-if="preflight && preflight.warnings.length > 0" class="alert alert-warn">
-        <strong>冲突预检发现提醒：</strong>
-        <ul style="margin: 6px 0 0 18px; padding: 0">
-          <li v-for="w in preflight.warnings" :key="w">{{ w }}</li>
-        </ul>
-      </div>
-
       <div class="grid-3">
         <div class="field">
           <label>防火墙后端 (firewall_backend)</label>
@@ -55,10 +46,10 @@ function addLanHost() {
           </select>
         </div>
         <div class="field">
-          <label>拦截模式 (fw3 生效)</label>
+          <label>拦截模式 (tproxy_mode)</label>
           <select v-model="config.transparent_proxy.tproxy_mode">
             <option value="tproxy">TPROXY（TCP + UDP 双栈）</option>
-            <option value="redirect">REDIRECT（仅 TCP IPv4）</option>
+            <option value="redirect">REDIRECT（TCP 重定向，fw4 支持双栈 / fw3 仅 IPv4）</option>
           </select>
         </div>
         <div class="field">

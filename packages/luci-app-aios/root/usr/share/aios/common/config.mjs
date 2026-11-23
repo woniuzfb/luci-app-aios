@@ -46,12 +46,30 @@ export function kv_to_map(pairs) {
 	return length(keys(out)) > 0 ? out : null;
 }
 
-export function resolve_core_bin(general) {
-	if (general && general.core_bin && general.core_bin !== "") return general.core_bin;
-	for (let cand in ["/usr/bin/aios-xray", "/usr/bin/aios-v2ray", "/usr/bin/xray", "/usr/bin/v2ray"]) {
+function shell_quote(s) {
+	return `'${replace(`${s}`, "'", "'\\''")}'`;
+}
+
+export function resolve_core_bin(cfg) {
+	const general = (cfg && type(cfg.general) === "object") ? cfg.general : (cfg || {});
+	if (general.core_bin && general.core_bin !== "") return general.core_bin;
+	const configured = general.core_type || "auto";
+	let cands;
+	let fallback;
+	if (configured === "v2ray") {
+		cands = ["/usr/bin/aios-v2ray", "/usr/bin/v2ray"];
+		fallback = "/usr/bin/aios-v2ray";
+	} else if (configured === "xray") {
+		cands = ["/usr/bin/aios-xray", "/usr/bin/xray"];
+		fallback = "/usr/bin/aios-xray";
+	} else {
+		cands = ["/usr/bin/aios-xray", "/usr/bin/aios-v2ray", "/usr/bin/xray", "/usr/bin/v2ray"];
+		fallback = "/usr/bin/aios-xray";
+	}
+	for (let cand in cands) {
 		if (access(cand, "x")) return cand;
 	}
-	return "/usr/bin/aios-xray";
+	return fallback;
 }
 
 export function detect_core_type(general) {
@@ -60,7 +78,7 @@ export function detect_core_type(general) {
 		return configured;
 	}
 	const bin = resolve_core_bin(general);
-	const proc = popen(`${bin} version 2>/dev/null`, "r");
+	const proc = popen(`${shell_quote(bin)} version 2>/dev/null`, "r");
 	if (proc) {
 		const line = proc.read("line") || "";
 		proc.close();
@@ -72,7 +90,7 @@ export function detect_core_type(general) {
 
 export function detect_core_version(general) {
 	const bin = resolve_core_bin(general);
-	const proc = popen(`${bin} version 2>/dev/null`, "r");
+	const proc = popen(`${shell_quote(bin)} version 2>/dev/null`, "r");
 	if (proc) {
 		const line = proc.read("line") || "";
 		proc.close();

@@ -110,8 +110,23 @@ function isValidCron5(raw: string): boolean {
   return fields.length === 5;
 }
 
+const V2RAY_SS_ALLOWED_METHODS = new Set([
+  'aes-128-gcm',
+  'aes_128_gcm',
+  'aead_aes_128_gcm',
+  'aes-256-gcm',
+  'aes_256_gcm',
+  'aead_aes_256_gcm',
+  'chacha20-poly1305',
+  'chacha20_poly1305',
+  'aead_chacha20_poly1305',
+  'chacha20-ietf-poly1305',
+  'none',
+  'plain'
+]);
+
 function isPrivateIpv4Bytes(a: number, b: number): boolean {
-  if (a === 10 || a === 127 || a === 0) return true;
+  if (a === 10 || a === 127) return true;
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 169 && b === 254) return true;
@@ -119,28 +134,50 @@ function isPrivateIpv4Bytes(a: number, b: number): boolean {
 }
 
 function isPublicTargetAddress(addr: string): boolean {
-  const s = addr.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  let s = addr.trim().replace(/^\[|\]$/g, '').toLowerCase();
+  if (s.endsWith('.')) s = s.slice(0, -1);
   if (!s) return false;
-  if (s === 'localhost' || s.endsWith('.local') || s.endsWith('.lan') || s.endsWith('.internal')) return false;
-  if (!s.includes(':') && !s.includes('.')) return false;
+  if (
+    s === 'localhost' ||
+    s === 'home.arpa' ||
+    s.endsWith('.local') ||
+    s.endsWith('.lan') ||
+    s.endsWith('.internal') ||
+    s.endsWith('.home.arpa') ||
+    s.endsWith('.localdomain') ||
+    s.endsWith('.example') ||
+    s.endsWith('.invalid') ||
+    s.endsWith('.test')
+  ) {
+    return false;
+  }
+  if (!s.includes(':') && !s.includes('.')) {
+    return !/^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/.test(s);
+  }
   const parts = s.split('.');
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
     const nums = parts.map(Number);
-    if (nums.some((n) => n > 255)) return false;
+    if (nums.some((n) => n > 255)) return true;
     return !isPrivateIpv4Bytes(nums[0], nums[1]);
   }
   if (s.includes(':')) {
     const mapped = s.match(/^::ffff:(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
     if (mapped) {
-      return !isPrivateIpv4Bytes(Number(mapped[1]), Number(mapped[2]));
+      const nums = [Number(mapped[1]), Number(mapped[2]), Number(mapped[3]), Number(mapped[4])];
+      if (nums.some((n) => n > 255)) return true;
+      return !isPrivateIpv4Bytes(nums[0], nums[1]);
     }
     const bytes = parseIpv6ToBytes(s);
     if (bytes) {
-      const allZero = bytes.every((x) => x === 0);
+      const isMappedV4 =
+        bytes.slice(0, 10).every((x) => x === 0) && bytes[10] === 0xff && bytes[11] === 0xff;
+      if (isMappedV4) {
+        return !isPrivateIpv4Bytes(bytes[12], bytes[13]);
+      }
       const isLoopback = bytes.slice(0, 15).every((x) => x === 0) && bytes[15] === 1;
       const isUla = (bytes[0] & 0xfe) === 0xfc; // fc00::/7
       const isLinkLocal = bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80; // fe80::/10
-      return !(allZero || isLoopback || isUla || isLinkLocal);
+      return !(isLoopback || isUla || isLinkLocal);
     }
     return true;
   }
@@ -171,6 +208,7 @@ function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null
   if (!addr) return null;
   if (addr.includes(':')) {
     const bytes = parseIpv6ToBytes(addr);
+    if (prefixStr !== undefined && prefixStr !== '' && !/^\d+$/.test(prefixStr)) return null;
     const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 128;
     if (bytes && Number.isFinite(prefix) && prefix >= 0 && prefix <= 128) {
       return { ip: bytes, prefix };
@@ -180,12 +218,19 @@ function parseCidrToBytes(cidr: string): { ip: number[]; prefix: number } | null
   const parts = addr.split('.');
   if (parts.length === 4 && parts.every((p) => /^\d+$/.test(p))) {
     const bytes = parts.map((p) => Number(p));
+    if (prefixStr !== undefined && prefixStr !== '' && !/^\d+$/.test(prefixStr)) return null;
     const prefix = prefixStr !== undefined && prefixStr !== '' ? Number(prefixStr) : 32;
     if (bytes.every((b) => b >= 0 && b <= 255) && Number.isFinite(prefix) && prefix >= 0 && prefix <= 32) {
       return { ip: bytes, prefix };
     }
   }
   return null;
+}
+
+function isValidBase64Pin(val: string): boolean {
+  const s = val.trim();
+  if (s.length < 4 || s.length % 4 !== 0) return false;
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(s);
 }
 
 function kvToMap(pairs?: KeyValuePair[]): Record<string, string> | null {
@@ -295,7 +340,35 @@ function buildStreamSettings(
         tls.curvePreferences = item.tls_curve_preferences;
       }
     } else {
-      if (pinned.length > 0) tls.pinnedPeerCertificateChainSha256 = pinned;
+      if (pinned.length > 0) {
+        const validPins: string[] = [];
+        for (const p of pinned) {
+          const s = p.trim();
+          if (!s) continue;
+          if (!isValidBase64Pin(s)) {
+            diagnostics.push({
+              level: 'error',
+              path: `${pathPrefix}.tls_pinned_sha256`,
+              message: `V2Ray tls_pinned_sha256 必须为合法 Base64 编码，已跳过无效条目: "${s}"。`
+            });
+            continue;
+          }
+          validPins.push(s);
+        }
+        if (validPins.length > 0) tls.pinnedPeerCertificateChainSha256 = validPins;
+      }
+      if (item.tls_ech_config && item.tls_ech_config.trim()) {
+        const ech = item.tls_ech_config.trim();
+        if (!isValidBase64Pin(ech)) {
+          diagnostics.push({
+            level: 'error',
+            path: `${pathPrefix}.tls_ech_config`,
+            message: `V2Ray tls_ech_config 必须为合法标准 Base64 编码，已跳过无效配置。`
+          });
+        } else {
+          tls.echConfig = ech;
+        }
+      }
       if (item.tls_verify_client) tls.verifyClientCertificate = true;
       if (item.tls_disable_system_root) tls.disableSystemRoot = true;
     }
@@ -546,7 +619,7 @@ function buildStreamSettings(
     if (item.sockopt_tcp_max_seg) sockopt.tcpMaxSeg = item.sockopt_tcp_max_seg;
     if (item.sockopt_tcp_keepalive_idle) sockopt.tcpKeepAliveIdle = item.sockopt_tcp_keepalive_idle;
     if (item.sockopt_tcp_user_timeout) sockopt.tcpUserTimeout = item.sockopt_tcp_user_timeout;
-    if (item.sockopt_tcp_congestion) sockopt.tcpcongestion = item.sockopt_tcp_congestion;
+    if (item.sockopt_tcp_congestion) sockopt.tcpCongestion = item.sockopt_tcp_congestion;
     if (item.sockopt_v6_only) sockopt.V6Only = true;
     if (item.sockopt_tcp_window_clamp) sockopt.tcpWindowClamp = item.sockopt_tcp_window_clamp;
     if (item.sockopt_address_port_strategy) sockopt.addressPortStrategy = item.sockopt_address_port_strategy;
@@ -556,20 +629,20 @@ function buildStreamSettings(
     const customSock = parseJsonArrayChecked(item.sockopt_custom_json, diagnostics, `${pathPrefix}.sockopt_custom_json`);
     if (customSock) sockopt.customSockopt = customSock;
     if (
-      item.sockopt_happy_eyeballs_try_delay_ms ||
+      item.sockopt_happy_eyeballs_try_delay_ms != null ||
       item.sockopt_happy_eyeballs_prioritize_ipv6 ||
-      item.sockopt_happy_eyeballs_interleave ||
-      item.sockopt_happy_eyeballs_max_concurrent_try
+      item.sockopt_happy_eyeballs_interleave != null ||
+      item.sockopt_happy_eyeballs_max_concurrent_try != null
     ) {
       const he: Record<string, unknown> = {};
-      if (item.sockopt_happy_eyeballs_try_delay_ms !== undefined) {
+      if (item.sockopt_happy_eyeballs_try_delay_ms != null) {
         he.tryDelayMs = item.sockopt_happy_eyeballs_try_delay_ms;
       }
       if (item.sockopt_happy_eyeballs_prioritize_ipv6) he.prioritizeIPv6 = true;
-      if (item.sockopt_happy_eyeballs_interleave !== undefined) {
+      if (item.sockopt_happy_eyeballs_interleave != null) {
         he.interleave = item.sockopt_happy_eyeballs_interleave;
       }
-      if (item.sockopt_happy_eyeballs_max_concurrent_try !== undefined) {
+      if (item.sockopt_happy_eyeballs_max_concurrent_try != null) {
         he.maxConcurrentTry = item.sockopt_happy_eyeballs_max_concurrent_try;
       }
       sockopt.happyEyeballs = he;
@@ -757,7 +830,9 @@ function compileInbound(
     obj.settings = s;
   } else if (proto === 'shadowsocks') {
     const ssMethod = item.method || 'aes-256-gcm';
-    if (!isXray && ssMethod.startsWith('2022-blake3-')) {
+    const ssMethodLower = ssMethod.toLowerCase();
+    const isSs2022 = ssMethodLower.startsWith('2022-blake3-');
+    if (!isXray && !V2RAY_SS_ALLOWED_METHODS.has(ssMethodLower)) {
       diagnostics.push({
         level: 'error',
         path: `inbounds.${item.tag}.method`,
@@ -765,17 +840,41 @@ function compileInbound(
       });
       return null;
     }
+    if (isXray && isSs2022 && userList) {
+      if (!ssMethodLower.includes('aes')) {
+        diagnostics.push({
+          level: 'error',
+          path: `inbounds.${item.tag}.method`,
+          message: `Xray Shadowsocks 2022 多用户入站仅支持 2022-blake3-aes-*-gcm，不支持 "${ssMethod}"。`
+        });
+        return null;
+      }
+      if (!item.password || !item.password.trim()) {
+        diagnostics.push({
+          level: 'error',
+          path: `inbounds.${item.tag}.password`,
+          message: `Xray Shadowsocks 2022 多用户入站必须配置顶层服务端 PSK (password)。`
+        });
+        return null;
+      }
+    }
     const s: Record<string, unknown> = {
-      method: ssMethod,
+      method: isXray && isSs2022 ? ssMethodLower : ssMethod,
       network: item.ss_network || 'tcp,udp'
     };
     if (isXray && userList) {
-      s[useInboundUsers ? 'users' : 'clients'] = userList.map((u) => ({
-        method: ssMethod,
-        password: u.password || '',
-        email: u.email || undefined,
-        level: u.level ?? 0
-      }));
+      if (isSs2022) {
+        s.password = item.password || '';
+      }
+      s[useInboundUsers ? 'users' : 'clients'] = userList.map((u) => {
+        const entry: Record<string, unknown> = {
+          password: u.password || '',
+          email: u.email || undefined,
+          level: u.level ?? 0
+        };
+        if (!isSs2022) entry.method = ssMethod;
+        return entry;
+      });
     } else {
       s.password = item.password || '';
     }
@@ -956,8 +1055,16 @@ function compileOutbound(
     if (isXray && item.user_level !== undefined) s.userLevel = item.user_level;
     if (isXray && item.freedom_proxy_protocol) s.proxyProtocol = item.freedom_proxy_protocol;
     if (isXray && item.freedom_final_rules_json) {
-      const fr = parseJsonArrayChecked(item.freedom_final_rules_json, diagnostics, `outbounds.${item.tag}.freedom_final_rules_json`);
-      if (fr) s.finalRules = fr;
+      if (xrayFeatures && !xrayFeatures.hasFreedomFinalRules) {
+        diagnostics.push({
+          level: 'warning',
+          path: `outbounds.${item.tag}.freedom_final_rules_json`,
+          message: `Xray ${xrayFeatures.version} 不支持 freedom.finalRules（需 >= ${CORE_FEATURES_SPEC.xray.features.freedomFinalRules.since}），已跳过输出。`
+        });
+      } else {
+        const fr = parseJsonArrayChecked(item.freedom_final_rules_json, diagnostics, `outbounds.${item.tag}.freedom_final_rules_json`);
+        if (fr) s.finalRules = fr;
+      }
     }
     obj.settings = s;
   } else if (proto === 'blackhole') {
@@ -993,7 +1100,10 @@ function compileOutbound(
     if (isXray && item.loopback_sniffing_enabled) {
       const sn: Record<string, unknown> = {
         enabled: true,
-        destOverride: item.loopback_sniffing_dest_override || ['http', 'tls'],
+        destOverride:
+          item.loopback_sniffing_dest_override && item.loopback_sniffing_dest_override.length > 0
+            ? item.loopback_sniffing_dest_override
+            : ['http', 'tls'],
         metadataOnly: !!item.loopback_sniffing_metadata_only,
         routeOnly: !!item.loopback_sniffing_route_only
       };
@@ -1121,19 +1231,22 @@ function compileOutbound(
     }
   } else if (proto === 'shadowsocks') {
     const ssMethod = item.method || 'aes-256-gcm';
-    if (!isXray && ssMethod.startsWith('2022-blake3-')) {
+    const ssMethodLower = ssMethod.toLowerCase();
+    if (!isXray && !V2RAY_SS_ALLOWED_METHODS.has(ssMethodLower)) {
       diagnostics.push({
         level: 'error',
         path: `outbounds.${item.tag}.method`,
-        message: `V2Ray jsonv4 的 shadowsocks 协议不支持 "${ssMethod}"，请切换 jsonv5 并使用 shadowsocks2022 协议。`
+        message: `V2Ray jsonv4 的 shadowsocks 协议不支持 "${ssMethod}"。`
       });
       return null;
     }
+    const isSs2022 = ssMethodLower.startsWith('2022-blake3-');
+    const outSsMethod = isXray && isSs2022 ? ssMethodLower : ssMethod;
     if (isXray && useFlatOutbounds) {
       const s: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 8388,
-        method: ssMethod,
+        method: outSsMethod,
         password: item.password || ''
       };
       if (item.email) s.email = item.email;
@@ -1147,9 +1260,11 @@ function compileOutbound(
       const srv: Record<string, unknown> = {
         address: item.address || '',
         port: item.port || 8388,
-        method: ssMethod,
+        method: outSsMethod,
         password: item.password || ''
       };
+      if (isXray && item.email) srv.email = item.email;
+      if (isXray && item.user_level !== undefined) srv.level = item.user_level;
       if (!isXray && item.ss_iv_check) srv.ivCheck = true;
       if (isXray && xrayFeatures?.hasSsUot) {
         if (item.ss_uot) srv.uot = true;
@@ -1176,7 +1291,11 @@ function compileOutbound(
       obj.settings = s;
     } else {
       const srv: Record<string, unknown> = { address: item.address || '', port: item.port || 1080 };
-      if (item.username) srv.users = [{ user: item.username, pass: item.password || '' }];
+      if (item.username) {
+        const u: Record<string, unknown> = { user: item.username, pass: item.password || '' };
+        if (isXray && item.user_level !== undefined) u.level = item.user_level;
+        srv.users = [u];
+      }
       const s: Record<string, unknown> = { servers: [srv] };
       if (!isXray && item.socks_version) s.version = item.socks_version;
       obj.settings = s;
@@ -1198,8 +1317,18 @@ function compileOutbound(
       obj.settings = s;
     } else {
       const srv: Record<string, unknown> = { address: item.address || '', port: item.port || 8080 };
-      if (item.username) srv.users = [{ user: item.username, pass: item.password || '' }];
-      obj.settings = { servers: [srv] };
+      if (item.username) {
+        const u: Record<string, unknown> = { user: item.username, pass: item.password || '' };
+        if (isXray && item.email) u.email = item.email;
+        if (isXray && item.user_level !== undefined) u.level = item.user_level;
+        srv.users = [u];
+      }
+      const s: Record<string, unknown> = { servers: [srv] };
+      if (isXray) {
+        const headers = kvToMap(item.http_headers);
+        if (headers) s.headers = headers;
+      }
+      obj.settings = s;
     }
   } else if (proto === 'wireguard' && isXray) {
     const peers =
@@ -1269,7 +1398,7 @@ function compileOutbound(
       concurrency: isXray && concurrency > 128 ? 128 : concurrency
     };
     if (isXray) {
-      if (item.mux_xudp_concurrency) mux.xudpConcurrency = item.mux_xudp_concurrency;
+      if (item.mux_xudp_concurrency != null) mux.xudpConcurrency = item.mux_xudp_concurrency;
       if (item.mux_xudp_proxy_udp443) mux.xudpProxyUDP443 = item.mux_xudp_proxy_udp443;
     }
     obj.mux = mux;
@@ -1455,10 +1584,21 @@ export function compileConfig(
     }
     if (cfg.dns.client_ip) dnsObj.clientIp = cfg.dns.client_ip;
 
-    const hostsMap: Record<string, string[] | string> = { ...(cfg.dns.hosts || {}) };
+    const hostsMap: Record<string, string[] | string> = {};
+    for (const [domain, addrs] of Object.entries(cfg.dns.hosts || {})) {
+      const key = domain.trim();
+      const cleaned = (Array.isArray(addrs) ? addrs : [String(addrs)])
+        .map((x) => String(x).trim())
+        .filter(Boolean);
+      if (key && cleaned.length > 0) {
+        hostsMap[key] = cleaned.length === 1 ? cleaned[0] : cleaned;
+      }
+    }
     for (const h of cfg.dns.host_entries || []) {
-      if (h.domain.trim() && h.addresses.length > 0) {
-        hostsMap[h.domain.trim()] = h.addresses.length === 1 ? h.addresses[0] : h.addresses;
+      const key = h.domain.trim();
+      const cleaned = (h.addresses || []).map((x) => String(x).trim()).filter(Boolean);
+      if (key && cleaned.length > 0) {
+        hostsMap[key] = cleaned.length === 1 ? cleaned[0] : cleaned;
       }
     }
     if (Object.keys(hostsMap).length > 0) dnsObj.hosts = hostsMap;
@@ -1467,7 +1607,10 @@ export function compileConfig(
 
   // FakeDNS (always array for dual-core safety)
   if (cfg.fakedns.length > 0) {
-    doc.fakedns = cfg.fakedns.map((f) => ({ ipPool: f.ip_pool, poolSize: f.pool_size }));
+    doc.fakedns = cfg.fakedns.map((f) => ({
+      ipPool: f.ip_pool || '198.18.0.0/15',
+      poolSize: f.pool_size || 65535
+    }));
   }
 
   // Routing
@@ -1491,8 +1634,7 @@ export function compileConfig(
       if (rr.inbound_tag && rr.inbound_tag.length > 0) rule.inboundTag = rr.inbound_tag;
       if (isXray && rr.process && rr.process.length > 0) rule.process = rr.process;
       if (rr.protocol && rr.protocol.length > 0) {
-        const protos = isXray ? rr.protocol : rr.protocol.filter((p) => p !== 'quic');
-        if (protos.length > 0) rule.protocol = protos;
+        rule.protocol = rr.protocol;
       }
       if (isXray && rr.vless_route) rule.vlessRoute = rr.vless_route;
       if (isXray && rr.rule_tag) rule.ruleTag = rr.rule_tag;
@@ -1563,10 +1705,10 @@ export function compileConfig(
       probeInterval: cfg.observatory.probe_interval || '1m'
     };
     if (isXray) {
-      obs.probeUrl = cfg.observatory.probe_url;
+      obs.probeUrl = cfg.observatory.probe_url || 'https://www.google.com/generate_204';
       obs.enableConcurrency = cfg.observatory.enable_concurrency;
     } else {
-      obs.probeURL = cfg.observatory.probe_url;
+      obs.probeURL = cfg.observatory.probe_url || 'https://www.google.com/generate_204';
     }
     doc.observatory = obs;
   }

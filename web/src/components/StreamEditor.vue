@@ -448,7 +448,7 @@ function removeCert(idx: number) {
         <div class="field"><label>出站网卡 ({{ core === 'xray' ? 'interface' : 'bindToDevice' }})</label><input v-model="model.sockopt_interface" type="text" placeholder="如 eth0 / wan" /></div>
         <div class="field"><label>KeepAlive 间隔 (秒)</label><input v-model.number="model.sockopt_tcp_keepalive_interval" type="number" placeholder="0" /></div>
         <div v-if="core === 'xray'" class="field"><label>KeepAlive 空闲阈值 (tcpKeepAliveIdle, s)</label><input v-model.number="model.sockopt_tcp_keepalive_idle" type="number" placeholder="300" /></div>
-        <div v-if="core === 'xray'" class="field"><label>TCP 拥塞控制 (tcpcongestion)</label><input v-model="model.sockopt_tcp_congestion" type="text" placeholder="bbr / cubic" /></div>
+        <div v-if="core === 'xray'" class="field"><label>TCP 拥塞控制 (tcpCongestion)</label><input v-model="model.sockopt_tcp_congestion" type="text" placeholder="bbr / cubic" /></div>
         <div v-if="core === 'xray'" class="field"><label>TCP MaxSeg (tcpMaxSeg)</label><input v-model.number="model.sockopt_tcp_max_seg" type="number" placeholder="0" /></div>
         <div v-if="core === 'xray'" class="field"><label>TCP UserTimeout (ms)</label><input v-model.number="model.sockopt_tcp_user_timeout" type="number" placeholder="10000" /></div>
         <div v-if="core === 'xray'" class="field"><label>SRV/TXT 策略 (addressPortStrategy)</label><input v-model="model.sockopt_address_port_strategy" type="text" placeholder="none / SrvPortAndAddress" /></div>

@@ -4,7 +4,7 @@ export const CAPABILITIES = {
 	xray: {
 		inboundProtocols: ["dokodemo-door", "tunnel", "socks", "http", "vless", "vmess", "trojan", "shadowsocks", "hysteria", "wireguard", "masque", "tun"],
 		outboundProtocols: ["vless", "vmess", "trojan", "shadowsocks", "hysteria", "wireguard", "masque", "freedom", "blackhole", "dns", "socks", "http", "loopback"],
-		transports: ["raw", "tcp", "websocket", "ws", "grpc", "httpupgrade", "xhttp", "mkcp", "hysteria", "masque"],
+		transports: ["raw", "websocket", "grpc", "httpupgrade", "xhttp", "mkcp", "hysteria", "masque"],
 		securities: ["none", "tls", "reality"],
 		balancerStrategies: ["random", "roundRobin", "leastPing", "leastLoad"],
 		maxMuxConcurrency: 128,
@@ -17,7 +17,7 @@ export const CAPABILITIES = {
 	v2ray_v4: {
 		inboundProtocols: ["dokodemo-door", "socks", "http", "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tun"],
 		outboundProtocols: ["vmess", "vless", "trojan", "shadowsocks", "hysteria2", "freedom", "blackhole", "dns", "socks", "http", "loopback"],
-		transports: ["tcp", "ws", "grpc", "http", "h2", "kcp", "mkcp", "quic", "domainsocket", "hysteria2"],
+		transports: ["tcp", "ws", "grpc", "http", "kcp", "quic", "domainsocket", "hysteria2"],
 		securities: ["none", "tls"],
 		balancerStrategies: ["random", "leastPing", "leastLoad"],
 		maxMuxConcurrency: 1024,
@@ -30,7 +30,7 @@ export const CAPABILITIES = {
 	v2ray_v5: {
 		inboundProtocols: ["dokodemo-door", "socks", "http", "vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tun"],
 		outboundProtocols: ["vmess", "vless", "trojan", "shadowsocks", "shadowsocks2022", "hysteria2", "freedom", "blackhole", "dns", "socks", "http", "loopback"],
-		transports: ["tcp", "ws", "grpc", "httpupgrade", "kcp", "mkcp", "quic", "hysteria2"],
+		transports: ["tcp", "ws", "grpc", "httpupgrade", "kcp", "quic", "hysteria2"],
 		securities: ["none", "tls", "utls"],
 		balancerStrategies: ["random", "leastPing", "leastLoad"],
 		maxMuxConcurrency: 1024,

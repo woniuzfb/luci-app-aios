@@ -43,7 +43,11 @@ if (length(pd6) > 0) {
 }
 
 const proc = popen("nft -f -", "w");
-if (proc) {
-	proc.write(join("\n", cmds) + "\n");
-	proc.close();
+if (!proc) {
+	exit(1);
+}
+proc.write(join("\n", cmds) + "\n");
+const rc = proc.close();
+if (rc !== 0) {
+	exit(1);
 }

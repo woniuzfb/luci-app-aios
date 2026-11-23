@@ -32,6 +32,14 @@ const installStatus = ref<InstallCoreStatus | null>(null);
 const errorMsg = ref('');
 
 let pollTimer: number | null = null;
+let binsDirTimer: number | null = null;
+
+function clearBinsDirTimer() {
+  if (binsDirTimer !== null) {
+    window.clearTimeout(binsDirTimer);
+    binsDirTimer = null;
+  }
+}
 
 const availMb = computed(() => Math.floor((coreList.value?.avail_kb || 0) / 1024));
 const canInstall = computed(() => {
@@ -110,7 +118,11 @@ async function refresh() {
 watch(
   () => props.config.general.bins_dir,
   () => {
-    void refresh();
+    clearBinsDirTimer();
+    binsDirTimer = window.setTimeout(() => {
+      binsDirTimer = null;
+      void refresh();
+    }, 400);
   }
 );
 
@@ -203,6 +215,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopPolling();
+  clearBinsDirTimer();
 });
 </script>
 

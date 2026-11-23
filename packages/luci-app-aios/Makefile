@@ -75,6 +75,16 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	fi
 	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache/
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true
+	if [ -f /var/etc/aios/.restart_after_upgrade ]; then
+		rm -f /var/etc/aios/.restart_after_upgrade
+		if [ -x /etc/init.d/aios ]; then
+			/etc/init.d/aios start_manual >/dev/null 2>&1 || true
+		fi
+	elif [ -x /etc/init.d/aios ]; then
+		if /etc/init.d/aios running >/dev/null 2>&1 || [ -f /var/etc/aios/aios_active ]; then
+			/etc/init.d/aios reload >/dev/null 2>&1 || true
+		fi
+	fi
 fi
 exit 0
 endef
@@ -83,6 +93,13 @@ define Package/$(PKG_NAME)/prerm
 #!/bin/sh
 if [ -z "$${IPKG_INSTROOT}" ]; then
 	if [ -x /etc/init.d/aios ]; then
+		if [ "$${1:-remove}" = "upgrade" ]; then
+			mkdir -p /var/etc/aios
+			aios_pid="$$(tr -cd '0-9' < /var/run/aios.main.pid 2>/dev/null || true)"
+			if /etc/init.d/aios running >/dev/null 2>&1 || { [ -n "$${aios_pid}" ] && [ -d "/proc/$${aios_pid}" ]; }; then
+				touch /var/etc/aios/.restart_after_upgrade
+			fi
+		fi
 		/etc/init.d/aios stop >/dev/null 2>&1 || true
 		if [ "$${1:-remove}" != "upgrade" ]; then
 			/etc/init.d/aios disable >/dev/null 2>&1 || true

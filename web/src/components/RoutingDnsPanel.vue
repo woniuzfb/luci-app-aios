@@ -84,30 +84,46 @@ function addPolicyLevel() {
   });
 }
 
-function ensureBurstObservatory() {
+const DEFAULT_BURST_OBSERVATORY = {
+  enabled: false,
+  subject_selector: [] as string[],
+  destination: 'https://www.google.com/generate_204',
+  connectivity: '',
+  interval: '1m',
+  sampling: 3,
+  timeout: '5s'
+};
+
+const DEFAULT_BROWSER_FORWARDER = {
+  enabled: false,
+  listen_addr: '127.0.0.1',
+  listen_port: 8088
+};
+
+const burstObs = computed(() => props.config.burst_observatory ?? DEFAULT_BURST_OBSERVATORY);
+const browserFwd = computed(() => props.config.browser_forwarder ?? DEFAULT_BROWSER_FORWARDER);
+
+function updateBurstObservatory<K extends keyof NonNullable<AiosConfig['burst_observatory']>>(
+  key: K,
+  value: NonNullable<AiosConfig['burst_observatory']>[K]
+) {
   if (!props.config.burst_observatory) {
     props.config.burst_observatory = {
-      enabled: false,
-      subject_selector: [],
-      destination: 'https://www.google.com/generate_204',
-      connectivity: '',
-      interval: '1m',
-      sampling: 2,
-      timeout: '5s'
+      ...DEFAULT_BURST_OBSERVATORY,
+      subject_selector: []
     };
   }
-  return props.config.burst_observatory;
+  props.config.burst_observatory[key] = value;
 }
 
-function ensureBrowserForwarder() {
+function updateBrowserForwarder<K extends keyof NonNullable<AiosConfig['browser_forwarder']>>(
+  key: K,
+  value: NonNullable<AiosConfig['browser_forwarder']>[K]
+) {
   if (!props.config.browser_forwarder) {
-    props.config.browser_forwarder = {
-      enabled: false,
-      listen_addr: '127.0.0.1',
-      listen_port: 8080
-    };
+    props.config.browser_forwarder = { ...DEFAULT_BROWSER_FORWARDER };
   }
-  return props.config.browser_forwarder;
+  props.config.browser_forwarder[key] = value;
 }
 </script>
 
@@ -338,7 +354,7 @@ function ensureBrowserForwarder() {
             <ArrayInput
               v-model="rr.protocol"
               label="嗅探协议 (protocol[])"
-              :suggestions="core === 'xray' ? ['http', 'tls', 'bittorrent', 'quic'] : ['http', 'tls', 'bittorrent']"
+              :suggestions="['http', 'tls', 'bittorrent', 'quic']"
             />
             <ArrayInput v-model="rr.source" label="来源 IP (source[])" placeholder="如 192.168.1.0/24" />
             <ArrayInput v-model="rr.user" label="用户邮箱 (user[])" placeholder="匹配入站用户 email" />
@@ -388,7 +404,7 @@ function ensureBrowserForwarder() {
                 </select>
               </div>
               <div class="row-nowrap">
-                <div v-if="core === 'xray' || v2rayFormat === 'jsonv5'" class="field" style="flex: 1">
+                <div class="field" style="flex: 1">
                   <label>回退节点 (fallbackTag)</label>
                   <input v-model="b.fallback_tag" type="text" placeholder="direct" />
                 </div>
@@ -423,16 +439,64 @@ function ensureBrowserForwarder() {
       <div class="card" style="margin: 0">
         <div class="card-header">
           <h3 class="card-title">突发连接观测 (Burst Observatory — 用于 leastLoad)</h3>
-          <ToggleSwitch v-model="ensureBurstObservatory().enabled" label="启用突发观测" />
+          <ToggleSwitch
+            :model-value="burstObs.enabled"
+            label="启用突发观测"
+            @update:model-value="updateBurstObservatory('enabled', $event)"
+          />
         </div>
         <div style="display: flex; flex-direction: column; gap: 12px">
-          <ArrayInput v-model="ensureBurstObservatory().subject_selector" label="观测节点前缀列表 (subjectSelector[])" />
+          <ArrayInput
+            :model-value="burstObs.subject_selector"
+            label="观测节点前缀列表 (subjectSelector[])"
+            @update:model-value="updateBurstObservatory('subject_selector', $event)"
+          />
           <div class="grid-3">
-            <div class="field"><label>探测目标 (destination)</label><input v-model="ensureBurstObservatory().destination" type="text" placeholder="https://www.google.com/generate_204" /></div>
-            <div class="field"><label>连通性检查 URL (connectivity)</label><input v-model="ensureBurstObservatory().connectivity" type="text" placeholder="可选" /></div>
-            <div class="field"><label>探测周期 (interval)</label><input v-model="ensureBurstObservatory().interval" type="text" placeholder="1m" /></div>
-            <div class="field"><label>采样次数 (sampling)</label><input v-model.number="ensureBurstObservatory().sampling" type="number" placeholder="2" /></div>
-            <div class="field"><label>单次超时 (timeout)</label><input v-model="ensureBurstObservatory().timeout" type="text" placeholder="5s" /></div>
+            <div class="field">
+              <label>探测目标 (destination)</label>
+              <input
+                :value="burstObs.destination"
+                type="text"
+                placeholder="https://www.google.com/generate_204"
+                @input="updateBurstObservatory('destination', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="field">
+              <label>连通性检查 URL (connectivity)</label>
+              <input
+                :value="burstObs.connectivity"
+                type="text"
+                placeholder="可选"
+                @input="updateBurstObservatory('connectivity', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="field">
+              <label>探测周期 (interval)</label>
+              <input
+                :value="burstObs.interval"
+                type="text"
+                placeholder="1m"
+                @input="updateBurstObservatory('interval', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="field">
+              <label>采样次数 (sampling)</label>
+              <input
+                :value="burstObs.sampling"
+                type="number"
+                placeholder="2"
+                @input="updateBurstObservatory('sampling', Number(($event.target as HTMLInputElement).value) || 0)"
+              />
+            </div>
+            <div class="field">
+              <label>单次超时 (timeout)</label>
+              <input
+                :value="burstObs.timeout"
+                type="text"
+                placeholder="5s"
+                @input="updateBurstObservatory('timeout', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
           </div>
         </div>
       </div>
@@ -506,11 +570,31 @@ function ensureBrowserForwarder() {
         <div v-if="core === 'v2ray'" class="card" style="margin: 0">
           <div class="card-header">
             <h3 class="card-title">浏览器转发 (Browser Forwarder, V2Ray)</h3>
-            <ToggleSwitch v-model="ensureBrowserForwarder().enabled" label="启用" />
+            <ToggleSwitch
+              :model-value="browserFwd.enabled"
+              label="启用"
+              @update:model-value="updateBrowserForwarder('enabled', $event)"
+            />
           </div>
           <div class="grid-2">
-            <div class="field"><label>监听地址 (listenAddr)</label><input v-model="ensureBrowserForwarder().listen_addr" type="text" placeholder="127.0.0.1" /></div>
-            <div class="field"><label>监听端口 (listenPort)</label><input v-model.number="ensureBrowserForwarder().listen_port" type="number" placeholder="8080" /></div>
+            <div class="field">
+              <label>监听地址 (listenAddr)</label>
+              <input
+                :value="browserFwd.listen_addr"
+                type="text"
+                placeholder="127.0.0.1"
+                @input="updateBrowserForwarder('listen_addr', ($event.target as HTMLInputElement).value)"
+              />
+            </div>
+            <div class="field">
+              <label>监听端口 (listenPort)</label>
+              <input
+                :value="browserFwd.listen_port"
+                type="number"
+                placeholder="8080"
+                @input="updateBrowserForwarder('listen_port', Number(($event.target as HTMLInputElement).value) || 0)"
+              />
+            </div>
           </div>
         </div>
       </div>

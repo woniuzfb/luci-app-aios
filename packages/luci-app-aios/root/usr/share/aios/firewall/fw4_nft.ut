@@ -222,6 +222,12 @@ table inet aios {
 {% if (tproxy_mode === "redirect"): %}
 	chain redirect_filter {
 		fib daddr type local return
+{% if (fakedns_on && f_tcp4_port > 0): %}
+		ip protocol tcp ip daddr {{ fakedns_v4 }} redirect to :{{ f_tcp4_port }}
+{% endif %}
+{% if (fakedns_on && f_tcp6_port > 0): %}
+		ip6 nexthdr tcp ip6 daddr {{ fakedns_v6 }} redirect to :{{ f_tcp6_port }}
+{% endif %}
 {% if (length(wan_fw_v4) > 0 && tcp4_port > 0): %}
 		ip protocol tcp ip daddr @aios_fw_v4 redirect to :{{ tcp4_port }}
 {% endif %}
@@ -238,14 +244,8 @@ table inet aios {
 {% endif %}
 		ip daddr @aios_reserved_v4 return
 		ip6 daddr @aios_reserved_v6 return
-{% if (fakedns_on && f_tcp4_port > 0): %}
-		ip protocol tcp ip daddr {{ fakedns_v4 }} redirect to :{{ f_tcp4_port }}
-{% endif %}
 {% if (tcp4_port > 0): %}
 		ip protocol tcp redirect to :{{ tcp4_port }}
-{% endif %}
-{% if (fakedns_on && f_tcp6_port > 0): %}
-		ip6 nexthdr tcp ip6 daddr {{ fakedns_v6 }} redirect to :{{ f_tcp6_port }}
 {% endif %}
 {% if (tcp6_port > 0): %}
 		ip6 nexthdr tcp redirect to :{{ tcp6_port }}
@@ -267,21 +267,21 @@ table inet aios {
 		ip6 nexthdr tcp ether saddr @aios_mac_bp_v6 return
 {% endif %}
 {% if (length(mac_tp_v4) > 0 && tcp4_port > 0): %}
-		ip protocol tcp ether saddr @aios_mac_tp_v4 jump redirect_filter
+		ip protocol tcp ether saddr @aios_mac_tp_v4 goto redirect_filter
 {% endif %}
 {% if (length(mac_tp_v6) > 0 && tcp6_port > 0): %}
-		ip6 nexthdr tcp ether saddr @aios_mac_tp_v6 jump redirect_filter
+		ip6 nexthdr tcp ether saddr @aios_mac_tp_v6 goto redirect_filter
 {% endif %}
 {% if (length(ifaces_v4) > 0 && tcp4_port > 0): %}
-		ip protocol tcp iifname { "{{ join('", "', ifaces_v4) }}" } jump redirect_filter
+		ip protocol tcp iifname { "{{ join('", "', ifaces_v4) }}" } goto redirect_filter
 {% endif %}
 {% if (length(ifaces_v6) > 0 && tcp6_port > 0): %}
-		ip6 nexthdr tcp iifname { "{{ join('", "', ifaces_v6) }}" } jump redirect_filter
+		ip6 nexthdr tcp iifname { "{{ join('", "', ifaces_v6) }}" } goto redirect_filter
 {% endif %}
 	}
 
 	chain nat_output {
-		type nat hook output priority -100; policy accept;
+		type nat hook output priority dstnat {{ prio }}; policy accept;
 		meta mark { {{ out_mark }}, {{ dns_mark }} } return
 {% if (length(bypass_uids) > 0): %}
 		meta skuid { {{ join(", ", bypass_uids) }} } return
@@ -423,7 +423,7 @@ table inet aios {
 	}
 {% endif %}
 
-{% if (fakedns_on && tp.fakedns_ping_response == "1"): %}
+{% if (fakedns_on && tp.fakedns_ping_response != "0"): %}
 	chain fakedns_ping_prerouting {
 		type nat hook prerouting priority dstnat {{ prio }}; policy accept;
 		ip daddr {{ fakedns_v4 }} icmp type echo-request redirect

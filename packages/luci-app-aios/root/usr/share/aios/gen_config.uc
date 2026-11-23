@@ -21,8 +21,14 @@ const general = cfg.general || {};
 const core = (cli_target_core === "xray" || cli_target_core === "v2ray")
 	? cli_target_core
 	: detect_core_type(general);
+const version_probe_general = (cli_target_core === "xray" || cli_target_core === "v2ray")
+	? { core_type: core, core_bin: cli_target_core === general.core_type ? general.core_bin : "" }
+	: general;
+const reuse_general_version = !cli_target_core || cli_target_core === general.core_type;
 const target_version = cli_target_version
-	|| (general.target_version && general.target_version !== "auto" ? general.target_version : detect_core_version(general));
+	|| (reuse_general_version && general.target_version && general.target_version !== "auto"
+		? general.target_version
+		: detect_core_version(version_probe_general));
 
 let compiled;
 if (core === "v2ray") {

@@ -4,6 +4,28 @@ import { deep_merge, parse_duration_ns, parse_json_safe, to_array } from "../com
 import { validate_stream_combination } from "../common/capabilities.mjs";
 import { resolve_core_features } from "../common/features.mjs";
 
+const V2RAY_V5_SS_ALLOWED_METHODS = {
+	"aes-128-gcm": true, "aes_128_gcm": true, "aead_aes_128_gcm": true,
+	"aes-256-gcm": true, "aes_256_gcm": true, "aead_aes_256_gcm": true,
+	"chacha20-poly1305": true, "chacha20_poly1305": true, "aead_chacha20_poly1305": true, "chacha20-ietf-poly1305": true,
+	"none": true, "plain": true
+};
+
+function bool_or(v, def_val) {
+	if (v == null || v === "") return def_val;
+	return v === "1" || v === true || lc(`${v}`) === "true";
+}
+
+function num_or(val, def) {
+	return val != null && val !== "" ? int(val) : def;
+}
+
+function is_valid_base64_pin(val) {
+	const s = trim(`${val || ""}`);
+	if (length(s) < 4 || length(s) % 4 !== 0) return false;
+	return !!match(s, /^[A-Za-z0-9+\/]+={0,2}$/);
+}
+
 function to_v5_log_level(lv) {
 	const v = lc(lv || "warning");
 	if (v === "debug") return "Debug";
@@ -44,9 +66,31 @@ function to_v5_quic_security(sec) {
 	return "NONE";
 }
 
+function parse_ipv6_bytes(addr) {
+	const halves = split(addr, "::");
+	if (length(halves) > 2) return null;
+	const left = halves[0] ? split(halves[0], ":") : [];
+	const right = length(halves) === 2 && halves[1] ? split(halves[1], ":") : [];
+	const missing = 8 - (length(left) + length(right));
+	if (length(halves) === 1 && missing !== 0) return null;
+	if (length(halves) === 2 && missing <= 0) return null;
+	let groups = [];
+	for (let x in left) push(groups, x);
+	for (let i = 0; i < missing; i++) push(groups, "0");
+	for (let x in right) push(groups, x);
+	if (length(groups) !== 8) return null;
+	let bytes = [];
+	for (let g in groups) {
+		if (!match(g, /^[0-9a-fA-F]{1,4}$/)) return null;
+		const val = hex(g);
+		push(bytes, (val >> 8) & 0xff, val & 0xff);
+	}
+	return bytes;
+}
+
 function is_ip_literal(val) {
 	if (!val) return false;
-	if (index(val, ":") >= 0) return true;
+	if (index(val, ":") >= 0) return parse_ipv6_bytes(val) != null;
 	const parts = split(val, ".");
 	if (length(parts) !== 4) return false;
 	for (let p in parts) {
@@ -62,24 +106,8 @@ function parse_cidr_bytes(cidr) {
 	const addr = parts[0] || "";
 	if (!addr) return null;
 	if (index(addr, ":") >= 0) {
-		const halves = split(addr, "::");
-		if (length(halves) > 2) return null;
-		const left = halves[0] ? split(halves[0], ":") : [];
-		const right = length(halves) === 2 && halves[1] ? split(halves[1], ":") : [];
-		const missing = 8 - (length(left) + length(right));
-		if (length(halves) === 1 && missing !== 0) return null;
-		if (length(halves) === 2 && missing <= 0) return null;
-		let groups = [];
-		for (let x in left) push(groups, x);
-		for (let i = 0; i < missing; i++) push(groups, "0");
-		for (let x in right) push(groups, x);
-		if (length(groups) !== 8) return null;
-		let bytes = [];
-		for (let g in groups) {
-			if (!match(g, /^[0-9a-fA-F]{1,4}$/)) return null;
-			const val = hex(g);
-			push(bytes, (val >> 8) & 0xff, val & 0xff);
-		}
+		const bytes = parse_ipv6_bytes(addr);
+		if (!bytes) return null;
 		if (length(parts) > 1 && parts[1] !== "" && !match(parts[1], /^[0-9]+$/)) return null;
 		const prefix = length(parts) > 1 && parts[1] !== "" ? int(parts[1]) : 128;
 		if (prefix < 0 || prefix > 128) return null;
@@ -150,6 +178,7 @@ function parse_priority_domain(raw) {
 
 function build_static_host(domain_raw, targets) {
 	const s = trim(domain_raw || "");
+	if (!s) return null;
 	let t = "Full";
 	let d = s;
 	if (substr(s, 0, 5) === "full:") { t = "Full"; d = substr(s, 5); }
@@ -159,12 +188,13 @@ function build_static_host(domain_raw, targets) {
 	let ips = [];
 	let proxied = null;
 	for (let x in targets) {
-		const v = trim(x || "");
+		const v = trim(`${x || ""}`);
 		if (!v) continue;
 		if (is_ip_literal(v)) push(ips, v);
 		else if (!proxied) proxied = v;
 	}
 	if (proxied) return { type: t, domain: d, proxiedDomain: proxied };
+	if (length(ips) === 0) return null;
 	return { type: t, domain: d, ip: ips };
 }
 
@@ -210,8 +240,16 @@ function build_v5_stream(item, is_inbound, default_mark, protocol) {
 		transportSettings = { serviceName: item.grpc_service_name || "" };
 	} else if (transport === "httpupgrade") {
 		transportSettings = { path: item.httpupgrade_path || "/", host: item.httpupgrade_host || "" };
-		const hs = parse_json_safe(item.httpupgrade_headers_json, "httpupgrade_headers_json");
-		if (type(hs) === "array" && length(hs) > 0) transportSettings.header = hs;
+		const rawHs = parse_json_safe(item.httpupgrade_headers_json, "httpupgrade_headers_json");
+		let huHeaders = [];
+		if (type(rawHs) === "array") {
+			for (let h in rawHs) {
+				if (h && h.key && trim(h.key) !== "") {
+					push(huHeaders, { key: trim(h.key), value: h.value || "" });
+				}
+			}
+		}
+		if (length(huHeaders) > 0) transportSettings.header = huHeaders;
 		if (item.ws_max_early_data) transportSettings.maxEarlyData = int(item.ws_max_early_data);
 		if (item.ws_early_data_header) transportSettings.earlyDataHeaderName = item.ws_early_data_header;
 	} else if (transport === "kcp") {
@@ -247,10 +285,27 @@ function build_v5_stream(item, is_inbound, default_mark, protocol) {
 		if (item.tls_disable_system_root === "1") tls.disableSystemRoot = true;
 		const pinned = to_array(item.tls_pinned_sha256);
 		if (length(pinned) > 0) {
-			tls.pinnedPeerCertificateChainSha256 = pinned;
-			if (item.tls_allow_insecure === "1") tls.allowInsecureIfPinnedPeerCertificate = true;
+			let valid_pins = [];
+			for (let p in pinned) {
+				const s = trim(`${p || ""}`);
+				if (!s) continue;
+				if (!is_valid_base64_pin(s)) {
+					die(`V2Ray jsonv5 tls_pinned_sha256 必须为合法 Base64 编码 (${item.tag || item[".name"] || "node"}): "${s}"。`);
+				}
+				push(valid_pins, s);
+			}
+			if (length(valid_pins) > 0) {
+				tls.pinnedPeerCertificateChainSha256 = valid_pins;
+				if (item.tls_allow_insecure === "1") tls.allowInsecureIfPinnedPeerCertificate = true;
+			}
 		}
-		if (item.tls_ech_config) tls.echConfig = item.tls_ech_config;
+		if (item.tls_ech_config && trim(`${item.tls_ech_config}`) !== "") {
+			const ech = trim(`${item.tls_ech_config}`);
+			if (!is_valid_base64_pin(ech)) {
+				die(`V2Ray jsonv5 tls_ech_config 必须为合法标准 Base64 编码 (${item.tag || item[".name"] || "node"})。`);
+			}
+			tls.echConfig = ech;
+		}
 		if (is_inbound) {
 			const usage_map = {
 				encipherment: "ENCIPHERMENT",
@@ -310,7 +365,7 @@ export function compile_v2ray_v5(cfg, opts) {
 
 	let inbounds = [];
 	let services = {};
-	if (g.stats_enabled === "1") services.stats = {};
+	if (bool_or(g.stats_enabled, true)) services.stats = {};
 
 	for (let ib in cfg.inbounds) {
 		if (ib.enabled === "0") continue;
@@ -367,7 +422,7 @@ export function compile_v2ray_v5(cfg, opts) {
 		const has_users = type(users) === "array" && length(users) > 0;
 		let settings = {};
 		if (proto === "socks") {
-			settings = { udpEnabled: ib.socks_udp === "1" };
+			settings = { udpEnabled: bool_or(ib.socks_udp, true) };
 			if (ib.socks_ip) settings.address = ib.socks_ip;
 			if (ib.packet_encoding) settings.packetEncoding = ib.packet_encoding;
 		} else if (proto === "http") {
@@ -383,7 +438,8 @@ export function compile_v2ray_v5(cfg, opts) {
 			if (ib.packet_encoding) settings.packetEncoding = ib.packet_encoding;
 		} else if (proto === "shadowsocks") {
 			const ssMethod = ib.method || "aes-256-gcm";
-			if (substr(ssMethod, 0, 12) === "2022-blake3-") {
+			const ssMethodLower = lc(ssMethod);
+			if (!V2RAY_V5_SS_ALLOWED_METHODS[ssMethodLower]) {
 				die(`V2Ray jsonv5 的 shadowsocks 入站不支持 "${ssMethod}"。`);
 			}
 			settings = { method: ssMethod, password: ib.password || "", networks: lc(ib.ss_network || "tcp,udp") };
@@ -394,7 +450,7 @@ export function compile_v2ray_v5(cfg, opts) {
 		let item = {
 			tag: ib.tag || ib[".name"],
 			listen: ib.listen || "0.0.0.0",
-			port: int(ib.port || 1080),
+			port: num_or(ib.port, 1080),
 			protocol: proto,
 			settings: settings,
 			streamSettings: build_v5_stream(ib, true, null, proto)
@@ -408,6 +464,7 @@ export function compile_v2ray_v5(cfg, opts) {
 			};
 		}
 		const custom = parse_json_safe(ib.custom_config, "custom_config");
+		if (custom != null && type(custom) !== "object") die(`custom_config 必须为 JSON 对象 (${ib.tag || ib[".name"] || "inbound"})。`);
 		push(inbounds, custom ? deep_merge(item, custom) : item);
 	}
 
@@ -435,8 +492,9 @@ export function compile_v2ray_v5(cfg, opts) {
 			settings = { address: ob.address || "", port: int(ob.port || 443), password: ob.password || "" };
 		} else if (proto === "shadowsocks") {
 			const ssMethod = ob.method || "aes-256-gcm";
-			if (substr(ssMethod, 0, 12) === "2022-blake3-") {
-				die(`V2Ray jsonv5 的 shadowsocks 出站不支持 "${ssMethod}"，请使用 shadowsocks2022 协议。`);
+			const ssMethodLower = lc(ssMethod);
+			if (!V2RAY_V5_SS_ALLOWED_METHODS[ssMethodLower]) {
+				die(`V2Ray jsonv5 的 shadowsocks 出站不支持 "${ssMethod}"。`);
 			}
 			settings = { address: ob.address || "", port: int(ob.port || 8388), method: ssMethod, password: ob.password || "" };
 		} else if (proto === "hysteria2") {
@@ -458,6 +516,7 @@ export function compile_v2ray_v5(cfg, opts) {
 			item.mux = { enabled: true, concurrency: conc };
 		}
 		const custom = parse_json_safe(ob.custom_config, "custom_config");
+		if (custom != null && type(custom) !== "object") die(`custom_config 必须为 JSON 对象 (${ob.tag || ob[".name"] || "outbound"})。`);
 		push(outbounds, custom ? deep_merge(item, custom) : item);
 	}
 
@@ -489,19 +548,26 @@ export function compile_v2ray_v5(cfg, opts) {
 		let bridges = [];
 		for (let b in to_array(rev.bridges)) {
 			const parts = split(b, "|");
-			if (length(parts) === 2) push(bridges, { tag: trim(parts[0]), domain: trim(parts[1]) });
+			if (length(parts) === 2) {
+				const t = trim(parts[0]);
+				const dom = trim(parts[1]);
+				if (t && dom) push(bridges, { tag: t, domain: dom });
+			}
 		}
 		let portals = [];
 		for (let pt in to_array(rev.portals)) {
 			const parts = split(pt, "|");
-			if (length(parts) === 2) push(portals, { tag: trim(parts[0]), domain: trim(parts[1]) });
+			if (length(parts) === 2) {
+				const t = trim(parts[0]);
+				const dom = trim(parts[1]);
+				if (t && dom) push(portals, { tag: t, domain: dom });
+			}
 		}
 		services.reverse = { bridgeConfig: bridges, portalConfig: portals };
 	}
 	const p = cfg.policy || {};
-	if (p.enabled === "1") {
+	if (bool_or(p.enabled, true)) {
 		let levelMap = {};
-		const num_or = (val, def) => (val != null && val !== "" ? int(val) : def);
 		const parsed_levels = parse_json_safe(p.policy_levels_json, "policy_levels_json");
 		if (type(parsed_levels) === "array" && length(parsed_levels) > 0) {
 			for (let lv in parsed_levels) {
@@ -539,10 +605,10 @@ export function compile_v2ray_v5(cfg, opts) {
 			level: levelMap,
 			system: {
 				stats: {
-					inboundUplink: p.stats_inbound_uplink === "1",
-					inboundDownlink: p.stats_inbound_downlink === "1",
-					outboundUplink: p.stats_outbound_uplink === "1",
-					outboundDownlink: p.stats_outbound_downlink === "1"
+					inboundUplink: bool_or(p.stats_inbound_uplink, true),
+					inboundDownlink: bool_or(p.stats_inbound_downlink, true),
+					outboundUplink: bool_or(p.stats_outbound_uplink, true),
+					outboundDownlink: bool_or(p.stats_outbound_downlink, true)
 				}
 			}
 		};
@@ -567,7 +633,7 @@ export function compile_v2ray_v5(cfg, opts) {
 
 	const d = cfg.dns || {};
 	const r = cfg.routing || {};
-	if (d.enabled === "1" || length(cfg.fakedns) > 0) {
+	if (bool_or(d.enabled, true) || length(cfg.fakedns) > 0) {
 		let dnsObj = {
 			tag: d.tag || "dns-in",
 			queryStrategy: to_v5_query_strategy(d.query_strategy),
@@ -589,8 +655,8 @@ export function compile_v2ray_v5(cfg, opts) {
 						if (!trimmed) continue;
 						if (substr(trimmed, 0, 8) === "geosite:") {
 							push(gDoms, { filePath: "geosite.dat", code: substr(trimmed, 8) });
-						} else if (substr(trimmed, 0, 4) === "ext:") {
-							const rest = substr(trimmed, 4);
+						} else if (substr(trimmed, 0, 4) === "ext:" || substr(trimmed, 0, 11) === "ext-domain:") {
+							const rest = substr(trimmed, 0, 11) === "ext-domain:" ? substr(trimmed, 11) : substr(trimmed, 4);
 							const colon = index(rest, ":");
 							push(gDoms, { filePath: colon >= 0 ? substr(rest, 0, colon) : "geosite.dat", code: colon >= 0 ? substr(rest, colon + 1) : rest });
 						} else {
@@ -608,22 +674,40 @@ export function compile_v2ray_v5(cfg, opts) {
 			})
 		};
 		if (d.client_ip) dnsObj.clientIp = d.client_ip;
-		let sh = [];
+		let host_map = {};
+		let host_order = [];
+		const add_host_entry = (dom, raw_addrs) => {
+			const k = trim(`${dom || ""}`);
+			if (!k) return;
+			let cleaned = [];
+			for (let x in raw_addrs) {
+				const v = trim(`${x || ""}`);
+				if (v) push(cleaned, v);
+			}
+			if (length(cleaned) === 0) return;
+			if (!exists(host_map, k)) push(host_order, k);
+			host_map[k] = cleaned;
+		};
 		const raw_hosts = parse_json_safe(d.hosts_json, "hosts_json");
 		if (type(raw_hosts) === "object") {
 			for (let k in raw_hosts) {
 				const v = raw_hosts[k];
 				const addrs = type(v) === "array" ? v : (v ? [`${v}`] : []);
-				if (k && length(addrs) > 0) push(sh, build_static_host(k, addrs));
+				add_host_entry(k, addrs);
 			}
 		}
 		const host_entries = parse_json_safe(d.host_entries_json, "host_entries_json");
 		if (type(host_entries) === "array" && length(host_entries) > 0) {
 			for (let h in host_entries) {
 				if (h && h.domain && type(h.addresses) === "array" && length(h.addresses) > 0) {
-					push(sh, build_static_host(h.domain, h.addresses));
+					add_host_entry(h.domain, h.addresses);
 				}
 			}
+		}
+		let sh = [];
+		for (let k in host_order) {
+			const entry = build_static_host(k, host_map[k]);
+			if (entry) push(sh, entry);
 		}
 		if (length(sh) > 0) dnsObj.staticHosts = sh;
 		if (length(cfg.fakedns) > 0) {
@@ -634,7 +718,7 @@ export function compile_v2ray_v5(cfg, opts) {
 		doc.dns = dnsObj;
 	}
 
-	if (r.enabled === "1") {
+	if (bool_or(r.enabled, true)) {
 		let rules = [];
 		for (let rr in cfg.routing_rules) {
 			if (rr.enabled === "0") continue;
@@ -644,8 +728,8 @@ export function compile_v2ray_v5(cfg, opts) {
 				const s = trim(dom || "");
 				if (!s) continue;
 				if (substr(s, 0, 8) === "geosite:") push(geoDomains, { filePath: "geosite.dat", code: substr(s, 8) });
-				else if (substr(s, 0, 4) === "ext:") {
-					const rest = substr(s, 4);
+				else if (substr(s, 0, 4) === "ext:" || substr(s, 0, 11) === "ext-domain:") {
+					const rest = substr(s, 0, 11) === "ext-domain:" ? substr(s, 11) : substr(s, 4);
 					const colon = index(rest, ":");
 					push(geoDomains, { filePath: colon >= 0 ? substr(rest, 0, colon) : "geosite.dat", code: colon >= 0 ? substr(rest, colon + 1) : rest });
 				}
@@ -669,7 +753,7 @@ export function compile_v2ray_v5(cfg, opts) {
 			if (length(us) > 0) rule.userEmail = us;
 			const ibs = to_array(rr.inbound_tag);
 			if (length(ibs) > 0) rule.inboundTag = ibs;
-			const protos = filter(to_array(rr.protocol), x => x !== "quic");
+			const protos = to_array(rr.protocol);
 			if (length(protos) > 0) rule.protocol = protos;
 			rule.domainMatcher = r.domain_matcher === "mph" ? "mph" : "linear";
 			if (rr.attrs) rule.attributes = rr.attrs;

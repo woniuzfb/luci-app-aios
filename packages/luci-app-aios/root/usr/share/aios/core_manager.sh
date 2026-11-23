@@ -58,9 +58,12 @@ detect_linux_arch() {
 		x86_64) echo "linux-64"; return 0 ;;
 		aarch64_*) echo "linux-arm64-v8a"; return 0 ;;
 		arm_cortex-a*) echo "linux-arm32-v7a"; return 0 ;;
+		arm_arm926ej-s|arm_xscale|arm_fa526) echo "linux-arm32-v5"; return 0 ;;
 		arm_arm1176jzf-s_vfp|arm_*) echo "linux-arm32-v6"; return 0 ;;
-		mipsel_*) echo "linux-mips32le"; return 0 ;;
-		mips_*) echo "linux-mips32"; return 0 ;;
+		mipsel_*fpu*|mipsel_*hardfloat*) echo "linux-mips32le"; return 0 ;;
+		mipsel_*) echo "linux-mips32le-softfloat"; return 0 ;;
+		mips_*fpu*|mips_*hardfloat*) echo "linux-mips32"; return 0 ;;
+		mips_*) echo "linux-mips32-softfloat"; return 0 ;;
 		mips64el_*) echo "linux-mips64le"; return 0 ;;
 		mips64_*) echo "linux-mips64"; return 0 ;;
 		riscv64_*) echo "linux-riscv64"; return 0 ;;
@@ -71,10 +74,11 @@ detect_linux_arch() {
 		aarch64|arm64) echo "linux-arm64-v8a" ;;
 		armv7l|armv7*) echo "linux-arm32-v7a" ;;
 		armv6l) echo "linux-arm32-v6" ;;
+		armv5*) echo "linux-arm32-v5" ;;
 		mips64) echo "linux-mips64" ;;
 		mips64el) echo "linux-mips64le" ;;
-		mips) echo "linux-mips32" ;;
-		mipsel) echo "linux-mips32le" ;;
+		mips) echo "linux-mips32-softfloat" ;;
+		mipsel) echo "linux-mips32le-softfloat" ;;
 		riscv64) echo "linux-riscv64" ;;
 		i386|i686) echo "linux-32" ;;
 		*) echo "" ;;
@@ -176,7 +180,7 @@ cmd_install() {
 	if [ -d "$LOCK_DIR" ] && [ -s "${LOCK_DIR}/pid" ]; then
 		local lock_pid
 		lock_pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
-		if [ -n "$lock_pid" ] && [ ! -d "/proc/${lock_pid}" ]; then
+		if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null && [ ! -d "/proc/${lock_pid}" ]; then
 			rm -rf "$LOCK_DIR" 2>/dev/null || true
 		fi
 	fi
@@ -187,6 +191,7 @@ cmd_install() {
 	echo "$$" > "${LOCK_DIR}/pid"
 	_WORK_TMP=""
 	trap cleanup_install EXIT
+	write_status "$job_id" "queued" "$core" "$tag" 5 "Queued install"
 
 	if [ "$core" != "xray" ] && [ "$core" != "v2ray" ]; then
 		write_status "$job_id" "error" "$core" "$tag" 0 "Invalid core: $core"

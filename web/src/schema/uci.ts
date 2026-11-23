@@ -763,7 +763,7 @@ export function serializeConfigToUci(cfg: AiosConfig): UciSectionPayload[] {
     'main_burst_observatory',
     'main_policy',
     'main_reverse',
-    'main_browser',
+    'main_browser_forwarder',
     'main_tproxy'
   ]);
   const usedNames = new Set<string>();
@@ -1108,7 +1108,7 @@ export function parseUciDump(raw: UciRawDump): AiosConfig {
         stats_inbound_downlink: asBool(s.stats_inbound_downlink, true),
         stats_outbound_uplink: asBool(s.stats_outbound_uplink, true),
         stats_outbound_downlink: asBool(s.stats_outbound_downlink, true),
-        levels: parseJsonField(s.policy_levels_json, def.policy.levels || [])
+        levels: parseJsonField(s.policy_levels_json, [])
       };
     } else if (type === 'reverse') {
       def.reverse = {

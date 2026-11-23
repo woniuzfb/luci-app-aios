@@ -27,7 +27,9 @@ if [ -f /etc/config/aios ]; then
 		legacy_interval="$(uci -q get aios.main.geodata_reload_interval || true)"
 		existing_cron="$(uci -q get aios.main.geodata_cron || true)"
 		if [ -n "$legacy_interval" ] && [ -z "$existing_cron" ]; then
+			set -f
 			set -- $legacy_interval
+			set +f
 			if [ "$#" -eq 5 ]; then
 				uci -q set aios.main.geodata_cron="$legacy_interval"
 			fi

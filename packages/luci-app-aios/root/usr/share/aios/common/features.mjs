@@ -11,10 +11,15 @@ const FALLBACK_SPEC = {
 			flatOutbounds: { since: "25.10.15" },
 			tunInbound: { since: "26.1.13" },
 			hysteria: { since: "26.1.13" },
+			dnsRewriteKeys: { since: "26.1.13" },
+			geodataCron: { since: "26.1.13" },
+			freedomFinalRules: { since: "26.1.13" },
+			ssUot: { removedIn: "26.1.13" },
 			legacyReverse: { removedIn: "26.4.25" },
 			inboundUsersKey: { since: "26.5.9" },
 			streamMethodKey: { since: "26.7.11" },
-			masque: { since: "26.9.30" }
+			masque: { since: "26.9.30" },
+			requireTlsPublicVlessTrojan: { since: "26.10.0" }
 		}
 	},
 	v2ray: {

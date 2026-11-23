@@ -168,6 +168,13 @@ function buildXrayDualStackTproxyPreset(): AiosPreset {
     inbound_tag: ['dns-in-5350', 'dns-in-5351', 'dns-in-5352'],
     outbound_tag: 'dns-out'
   });
+  cfg.dns_servers.unshift({
+    id: 'dns_fakedns',
+    enabled: true,
+    alias: 'FakeDNS (Global)',
+    address: 'fakedns',
+    domains: ['geosite:geolocation-!cn']
+  });
   cfg.fakedns = [
     { id: 'fake_v4', ip_pool: '198.18.0.0/15', pool_size: 65535 },
     { id: 'fake_v6', ip_pool: '2001:2::/48', pool_size: 65535 }

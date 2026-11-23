@@ -4,8 +4,17 @@ import { deep_merge, kv_to_map, parse_json_safe, to_array } from "../common/conf
 import { resolve_core_features } from "../common/features.mjs";
 import { build_stream_settings } from "../common/stream.mjs";
 
+function bool_or(v, def_val) {
+	if (v == null || v === "") return def_val;
+	return v === "1" || v === true || lc(`${v}`) === "true";
+}
+
+function num_or(val, def) {
+	return val != null && val !== "" ? int(val) : def;
+}
+
 function is_private_v4(a, b) {
-	if (a === 10 || a === 127 || a === 0) return true;
+	if (a === 10 || a === 127) return true;
 	if (a === 172 && b >= 16 && b <= 31) return true;
 	if (a === 192 && b === 168) return true;
 	if (a === 169 && b === 254) return true;
@@ -15,20 +24,32 @@ function is_private_v4(a, b) {
 function is_public_target_addr(addr) {
 	let s = lc(trim(addr || ""));
 	if (substr(s, 0, 1) === "[" && substr(s, -1) === "]") s = substr(s, 1, length(s) - 2);
+	if (length(s) > 0 && substr(s, -1) === ".") s = substr(s, 0, length(s) - 1);
 	if (!s) return false;
-	if (s === "localhost" || substr(s, -6) === ".local" || substr(s, -4) === ".lan" || substr(s, -9) === ".internal") return false;
-	if (index(s, ":") < 0 && index(s, ".") < 0) return false;
+	if (s === "localhost" || s === "home.arpa" || substr(s, -6) === ".local" || substr(s, -4) === ".lan" || substr(s, -9) === ".internal" || substr(s, -10) === ".home.arpa" || substr(s, -12) === ".localdomain" || substr(s, -8) === ".example" || substr(s, -8) === ".invalid" || substr(s, -5) === ".test") return false;
+	if (index(s, ":") < 0 && index(s, ".") < 0) {
+		return !match(s, /^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$/);
+	}
 	const parts = split(s, ".");
 	if (length(parts) === 4) {
-		let ok = true;
+		let all_digits = true;
+		let any_gt_255 = false;
 		for (let p in parts) {
-			if (!match(p, /^[0-9]+$/) || int(p) > 255) { ok = false; break; }
+			if (!match(p, /^[0-9]+$/)) { all_digits = false; break; }
+			if (int(p) > 255) any_gt_255 = true;
 		}
-		if (ok) return !is_private_v4(int(parts[0]), int(parts[1]));
+		if (all_digits) {
+			if (any_gt_255) return true;
+			return !is_private_v4(int(parts[0]), int(parts[1]));
+		}
 	}
 	if (index(s, ":") >= 0) {
 		const m = match(s, /^::ffff:([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
-		if (m) return !is_private_v4(int(m[1]), int(m[2]));
+		if (m) {
+			const a = int(m[1]), b = int(m[2]), c = int(m[3]), d = int(m[4]);
+			if (a > 255 || b > 255 || c > 255 || d > 255) return true;
+			return !is_private_v4(a, b);
+		}
 		const halves = split(s, "::");
 		if (length(halves) <= 2) {
 			const left = halves[0] ? split(halves[0], ":") : [];
@@ -47,9 +68,14 @@ function is_public_target_addr(addr) {
 					push(bytes, (val >> 8) & 0xff, val & 0xff);
 				}
 				if (valid && length(bytes) === 16) {
+					let mapped_prefix = true;
+					for (let i = 0; i < 10; i++) if (bytes[i] !== 0) { mapped_prefix = false; break; }
+					if (mapped_prefix && bytes[10] === 0xff && bytes[11] === 0xff) {
+						return !is_private_v4(bytes[12], bytes[13]);
+					}
 					let zero = true;
 					for (let i = 0; i < 15; i++) if (bytes[i] !== 0) { zero = false; break; }
-					if (zero && (bytes[15] === 0 || bytes[15] === 1)) return false;
+					if (zero && bytes[15] === 1) return false;
 					if ((bytes[0] & 0xfe) === 0xfc) return false;
 					if (bytes[0] === 0xfe && (bytes[1] & 0xc0) === 0x80) return false;
 					return true;
@@ -80,17 +106,17 @@ function build_inbound(item, features) {
 	let obj = {
 		tag: item.tag || item[".name"],
 		listen: item.listen || "0.0.0.0",
-		port: int(item.port || 1080),
+		port: num_or(item.port, 1080),
 		protocol: proto,
 		settings: {}
 	};
 
-	const users = parse_json_safe(item.users_json);
+	const users = parse_json_safe(item.users_json, "users_json");
 	const has_users = type(users) === "array" && length(users) > 0;
-	const fallbacks = parse_json_safe(item.fallbacks_json);
+	const fallbacks = parse_json_safe(item.fallbacks_json, "fallbacks_json");
 
 	if (proto === "socks") {
-		obj.settings = { auth: item.socks_auth || "noauth", udp: item.socks_udp === "1" };
+		obj.settings = { auth: item.socks_auth || "noauth", udp: bool_or(item.socks_udp, true) };
 		if (item.socks_ip) obj.settings.ip = item.socks_ip;
 		if (item.socks_auth === "password") {
 			const accKey = use_users ? "users" : "accounts";
@@ -113,7 +139,7 @@ function build_inbound(item, features) {
 			: { network: item.dokodemo_network || "tcp,udp", followRedirect: item.dokodemo_follow_redirect === "1" };
 		if (item.dokodemo_address) obj.settings[use_rw ? "rewriteAddress" : "address"] = item.dokodemo_address;
 		if (item.dokodemo_port) obj.settings[use_rw ? "rewritePort" : "port"] = int(item.dokodemo_port);
-		const pm = kv_to_map(parse_json_safe(item.tunnel_port_map_json));
+		const pm = kv_to_map(parse_json_safe(item.tunnel_port_map_json, "tunnel_port_map_json"));
 		if (pm) obj.settings.portMap = pm;
 		if (item.tunnel_user_level != null && item.tunnel_user_level !== "") obj.settings.userLevel = int(item.tunnel_user_level);
 	} else if (proto === "vless") {
@@ -150,11 +176,25 @@ function build_inbound(item, features) {
 		if (type(fallbacks) === "array" && length(fallbacks) > 0) obj.settings.fallbacks = fallbacks;
 	} else if (proto === "shadowsocks") {
 		const ssMethod = item.method || "aes-256-gcm";
-		obj.settings = { method: ssMethod, network: item.ss_network || "tcp,udp" };
+		const ssMethodLower = lc(ssMethod);
+		const isSs2022 = substr(ssMethodLower, 0, 12) === "2022-blake3-";
+		if (isSs2022 && has_users) {
+			if (index(ssMethodLower, "aes") < 0) {
+				die(`Xray Shadowsocks 2022 多用户入站仅支持 2022-blake3-aes-*-gcm，不支持 "${ssMethod}"。`);
+			}
+			if (!trim(item.password || "")) {
+				die(`Xray Shadowsocks 2022 多用户入站必须配置顶层服务端 PSK (password)。`);
+			}
+		}
+		obj.settings = { method: isSs2022 ? ssMethodLower : ssMethod, network: item.ss_network || "tcp,udp" };
 		if (has_users) {
+			if (isSs2022) {
+				obj.settings.password = item.password || "";
+			}
 			const uKey = use_users ? "users" : "clients";
 			obj.settings[uKey] = map(users, u => {
-				let x = { method: ssMethod, password: u.password || "", level: int(u.level || 0) };
+				let x = { password: u.password || "", level: int(u.level || 0) };
+				if (!isSs2022) x.method = ssMethod;
 				if (u.email) x.email = u.email;
 				return x;
 			});
@@ -175,7 +215,7 @@ function build_inbound(item, features) {
 	} else if (proto === "wireguard") {
 		obj.settings = {
 			secretKey: item.wg_secret_key || "",
-			peers: parse_json_safe(item.wg_peers_json) || [],
+			peers: parse_json_safe(item.wg_peers_json, "wg_peers_json") || [],
 			mtu: int(item.wg_mtu || 1420)
 		};
 	} else if (proto === "masque") {
@@ -234,7 +274,8 @@ function build_inbound(item, features) {
 		obj.streamSettings = build_stream_settings(item, "xray", true, null, proto, features);
 	}
 
-	const custom = parse_json_safe(item.custom_config);
+	const custom = parse_json_safe(item.custom_config, "custom_config");
+	if (custom != null && type(custom) !== "object") die(`custom_config 必须为 JSON 对象 (${item.tag || item[".name"] || "inbound"})。`);
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
@@ -258,8 +299,10 @@ function build_outbound(item, default_mark, features) {
 		if (item.freedom_redirect) obj.settings.redirect = item.freedom_redirect;
 		if (item.user_level != null && item.user_level !== "") obj.settings.userLevel = int(item.user_level);
 		if (item.freedom_proxy_protocol) obj.settings.proxyProtocol = int(item.freedom_proxy_protocol);
-		const fr = parse_json_safe(item.freedom_final_rules_json);
-		if (type(fr) === "array") obj.settings.finalRules = fr;
+		if (!features || features.hasFreedomFinalRules !== false) {
+			const fr = parse_json_safe(item.freedom_final_rules_json, "freedom_final_rules_json");
+			if (type(fr) === "array") obj.settings.finalRules = fr;
+		}
 	} else if (proto === "blackhole") {
 		obj.settings.response = { type: item.blackhole_response || "none" };
 	} else if (proto === "dns") {
@@ -268,7 +311,7 @@ function build_outbound(item, default_mark, features) {
 			if (item.dns_network) obj.settings.rewriteNetwork = item.dns_network;
 			if (item.dns_address) obj.settings.rewriteAddress = item.dns_address;
 			if (item.dns_port) obj.settings.rewritePort = int(item.dns_port);
-			const rules = parse_json_safe(item.dns_rules_json);
+			const rules = parse_json_safe(item.dns_rules_json, "dns_rules_json");
 			if (type(rules) === "array" && length(rules) > 0) obj.settings.rules = rules;
 			else if (item.dns_non_ip_query) obj.settings.nonIPQuery = item.dns_non_ip_query;
 		} else {
@@ -344,11 +387,14 @@ function build_outbound(item, default_mark, features) {
 			obj.settings = { servers: [srv] };
 		}
 	} else if (proto === "shadowsocks") {
+		const rawSsMethod = item.method || "aes-256-gcm";
+		const ssMethodLower = lc(rawSsMethod);
+		const outSsMethod = substr(ssMethodLower, 0, 12) === "2022-blake3-" ? ssMethodLower : rawSsMethod;
 		if (use_flat) {
 			obj.settings = {
 				address: item.address || "",
 				port: int(item.port || 8388),
-				method: item.method || "aes-256-gcm",
+				method: outSsMethod,
 				password: item.password || ""
 			};
 			if (item.email) obj.settings.email = item.email;
@@ -358,7 +404,9 @@ function build_outbound(item, default_mark, features) {
 				if (item.ss_uot_version) obj.settings.UoTVersion = int(item.ss_uot_version);
 			}
 		} else {
-			let srv = { address: item.address || "", port: int(item.port || 8388), method: item.method || "aes-256-gcm", password: item.password || "" };
+			let srv = { address: item.address || "", port: int(item.port || 8388), method: outSsMethod, password: item.password || "" };
+			if (item.email) srv.email = item.email;
+			if (item.user_level != null && item.user_level !== "") srv.level = int(item.user_level);
 			if (features && features.hasSsUot) {
 				if (item.ss_uot === "1") srv.uot = true;
 				if (item.ss_uot_version) srv.UoTVersion = int(item.ss_uot_version);
@@ -378,7 +426,11 @@ function build_outbound(item, default_mark, features) {
 			}
 		} else {
 			let srv = { address: item.address || "", port: int(item.port || 1080) };
-			if (item.username) srv.users = [{ user: item.username, pass: item.password || "" }];
+			if (item.username) {
+				let u = { user: item.username, pass: item.password || "" };
+				if (item.user_level != null && item.user_level !== "") u.level = int(item.user_level);
+				srv.users = [u];
+			}
 			obj.settings = { servers: [srv] };
 		}
 	} else if (proto === "http") {
@@ -390,15 +442,23 @@ function build_outbound(item, default_mark, features) {
 				if (item.email) obj.settings.email = item.email;
 				if (item.user_level != null && item.user_level !== "") obj.settings.level = int(item.user_level);
 			}
-			const hh = kv_to_map(parse_json_safe(item.http_headers_json));
+			const hh = kv_to_map(parse_json_safe(item.http_headers_json, "http_headers_json"));
 			if (hh) obj.settings.headers = hh;
 		} else {
 			let srv = { address: item.address || "", port: int(item.port || 8080) };
-			if (item.username) srv.users = [{ user: item.username, pass: item.password || "" }];
-			obj.settings = { servers: [srv] };
+			if (item.username) {
+				let u = { user: item.username, pass: item.password || "" };
+				if (item.email) u.email = item.email;
+				if (item.user_level != null && item.user_level !== "") u.level = int(item.user_level);
+				srv.users = [u];
+			}
+			let s = { servers: [srv] };
+			const hh = kv_to_map(parse_json_safe(item.http_headers_json, "http_headers_json"));
+			if (hh) s.headers = hh;
+			obj.settings = s;
 		}
 	} else if (proto === "wireguard") {
-		const peers = parse_json_safe(item.wg_peers_json);
+		const peers = parse_json_safe(item.wg_peers_json, "wg_peers_json");
 		obj.settings = {
 			secretKey: item.wg_secret_key || "",
 			address: to_array(item.wg_address),
@@ -430,14 +490,15 @@ function build_outbound(item, default_mark, features) {
 	}
 
 	if (item.mux_enabled === "1") {
-		let conc = int(item.mux_concurrency || 8);
+		let conc = num_or(item.mux_concurrency, 8);
 		if (conc > 128) conc = 128;
 		obj.mux = { enabled: true, concurrency: conc };
-		if (item.mux_xudp_concurrency) obj.mux.xudpConcurrency = int(item.mux_xudp_concurrency);
+		if (item.mux_xudp_concurrency != null && item.mux_xudp_concurrency !== "") obj.mux.xudpConcurrency = int(item.mux_xudp_concurrency);
 		if (item.mux_xudp_proxy_udp443) obj.mux.xudpProxyUDP443 = item.mux_xudp_proxy_udp443;
 	}
 
-	const custom = parse_json_safe(item.custom_config);
+	const custom = parse_json_safe(item.custom_config, "custom_config");
+	if (custom != null && type(custom) !== "object") die(`custom_config 必须为 JSON 对象 (${item.tag || item[".name"] || "outbound"})。`);
 	return custom ? deep_merge(obj, custom) : obj;
 }
 
@@ -455,13 +516,13 @@ export function compile_xray(cfg, opts) {
 	};
 	if (g.mask_address) doc.log.maskAddress = g.mask_address;
 
-	const env_map = kv_to_map(parse_json_safe(g.inline_env_json));
+	const env_map = kv_to_map(parse_json_safe(g.inline_env_json, "inline_env_json"));
 	if (env_map) doc.env = env_map;
 	const raw_cron = trim(g.geodata_cron || g.geodata_reload_interval || "");
 	const cron_parts = filter(split(raw_cron, /[ \t]+/), x => x !== "");
 	const gd_cron = length(cron_parts) === 5 ? raw_cron : "";
 	const gd_out = trim(g.geodata_outbound || "");
-	const gd_assets = parse_json_safe(g.geodata_assets_json);
+	const gd_assets = parse_json_safe(g.geodata_assets_json, "geodata_assets_json");
 	if ((gd_cron || gd_out || (type(gd_assets) === "array" && length(gd_assets) > 0)) && features.hasGeodataCron !== false) {
 		let gd = {};
 		if (gd_cron) gd.cron = gd_cron;
@@ -475,11 +536,11 @@ export function compile_xray(cfg, opts) {
 		if (g.max_version) doc.version.max = g.max_version;
 	}
 
-	if (g.stats_enabled === "1") doc.stats = {};
-	if (g.api_enabled === "1") {
+	if (bool_or(g.stats_enabled, true)) doc.stats = {};
+	if (bool_or(g.api_enabled, true)) {
 		doc.api = { tag: "api", listen: `127.0.0.1:${int(g.api_port || 18080)}`, services: ["HandlerService", "LoggerService", "StatsService", "RoutingService"] };
 	}
-	if (g.metrics_enabled === "1") {
+	if (bool_or(g.metrics_enabled, true)) {
 		doc.metrics = { tag: "metrics", listen: `127.0.0.1:${int(g.metrics_port || 18888)}` };
 	}
 
@@ -494,7 +555,7 @@ export function compile_xray(cfg, opts) {
 
 	// DNS
 	const d = cfg.dns || {};
-	if (d.enabled === "1") {
+	if (bool_or(d.enabled, true)) {
 		let servers = [];
 		for (let s in cfg.dns_servers) {
 			if (s.enabled === "0") continue;
@@ -533,15 +594,34 @@ export function compile_xray(cfg, opts) {
 		if (d.use_system_hosts === "1") doc.dns.useSystemHosts = true;
 		if (d.client_ip) doc.dns.clientIp = d.client_ip;
 		let hosts = {};
-		const raw_hosts = parse_json_safe(d.hosts_json);
+		const raw_hosts = parse_json_safe(d.hosts_json, "hosts_json");
 		if (type(raw_hosts) === "object") {
-			for (let k in raw_hosts) hosts[k] = raw_hosts[k];
+			for (let k in raw_hosts) {
+				const dom = trim(`${k || ""}`);
+				const raw_vals = type(raw_hosts[k]) === "array" ? raw_hosts[k] : [raw_hosts[k]];
+				let cleaned = [];
+				for (let v in raw_vals) {
+					const sv = trim(`${v || ""}`);
+					if (sv) push(cleaned, sv);
+				}
+				if (dom && length(cleaned) > 0) {
+					hosts[dom] = length(cleaned) === 1 ? cleaned[0] : cleaned;
+				}
+			}
 		}
-		const host_entries = parse_json_safe(d.host_entries_json);
+		const host_entries = parse_json_safe(d.host_entries_json, "host_entries_json");
 		if (type(host_entries) === "array" && length(host_entries) > 0) {
 			for (let h in host_entries) {
-				if (h && h.domain && type(h.addresses) === "array" && length(h.addresses) > 0) {
-					hosts[h.domain] = length(h.addresses) === 1 ? h.addresses[0] : h.addresses;
+				const dom = h && h.domain ? trim(`${h.domain}`) : "";
+				if (dom && type(h.addresses) === "array") {
+					let cleaned = [];
+					for (let v in h.addresses) {
+						const sv = trim(`${v || ""}`);
+						if (sv) push(cleaned, sv);
+					}
+					if (length(cleaned) > 0) {
+						hosts[dom] = length(cleaned) === 1 ? cleaned[0] : cleaned;
+					}
 				}
 			}
 		}
@@ -554,7 +634,7 @@ export function compile_xray(cfg, opts) {
 
 	// Routing
 	const r = cfg.routing || {};
-	if (r.enabled === "1") {
+	if (bool_or(r.enabled, true)) {
 		let rules = [];
 		for (let rr in cfg.routing_rules) {
 			if (rr.enabled === "0") continue;
@@ -584,12 +664,15 @@ export function compile_xray(cfg, opts) {
 			if (rr.webhook_url) {
 				let wh = { url: rr.webhook_url };
 				if (rr.webhook_deduplication) wh.deduplication = int(rr.webhook_deduplication);
-				const whH = kv_to_map(parse_json_safe(rr.webhook_headers_json));
+				const whH = kv_to_map(parse_json_safe(rr.webhook_headers_json, "webhook_headers_json"));
 				if (whH) wh.headers = whH;
 				rule.webhook = wh;
 			}
-			const attrs_obj = parse_json_safe(rr.attrs);
-			if (attrs_obj) rule.attrs = attrs_obj;
+			const attrs_obj = parse_json_safe(rr.attrs, "attrs");
+			if (attrs_obj != null) {
+				if (type(attrs_obj) !== "object") die("routing_rule attrs 必须为 JSON 对象。");
+				rule.attrs = attrs_obj;
+			}
 			if (rr.balancer_tag) rule.balancerTag = rr.balancer_tag;
 			else if (rr.outbound_tag) rule.outboundTag = rr.outbound_tag;
 			push(rules, rule);
@@ -603,7 +686,7 @@ export function compile_xray(cfg, opts) {
 				if (b.strategy_tolerance != null && b.strategy_tolerance !== "") st.tolerance = +b.strategy_tolerance;
 				const bl = to_array(b.strategy_baselines);
 				if (length(bl) > 0) st.baselines = bl;
-				const costs = parse_json_safe(b.strategy_costs_json);
+				const costs = parse_json_safe(b.strategy_costs_json, "strategy_costs_json");
 				if (type(costs) === "array") st.costs = costs;
 				if (length(keys(st)) > 0) strategyObj.settings = st;
 			}
@@ -640,10 +723,9 @@ export function compile_xray(cfg, opts) {
 	}
 
 	const p = cfg.policy || {};
-	if (p.enabled === "1") {
+	if (bool_or(p.enabled, true)) {
 		let levels = {};
-		const parsed_levels = parse_json_safe(p.policy_levels_json);
-		const num_or = (val, def) => (val != null && val !== "" ? int(val) : def);
+		const parsed_levels = parse_json_safe(p.policy_levels_json, "policy_levels_json");
 		if (type(parsed_levels) === "array" && length(parsed_levels) > 0) {
 			for (let lv in parsed_levels) {
 				levels[`${lv.level != null && lv.level !== "" ? lv.level : "0"}`] = {
@@ -670,10 +752,10 @@ export function compile_xray(cfg, opts) {
 		doc.policy = {
 			levels: levels,
 			system: {
-				statsInboundUplink: p.stats_inbound_uplink === "1",
-				statsInboundDownlink: p.stats_inbound_downlink === "1",
-				statsOutboundUplink: p.stats_outbound_uplink === "1",
-				statsOutboundDownlink: p.stats_outbound_downlink === "1"
+				statsInboundUplink: bool_or(p.stats_inbound_uplink, true),
+				statsInboundDownlink: bool_or(p.stats_inbound_downlink, true),
+				statsOutboundUplink: bool_or(p.stats_outbound_uplink, true),
+				statsOutboundDownlink: bool_or(p.stats_outbound_downlink, true)
 			}
 		};
 	}
@@ -683,12 +765,20 @@ export function compile_xray(cfg, opts) {
 		let bridges = [];
 		for (let b in to_array(rev.bridges)) {
 			const parts = split(b, "|");
-			if (length(parts) === 2) push(bridges, { tag: trim(parts[0]), domain: trim(parts[1]) });
+			if (length(parts) === 2) {
+				const t = trim(parts[0]);
+				const dom = trim(parts[1]);
+				if (t && dom) push(bridges, { tag: t, domain: dom });
+			}
 		}
 		let portals = [];
 		for (let pt in to_array(rev.portals)) {
 			const parts = split(pt, "|");
-			if (length(parts) === 2) push(portals, { tag: trim(parts[0]), domain: trim(parts[1]) });
+			if (length(parts) === 2) {
+				const t = trim(parts[0]);
+				const dom = trim(parts[1]);
+				if (t && dom) push(portals, { tag: t, domain: dom });
+			}
 		}
 		doc.reverse = { bridges: bridges, portals: portals };
 	}
